@@ -26,6 +26,8 @@ namespace MxfPlayer
         private Label _lblStart = null!;
         private Label _lblDur = null!;
         private Label _lblRemain = null!;
+        private Label _lblFileCount = null!;
+        private Label _lblTotalSize = null!;
         private TrackBar _timeline = null!;
         private System.Windows.Forms.Timer _meterTimer = null!;
         private readonly List<Panel> _meterBars = new();
@@ -130,7 +132,7 @@ namespace MxfPlayer
             PopulateGrid(files);
 
             double totalGB = CalculateTotalSizeGB(files);
-            UpdateRightSummary(folderPath, files.Count, totalGB);
+            UpdateRightSummary(files.Count, totalGB);
         }
 
         private void PopulateGrid(List<MediaFile> files)
@@ -625,27 +627,44 @@ namespace MxfPlayer
         }
         private void HandlePlay()
         {
-            _player.MediaPlayer.Play();
-            _meterTimer.Start();
+            _playbackController.Play();
         }
 
         private void HandlePause()
         {
-            _player.Pause();
+            _playbackController.Pause();
         }
 
         private void HandleStop()
         {
-            _player.Stop();
-            _meterTimer.Stop();
-            ResetMeters();
+            _playbackController.Stop();
         }
 
         private void HandleLoop()
         {
-            // TODO
+            bool isLooping = _playbackController.ToggleLoop();
+            MessageBox.Show(isLooping ? "循環播放：開啟" : "循環播放：關閉");
         }
 
+        private void HandleRewFast()
+        {
+            _playbackController.RewindFast();
+        }
+
+        private void HandleRew()
+        {
+            _playbackController.Rewind();
+        }
+
+        private void HandleFwd()
+        {
+            _playbackController.Forward();
+        }
+
+        private void HandleJump(int seconds)
+        {
+            _playbackController.Jump(seconds);
+        }
         private void HandleAudio()
         {
             // TODO
@@ -656,27 +675,7 @@ namespace MxfPlayer
             // TODO
         }
 
-        private void HandleRewFast()
-        {
-            // TODO
-        }
-
-        private void HandleRew()
-        {
-            // TODO
-        }
-
-        private void HandleFwd()
-        {
-            // TODO
-        }
-
         private void HandleNextFile()
-        {
-            // TODO
-        }
-
-        private void HandleJump(int seconds)
         {
             // TODO
         }
@@ -813,9 +812,8 @@ namespace MxfPlayer
                 Padding = new Padding(10, 6, 10, 6)
             };
 
-            var lblFileCount = new Label
+            _lblFileCount = new Label
             {
-                Name = "lblFileCount",
                 Text = "文件總數：0",
                 ForeColor = Color.Black,
                 AutoSize = true,
@@ -823,9 +821,8 @@ namespace MxfPlayer
                 Top = 8
             };
 
-            var lblTotalSize = new Label
+            _lblTotalSize = new Label
             {
-                Name = "lblTotalSize",
                 Text = "總大小：0 GB",
                 ForeColor = Color.Black,
                 AutoSize = true,
@@ -833,11 +830,11 @@ namespace MxfPlayer
                 Anchor = AnchorStyles.Top | AnchorStyles.Right
             };
 
-            statusPanel.Controls.Add(lblFileCount);
-            statusPanel.Controls.Add(lblTotalSize);
+            statusPanel.Controls.Add(_lblFileCount);
+            statusPanel.Controls.Add(_lblTotalSize);
             statusPanel.Resize += (_, _) =>
             {
-                lblTotalSize.Left = statusPanel.Width - lblTotalSize.Width - 10;
+                _lblTotalSize.Left = statusPanel.Width - _lblTotalSize.Width - 10;
             };
 
             var bottomPanel = new Panel
@@ -902,28 +899,13 @@ namespace MxfPlayer
 
             LoadFolderToGrid(dialog.SelectedPath);
         }
-        private void UpdateRightSummary(string path, int count, double totalGB)
+        private void UpdateRightSummary(int count, double totalGB)
         {
-            foreach (Control parent in Controls)
-            {
-                FindLabelsRecursive(parent, count, totalGB);
-            }
+            _lblFileCount.Text = $"文件總數：{count}";
+            _lblTotalSize.Text = $"總大小：{totalGB:F2} GB";
         }
 
-        private void FindLabelsRecursive(Control parent, int count, double totalGB)
-        {
-            foreach (Control c in parent.Controls)
-            {
-                if (c.Name == "lblFileCount")
-                    c.Text = $"文件總數：{count}";
-
-                if (c.Name == "lblTotalSize")
-                    c.Text = $"總大小：{totalGB:F2} GB";
-
-                if (c.HasChildren)
-                    FindLabelsRecursive(c, count, totalGB);
-            }
-        }
+       
 
         private void OnGridFileDoubleClick(object? sender, DataGridViewCellEventArgs e)
         {
