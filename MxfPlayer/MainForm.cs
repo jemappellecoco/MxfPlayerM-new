@@ -118,35 +118,54 @@ namespace MxfPlayer
             ShowMediaInfo(info);
         }
 
-        private async void StartPlaybackForFile(MediaFile file)
+        private async Task StartPlaybackForFile(MediaFile file)
         {
-            // 1. 同步 Mask
-            for (int i = 0; i < 8; i++)
-            {
-                _player.ChannelMask[i] = _channelChecks[i].Checked;
-            }
-
-            // 2. 從快取中獲取該檔案的音軌數量
-            int audioCount = 8; // 預設 8
+            // 1. 取得音軌數量 (從快取獲取)
+            int audioCount = 8;
             if (_mediaCache.TryGetValue(file.FullPath, out var info))
             {
                 int.TryParse(info.AudioCount, out audioCount);
             }
 
-            // 3. 啟動播放 (現在傳入正確的音軌數)
-            await _player.StartAudioBridge(file.FullPath, audioCount);
-            _meterTimer.Start();
-        }
-        private void SyncChannelSelectionToMixer()
-        {
-            for (int i = 0; i < _channelChecks.Count; i++)
+            // 2. 同步 CheckBox 狀態到 Player 遮罩
+            for (int i = 0; i < 8; i++)
             {
-                _audioMixer.SetChannelEnabled(i, _channelChecks[i].Checked);
+                _player.ChannelMask[i] = _channelChecks[i].Checked;
             }
 
-            var selected = _audioMixer.GetSelectedIndices();
-            Console.WriteLine("[Audio] Play with selected = " + string.Join(",", selected));
+            // 3. 建立並顯示 Loading 視窗
+            // 使用 using 確保 loadingForm 物件資源最後會被釋放
+            using (var loading = new LoadingForm(this, file.FileName))
+            {
+                // 改進 2：TopMost 確保不會被 VLC 視窗蓋住
+                loading.TopMost = true;
+                loading.Show();
+
+                // 改進 3：強制 Refresh 比 DoEvents 穩定，確保 UI 繪製
+                loading.Refresh();
+
+                try
+                {
+                    await _player.StartAudioBridge(file.FullPath, audioCount);
+                }
+                finally
+                {
+                    loading.Close();
+                }
+            }
+            _meterTimer.Start();
         }
+        
+        //private void SyncChannelSelectionToMixer()
+        //{
+        //    for (int i = 0; i < _channelChecks.Count; i++)
+        //    {
+        //        _audioMixer.SetChannelEnabled(i, _channelChecks[i].Checked);
+        //    }
+
+        //    var selected = _audioMixer.GetSelectedIndices();
+        //    Console.WriteLine("[Audio] Play with selected = " + string.Join(",", selected));
+        //}
 
         private void LoadFolderToGrid(string folderPath)
         {
@@ -567,10 +586,10 @@ namespace MxfPlayer
             };
             _timeline.MouseDown += (_, _) => _isDraggingTimeline = true;
 
-            _timeline.MouseUp += (_, _) =>
+            _timeline.MouseUp += async (_, _) =>
             {
                 _isDraggingTimeline = false;
-                SeekFromTimeline();  
+                await SeekFromTimeline();  
             };
             var btnRow = new FlowLayoutPanel
             {
@@ -665,13 +684,13 @@ namespace MxfPlayer
             btnMinus10.Click += (_, _) => HandleJump(-10);
             btnPlus10.Click += (_, _) => HandleJump(10);
         }
-        private void HandlePlay()
+        private async void HandlePlay()
         {
             if (!TryGetSelectedMediaFile(out var file) || file == null)
                 return;
 
             // 這裡會進到我們上面改好的 StartPlaybackForFile
-            StartPlaybackForFile(file);
+            await StartPlaybackForFile(file);
             _lblNow.Text = "1x";
         }
 
@@ -680,14 +699,14 @@ namespace MxfPlayer
             _playbackController.Pause();
         }
 
-        private void HandleMoveFirst()
+        private async void HandleMoveFirst() // ⭐ async void 是正確的 UI 事件寫法
         {
-            _playbackController.MoveFirst();
+            await _playbackController.MoveFirst(); // ⭐ 現在這裡可以正常 await 了！
         }
 
-        private void HandleMoveLast()
+        private async void HandleMoveLast()
         {
-            _playbackController.MoveLast();
+            await  _playbackController.MoveLast();
         }
 
         private void HandleMoveBackForward()
@@ -717,14 +736,14 @@ namespace MxfPlayer
             _playbackController.NegativeLog(fps);
         }
 
-        private void HandlePositiveLog()
+        private async Task HandlePositiveLog()
         {
-            _playbackController.PositiveLog();
+            await _playbackController.PositiveLog();
         }
 
-        private void HandleJump(int seconds)
+        private async Task HandleJump(int seconds)
         {
-            _playbackController.Jump(seconds);
+            await _playbackController.Jump(seconds);
         }
 
         private void HandleFullScreen()
@@ -954,14 +973,14 @@ namespace MxfPlayer
 
        
 
-        private void OnGridFileDoubleClick(object? sender, DataGridViewCellEventArgs e)
+        private async void OnGridFileDoubleClick(object? sender, DataGridViewCellEventArgs e)
         {
             if (e.RowIndex < 0) return;
 
             var row = _gridFiles.Rows[e.RowIndex];
             if (row.Tag is not MediaFile file) return;
 
-            StartPlaybackForFile(file);
+           await StartPlaybackForFile(file);
         }
       
 
@@ -991,27 +1010,28 @@ namespace MxfPlayer
                 bar.Height = 8;
             }
         }
-        private void UpdateTimelineFromPlayer()
+       
+       private void UpdateTimelineFromPlayer()
         {
-            if (_isDraggingTimeline) return;
+            // ⭐ 修改：同時檢查正在拖動或正在更新中
+            if (_isDraggingTimeline || _isUpdatingTimeline) return;
 
             long current = _playbackController.GetCurrentTime();
             long length = _playbackController.GetLength();
 
             if (length <= 0) return;
 
-            _isUpdatingTimeline = true;
+            _isUpdatingTimeline = true; // 開始更新
 
             _timeline.Value = _playbackController.GetTimelineValue(_timeline.Maximum);
             _lblNow.Text = FormatTimecodeFromMilliseconds(current);
             _lblRemain.Text = $"REM {FormatTimecodeFromMilliseconds(Math.Max(0, length - current))}";
 
-            _isUpdatingTimeline = false;
+            _isUpdatingTimeline = false; // 更新結束
         }
-        private void SeekFromTimeline()
+        private async Task SeekFromTimeline()
         {
-            _playbackController.SeekByTimelineValue(_timeline.Value, _timeline.Maximum);
-
+            await _playbackController.SeekByTimelineValue(_timeline.Value, _timeline.Maximum);
             long current = _playbackController.GetCurrentTime();
             long length = _playbackController.GetLength();
 

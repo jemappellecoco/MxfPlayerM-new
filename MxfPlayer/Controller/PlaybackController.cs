@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Threading.Tasks; // 必須引用
 using System.Windows.Forms;
 using MxfPlayer.Services;
 
@@ -26,14 +27,13 @@ namespace MxfPlayer.Controllers
         private async Task SyncAudioToCurrentTime()
         {
             if (string.IsNullOrEmpty(_player.CurrentPath)) return;
-
             long currentTime = _player.MediaPlayer.Time;
-
-            // 這裡加上 await，確保 Start 邏輯執行完畢
+            // 等待 PlayerService 完成解析與初始化
             await _player.StartAudioBridge(_player.CurrentPath, _player.CurrentAudioCount, currentTime);
         }
 
-        public async void Play()
+        // ⭐ 修正：將 void 改為 Task，讓 MainForm 可以 await 它
+        public async Task Play()
         {
             if (_player.MediaPlayer == null) return;
             _player.MediaPlayer.Play();
@@ -49,7 +49,8 @@ namespace MxfPlayer.Controllers
             _resetMeters?.Invoke();
         }
 
-        public async void MoveFirst()
+        // ⭐ 修正：回傳 Task
+        public async Task MoveFirst()
         {
             if (_player.MediaPlayer == null) return;
             _player.MediaPlayer.Time = 0;
@@ -57,7 +58,8 @@ namespace MxfPlayer.Controllers
             await SyncAudioToCurrentTime();
         }
 
-        public async void MoveLast()
+        // ⭐ 修正：回傳 Task
+        public async Task MoveLast()
         {
             if (_player.MediaPlayer == null) return;
             long length = _player.MediaPlayer.Length;
@@ -68,7 +70,8 @@ namespace MxfPlayer.Controllers
             await SyncAudioToCurrentTime();
         }
 
-        public async void PositiveLog()
+        // ⭐ 修正：回傳 Task
+        public async Task PositiveLog()
         {
             if (_player.MediaPlayer == null) return;
             _player.MediaPlayer.NextFrame();
@@ -76,11 +79,12 @@ namespace MxfPlayer.Controllers
             await SyncAudioToCurrentTime();
         }
 
-        public void NegativeLog(double fps = 29.97)
+        // ⭐ 修正：因為呼叫了 async 的 JumpMilliseconds，所以這裡也要 async Task
+        public async Task NegativeLog(double fps = 29.97)
         {
             if (_player.MediaPlayer == null) return;
             int frameMs = (int)Math.Round(1000.0 / fps);
-            JumpMilliseconds(-frameMs);
+            await JumpMilliseconds(-frameMs);
         }
 
         public float MoveFastForward()
@@ -105,12 +109,15 @@ namespace MxfPlayer.Controllers
             return rate;
         }
 
-        public void Jump(int seconds)
+        public async Task Jump(int seconds)
         {
-            JumpMilliseconds(seconds * 1000L);
+            long current = _player.MediaPlayer.Time;
+            _player.MediaPlayer.Time = current + (seconds * 1000L);
+            await SyncAudioToCurrentTime();
         }
 
-        private async void JumpMilliseconds(long ms)
+        // ⭐ 修正：回傳 Task
+        private async Task JumpMilliseconds(long ms)
         {
             if (_player.MediaPlayer == null) return;
             long target = _player.MediaPlayer.Time + ms;
@@ -120,7 +127,7 @@ namespace MxfPlayer.Controllers
 
             _player.MediaPlayer.Time = target;
             ResetRate();
-            await  SyncAudioToCurrentTime();
+            await SyncAudioToCurrentTime();
         }
 
         private void ResetRate()
@@ -142,7 +149,7 @@ namespace MxfPlayer.Controllers
             return (int)(_player.MediaPlayer.Time * maxValue / length);
         }
 
-        public async void SeekByTimelineValue(int value, int maxValue)
+        public async Task SeekByTimelineValue(int value, int maxValue)
         {
             if (_player.MediaPlayer == null || maxValue <= 0) return;
             long length = _player.MediaPlayer.Length;
@@ -151,8 +158,7 @@ namespace MxfPlayer.Controllers
             long target = (long)value * length / maxValue;
             _player.MediaPlayer.Time = target;
 
-            ResetRate();
-            await SyncAudioToCurrentTime(); // 拖動後重啟音訊對齊
+            await SyncAudioToCurrentTime();
         }
     }
 }
