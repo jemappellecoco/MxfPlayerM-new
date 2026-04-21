@@ -11,10 +11,13 @@ namespace MxfPlayer
 {
     public class MainForm : Form
     {
+        private bool _isDraggingTimeline = false;
+        private bool _isUpdatingTimeline = false;
         private readonly PlayerService _player = new();
         private readonly FolderService _folder = new();
         private readonly MediaInfoService _mediaInfo = new();
         private readonly Dictionary<string, MediaInfoResult> _mediaCache = new();
+        private readonly AudioMixerService _audioMixer = new();
         private readonly PlaybackController _playbackController;
         private readonly Random _rnd = new();
         private VideoView _videoView = null!;
@@ -115,11 +118,34 @@ namespace MxfPlayer
             ShowMediaInfo(info);
         }
 
-        private void StartPlaybackForFile(MediaFile file)
+        private async void StartPlaybackForFile(MediaFile file)
         {
-            _player.Play(file.FullPath);
+            // 1. 同步 Mask
+            for (int i = 0; i < 8; i++)
+            {
+                _player.ChannelMask[i] = _channelChecks[i].Checked;
+            }
+
+            // 2. 從快取中獲取該檔案的音軌數量
+            int audioCount = 8; // 預設 8
+            if (_mediaCache.TryGetValue(file.FullPath, out var info))
+            {
+                int.TryParse(info.AudioCount, out audioCount);
+            }
+
+            // 3. 啟動播放 (現在傳入正確的音軌數)
+            await _player.StartAudioBridge(file.FullPath, audioCount);
             _meterTimer.Start();
-            FakeUpdateMeters();
+        }
+        private void SyncChannelSelectionToMixer()
+        {
+            for (int i = 0; i < _channelChecks.Count; i++)
+            {
+                _audioMixer.SetChannelEnabled(i, _channelChecks[i].Checked);
+            }
+
+            var selected = _audioMixer.GetSelectedIndices();
+            Console.WriteLine("[Audio] Play with selected = " + string.Join(",", selected));
         }
 
         private void LoadFolderToGrid(string folderPath)
@@ -183,7 +209,11 @@ namespace MxfPlayer
         {
             _meterTimer = new System.Windows.Forms.Timer();
             _meterTimer.Interval = 180;
-            _meterTimer.Tick += (_, _) => FakeUpdateMeters();
+            _meterTimer.Tick += (_, _) =>
+            {
+                FakeUpdateMeters();
+                UpdateTimelineFromPlayer();
+            };
         }
 
         private void BuildMenu()
@@ -399,6 +429,10 @@ namespace MxfPlayer
                     Font = new Font("Segoe UI", 7.5f, FontStyle.Regular),
                     Margin = new Padding(0)
                 };
+
+                int channelIndex = i;
+                chk.CheckedChanged += (_, _) => OnChannelCheckChanged(channelIndex, chk.Checked);
+
                 _channelChecks.Add(chk);
 
                 var barBack = new Panel
@@ -427,7 +461,19 @@ namespace MxfPlayer
 
             return host;
         }
+        private void OnChannelCheckChanged(int channelIndex, bool isChecked)
+        {
+            // 1. 更新 Mixer 紀錄 (用於顯示或邏輯判斷)
+            _audioMixer.SetChannelEnabled(channelIndex, isChecked);
 
+            // 2. ⭐ 直接更新 PlayerService 內的 Mask
+            // 因為 OnAudioPlay 每秒跑幾百次，它會即時讀到這個新狀態，達成秒切效果
+            _player.ChannelMask[channelIndex] = isChecked;
+
+            // 偵錯輸出
+            var selected = _audioMixer.GetSelectedIndices();
+            Console.WriteLine($"[Audio] Channel {channelIndex + 1} changed to {isChecked}. Selected = {string.Join(",", selected)}");
+        }
         private void AddScaleLabel(Panel parent, string text, int top)
         {
             var lbl = new Label
@@ -519,115 +565,114 @@ namespace MxfPlayer
                 BackColor = Color.FromArgb(58, 62, 67),
                 Margin = new Padding(0)
             };
+            _timeline.MouseDown += (_, _) => _isDraggingTimeline = true;
 
+            _timeline.MouseUp += (_, _) =>
+            {
+                _isDraggingTimeline = false;
+                SeekFromTimeline();  
+            };
             var btnRow = new FlowLayoutPanel
             {
-                Dock = DockStyle.Fill,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 FlowDirection = FlowDirection.LeftToRight,
                 WrapContents = false,
                 AutoScroll = false,
                 Padding = new Padding(0, 4, 0, 0),
+                Margin = new Padding(0),
                 BackColor = Color.FromArgb(58, 62, 67)
             };
 
-            var btnLoop = CreatePlaybackButton("⟳", 36);
-            var btnAudio = CreatePlaybackButton("▮▮", 36);
-            var btnPrevFile = CreatePlaybackButton("|◀", 36);
-            var btnRewFast = CreatePlaybackButton("⏪", 36);
-            var btnRew = CreatePlaybackButton("◀", 36);
+            var btnMoveFirst = CreatePlaybackButton("|◀", 36);
+            var btnMoveBackForward = CreatePlaybackButton("⏪", 36);
+            var btnNegativeLog = CreatePlaybackButton("|◂", 36);
             var btnPlay = CreatePlaybackButton("▶", 40, true);
             var btnPause = CreatePlaybackButton("▌▌", 36);
-            var btnFwd = CreatePlaybackButton("▶", 36);
-            var btnNextFile = CreatePlaybackButton("▶|", 36);
-            var btnStop = CreatePlaybackButton("■", 36);
-            var btnMinus10 = CreatePlaybackButton("-10", 44);
-            var btnPlus10 = CreatePlaybackButton("+10", 44);
-            var btnFull = CreatePlaybackButton("□", 36);
-
-            var chkAuto = new CheckBox
-            {
-                Text = "自動播放",
-                ForeColor = Color.White,
-                BackColor = Color.FromArgb(58, 62, 67),
-                AutoSize = true,
-                Height = 30,
-                Margin = new Padding(12, 7, 0, 0),
-                Font = new Font("Segoe UI", 10f)
-            };
+            var btnPositiveLog = CreatePlaybackButton("▸|", 36);
+            var btnMoveFastForward = CreatePlaybackButton("⏩", 36);
+            var btnMoveLast = CreatePlaybackButton("▶|", 36);
+            var btnMinus10 = CreatePlaybackButton("-10", 60);
+            var btnPlus10 = CreatePlaybackButton("+10", 60);
 
             BindPlaybackEvents(
                 btnPlay,
                 btnPause,
-                btnStop,
-                btnLoop,
-                btnAudio,
-                btnPrevFile,
-                btnRewFast,
-                btnRew,
-                btnFwd,
-                btnNextFile,
+                btnMoveFirst,
+                btnMoveLast,
+                btnMoveBackForward,
+                btnMoveFastForward,
+                btnNegativeLog,
+                btnPositiveLog,
                 btnMinus10,
-                btnPlus10,
-                btnFull,
-                chkAuto
+                btnPlus10
             );
 
-            btnRow.Controls.Add(btnLoop);
-            btnRow.Controls.Add(btnAudio);
-            btnRow.Controls.Add(btnPrevFile);
-            btnRow.Controls.Add(btnRewFast);
-            btnRow.Controls.Add(btnRew);
+            btnRow.Controls.Add(btnMoveFirst);
+            btnRow.Controls.Add(btnMoveBackForward);
+            btnRow.Controls.Add(btnNegativeLog);
             btnRow.Controls.Add(btnPlay);
             btnRow.Controls.Add(btnPause);
-            btnRow.Controls.Add(btnFwd);
-            btnRow.Controls.Add(btnNextFile);
-            btnRow.Controls.Add(btnStop);
+            btnRow.Controls.Add(btnPositiveLog);
+            btnRow.Controls.Add(btnMoveFastForward);
+            btnRow.Controls.Add(btnMoveLast);
             btnRow.Controls.Add(btnMinus10);
             btnRow.Controls.Add(btnPlus10);
-            btnRow.Controls.Add(btnFull);
-            btnRow.Controls.Add(chkAuto);
 
-            panel.Controls.Add(btnRow);
+            var buttonHost = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 3,
+                RowCount = 1,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                BackColor = Color.FromArgb(58, 62, 67)
+            };
+
+            buttonHost.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+            buttonHost.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            buttonHost.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+            buttonHost.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+
+            buttonHost.Controls.Add(btnRow, 1, 0);
+
+            panel.Controls.Add(buttonHost);
             panel.Controls.Add(_timeline);
             panel.Controls.Add(timeRow);
 
             return panel;
         }
         private void BindPlaybackEvents(
-    Button btnPlay,
-    Button btnPause,
-    Button btnStop,
-    Button btnLoop,
-    Button btnAudio,
-    Button btnPrevFile,
-    Button btnRewFast,
-    Button btnRew,
-    Button btnFwd,
-    Button btnNextFile,
-    Button btnMinus10,
-    Button btnPlus10,
-    Button btnFull,
-    CheckBox chkAuto)
+            Button btnPlay,
+            Button btnPause,
+            Button btnMoveFirst,
+            Button btnMoveLast,
+            Button btnMoveBackForward,
+            Button btnMoveFastForward,
+            Button btnNegativeLog,
+            Button btnPositiveLog,
+            Button btnMinus10,
+            Button btnPlus10)
         {
             btnPlay.Click += (_, _) => HandlePlay();
             btnPause.Click += (_, _) => HandlePause();
-            btnStop.Click += (_, _) => HandleStop();
-
-            btnLoop.Click += (_, _) => HandleLoop();
-            btnAudio.Click += (_, _) => HandleAudio();
-            btnPrevFile.Click += (_, _) => HandlePrevFile();
-            btnRewFast.Click += (_, _) => HandleRewFast();
-            btnRew.Click += (_, _) => HandleRew();
-            btnFwd.Click += (_, _) => HandleFwd();
-            btnNextFile.Click += (_, _) => HandleNextFile();
+            btnMoveFirst.Click += (_, _) => HandleMoveFirst();
+            btnMoveLast.Click += (_, _) => HandleMoveLast();
+            btnMoveBackForward.Click += (_, _) => HandleMoveBackForward();
+            btnMoveFastForward.Click += (_, _) => HandleMoveFastForward();
+            btnNegativeLog.Click += (_, _) => HandleNegativeLog();
+            btnPositiveLog.Click += (_, _) => HandlePositiveLog();
             btnMinus10.Click += (_, _) => HandleJump(-10);
             btnPlus10.Click += (_, _) => HandleJump(10);
-            btnFull.Click += (_, _) => HandleFullScreen();
-            chkAuto.CheckedChanged += (_, _) => HandleAutoPlayChanged(chkAuto.Checked);
         }
         private void HandlePlay()
         {
-            _playbackController.Play();
+            if (!TryGetSelectedMediaFile(out var file) || file == null)
+                return;
+
+            // 這裡會進到我們上面改好的 StartPlaybackForFile
+            StartPlaybackForFile(file);
+            _lblNow.Text = "1x";
         }
 
         private void HandlePause()
@@ -635,49 +680,51 @@ namespace MxfPlayer
             _playbackController.Pause();
         }
 
-        private void HandleStop()
+        private void HandleMoveFirst()
         {
-            _playbackController.Stop();
+            _playbackController.MoveFirst();
         }
 
-        private void HandleLoop()
+        private void HandleMoveLast()
         {
-            bool isLooping = _playbackController.ToggleLoop();
-            MessageBox.Show(isLooping ? "循環播放：開啟" : "循環播放：關閉");
+            _playbackController.MoveLast();
         }
 
-        private void HandleRewFast()
+        private void HandleMoveBackForward()
         {
-            _playbackController.RewindFast();
+            float rate = _playbackController.MoveBackForward();
+            _lblNow.Text = $"{rate:0}x";
         }
 
-        private void HandleRew()
+        private void HandleMoveFastForward()
         {
-            _playbackController.Rewind();
+            float rate = _playbackController.MoveFastForward();
+            _lblNow.Text = $"{rate:0}x";
         }
 
-        private void HandleFwd()
+        private void HandleNegativeLog()
         {
-            _playbackController.Forward();
+            double fps = 29.97;
+
+            if (TryGetSelectedMediaFile(out var file) &&
+                file != null &&
+                _mediaCache.TryGetValue(file.FullPath, out var info) &&
+                double.TryParse(info.FrameRate, out var parsedFps))
+            {
+                fps = parsedFps;
+            }
+
+            _playbackController.NegativeLog(fps);
+        }
+
+        private void HandlePositiveLog()
+        {
+            _playbackController.PositiveLog();
         }
 
         private void HandleJump(int seconds)
         {
             _playbackController.Jump(seconds);
-        }
-        private void HandleAudio()
-        {
-            // TODO
-        }
-
-        private void HandlePrevFile()
-        {
-            // TODO
-        }
-
-        private void HandleNextFile()
-        {
-            // TODO
         }
 
         private void HandleFullScreen()
@@ -944,7 +991,41 @@ namespace MxfPlayer
                 bar.Height = 8;
             }
         }
+        private void UpdateTimelineFromPlayer()
+        {
+            if (_isDraggingTimeline) return;
 
+            long current = _playbackController.GetCurrentTime();
+            long length = _playbackController.GetLength();
+
+            if (length <= 0) return;
+
+            _isUpdatingTimeline = true;
+
+            _timeline.Value = _playbackController.GetTimelineValue(_timeline.Maximum);
+            _lblNow.Text = FormatTimecodeFromMilliseconds(current);
+            _lblRemain.Text = $"REM {FormatTimecodeFromMilliseconds(Math.Max(0, length - current))}";
+
+            _isUpdatingTimeline = false;
+        }
+        private void SeekFromTimeline()
+        {
+            _playbackController.SeekByTimelineValue(_timeline.Value, _timeline.Maximum);
+
+            long current = _playbackController.GetCurrentTime();
+            long length = _playbackController.GetLength();
+
+            _lblNow.Text = FormatTimecodeFromMilliseconds(current);
+            _lblRemain.Text = $"REM {FormatTimecodeFromMilliseconds(Math.Max(0, length - current))}";
+        }
+        private string FormatTimecodeFromMilliseconds(long ms)
+        {
+            if (ms < 0) ms = 0;
+
+            var ts = TimeSpan.FromMilliseconds(ms);
+
+            return $"{ts.Hours:00}:{ts.Minutes:00}:{ts.Seconds:00}:{(ts.Milliseconds / 40):00}";
+        }
         private class DarkColorTable : ProfessionalColorTable
         {
             public override Color MenuItemSelected => Color.FromArgb(72, 76, 82);
