@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace MxfPlayer.Services
@@ -14,9 +15,10 @@ namespace MxfPlayer.Services
         private readonly string _ffmpegPath = @"C:\ffmpeg-7.1.1-essentials_build\bin\ffmpeg.exe";
         private readonly LibVLC _vlc;
         private readonly MediaPlayer _mp;
-        private static readonly Dictionary<string, byte[]> _globalAudioCache = new();
 
-        // ⭐ 改動 1：新增進程變數，以便隨時中斷
+        // 快取目前正在播放的暫存檔路徑
+        private static readonly Dictionary<string, string> _globalAudioCache = new();
+
         private Process? _ffmpegProcess;
         private WaveOutEvent? _waveOut;
         private MxfAudioProvider? _currentProvider;
@@ -33,52 +35,57 @@ namespace MxfPlayer.Services
             _mp.Mute = true;
         }
 
+        // ⭐ 修正：這是唯一的 StartAudioBridge 定義
         public async Task StartAudioBridge(string path, int audioCount, long startTimeMs = 0)
         {
-            // 這裡會先執行 Stop，殺掉上一個還在解析的 FFmpeg
-            StopAudioBridge();
+            bool needNewTranscode = true;
 
-            CurrentPath = path;
-            CurrentAudioCount = audioCount;
-
-            byte[]? audioData = null;
-            if (_globalAudioCache.ContainsKey(path))
+            // 檢查是否為同一個檔案且時間點已被目前的快取覆蓋
+            if (CurrentPath == path && _currentProvider != null && _currentProvider.IsDataAvailable(startTimeMs))
             {
-                audioData = _globalAudioCache[path];
-            }
-            else
-            {
-                try
-                {
-                    // 執行解析
-                    audioData = await Task.Run(() => PreloadAllAudio(path, audioCount));
-                    if (audioData != null) _globalAudioCache[path] = audioData;
-                }
-                catch (OperationCanceledException)
-                {
-                    Debug.WriteLine("[Audio] 解析任務被取消");
-                    return;
-                }
+                needNewTranscode = false;
             }
 
-            if (audioData == null) return;
+            if (needNewTranscode)
+            {
+                StopAudioBridge(); // 停止舊任務，釋放檔案
+                CurrentPath = path;
+                CurrentAudioCount = audioCount;
 
-            _currentProvider = new MxfAudioProvider(audioData, audioCount) { Mask = this.ChannelMask };
-            _currentProvider.Seek(startTimeMs);
+                // 執行隨機點解析
+                string? pcmPath = await Task.Run(() => PreloadFromPoint(path, audioCount, startTimeMs));
 
-            _waveOut = new WaveOutEvent { DesiredLatency = 100 };
-            _waveOut.Init(_currentProvider);
+                if (string.IsNullOrEmpty(pcmPath)) return;
 
+                // ⭐ 修正點：傳入三個參數 (路徑, 聲道數, 起始偏移時間)
+                _currentProvider = new MxfAudioProvider(pcmPath, audioCount, startTimeMs) { Mask = this.ChannelMask };
+            }
+
+            // 對齊音軌位置
+            _currentProvider?.Seek(startTimeMs);
+
+            if (_waveOut == null)
+            {
+                _waveOut = new WaveOutEvent { DesiredLatency = 100 };
+                _waveOut.Init(_currentProvider);
+            }
+
+            _waveOut.Play();
+
+            // 啟動影片
             using var media = new Media(_vlc, path, FromType.FromPath);
             _mp.Play(media);
             _mp.Time = startTimeMs;
-            _waveOut.Play();
         }
 
-        private byte[]? PreloadAllAudio(string path, int audioCount)
+        private string? PreloadFromPoint(string path, int audioCount, long startTimeMs)
         {
+            double startSec = startTimeMs / 1000.0;
             string filter = string.Concat(Enumerable.Range(0, audioCount).Select(i => $"[0:a:{i}]"));
-            string args = $"-i \"{path}\" -filter_complex \"{filter}amerge=inputs={audioCount}\" -f s16le -ar 48000 -ac {audioCount} -vn pipe:1";
+            // 使用極速跳轉參數 -ss 在 -i 之前
+            string args = $"-ss {startSec:F3} -i \"{path}\" -filter_complex \"{filter}amerge=inputs={audioCount}\" -f s16le -ar 48000 -ac {audioCount} -vn pipe:1";
+
+            string tempFilePath = Path.Combine(Path.GetTempPath(), $"mxf_cache_{Guid.NewGuid()}.pcm");
 
             var psi = new ProcessStartInfo
             {
@@ -89,50 +96,32 @@ namespace MxfPlayer.Services
                 CreateNoWindow = true
             };
 
-            // ⭐ 修正點 1：先使用區域變數 localProcess
-            Process? localProcess = null;
+            Process? localProcess = Process.Start(psi);
+            if (localProcess == null) return null;
+            _ffmpegProcess = localProcess;
 
-            try
-            {
-                localProcess = Process.Start(psi);
-                if (localProcess == null) return null;
-
-                // 將區域變數賦值給全域變數，以便 StopAudioBridge 可以 Kill 它
-                _ffmpegProcess = localProcess;
-
-                using var ms = new MemoryStream();
-                // 讀取資料
-                localProcess.StandardOutput.BaseStream.CopyTo(ms);
-
-                // ⭐ 修正點 2：檢查時使用 localProcess 而非全域的 _ffmpegProcess
-                // 這樣即便 _ffmpegProcess 被外部設為 null，這裡也不會報錯
-                if (localProcess.HasExited && localProcess.ExitCode != 0)
+            // 背景寫入磁碟
+            _ = Task.Run(() => {
+                try
                 {
-                    // 如果是被手動 Kill 的 (ExitCode 通常是 -1)，會進到這裡
-                    return null;
+                    using var fs = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+                    localProcess.StandardOutput.BaseStream.CopyTo(fs);
                 }
+                catch { }
+            });
 
-                localProcess.WaitForExit();
-                return ms.ToArray();
-            }
-            catch (Exception ex)
+            // 等待初步資料產出
+            int retry = 0;
+            while (retry < 20)
             {
-                Debug.WriteLine($"[FFmpeg Exception] {ex.Message}");
-                return null;
+                if (File.Exists(tempFilePath) && new FileInfo(tempFilePath).Length > 4096) break;
+                Thread.Sleep(50);
+                retry++;
             }
-            finally
-            {
-                // ⭐ 修正點 3：結束後，只有當前的進程確實是 localProcess 時才清空全域變數
-                // 防止新啟動的進程被舊的任務清掉
-                if (_ffmpegProcess == localProcess)
-                {
-                    _ffmpegProcess = null;
-                }
 
-                // 確保釋放 localProcess 資源
-                localProcess?.Dispose();
-            }
+            return tempFilePath;
         }
+
         public void Pause()
         {
             _mp.Pause();
@@ -141,16 +130,9 @@ namespace MxfPlayer.Services
 
         public void StopAudioBridge()
         {
-            // ⭐ 改動 3：切換檔案時，強制殺掉正在解析中的 FFmpeg
-            // 這是讓 Loading 視窗能正常關閉的關鍵
             if (_ffmpegProcess != null && !_ffmpegProcess.HasExited)
             {
-                try
-                {
-                    _ffmpegProcess.Kill();
-                    _ffmpegProcess.Dispose();
-                }
-                catch { }
+                try { _ffmpegProcess.Kill(); } catch { }
                 _ffmpegProcess = null;
             }
 
@@ -161,6 +143,14 @@ namespace MxfPlayer.Services
                 _waveOut.Dispose();
                 _waveOut = null;
             }
+            _currentProvider?.Dispose();
+            _currentProvider = null;
+        }
+
+        public void ClearCache()
+        {
+            // 關閉程式時清理所有暫存
+            _globalAudioCache.Clear();
         }
     }
 }

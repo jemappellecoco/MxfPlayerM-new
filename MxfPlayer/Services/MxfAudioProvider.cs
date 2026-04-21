@@ -1,47 +1,62 @@
 ﻿using NAudio.Wave;
 using System;
+using System.IO;
 
 namespace MxfPlayer.Services
 {
-    public class MxfAudioProvider : IWaveProvider
+    public class MxfAudioProvider : IWaveProvider, IDisposable
     {
-        private readonly byte[] _data;
+        private readonly FileStream _fileStream;
         private readonly int _channels;
-        private long _position = 0;
+        private readonly long _baseTimeMs; // 此快取檔的起始影片毫秒
+
         public WaveFormat WaveFormat { get; }
         public bool[] Mask { get; set; } = new bool[8];
 
-        public MxfAudioProvider(byte[] data, int channels)
+        // ⭐ 修正點：建構子必須包含 baseTimeMs
+        public MxfAudioProvider(string pcmPath, int channels, long baseTimeMs)
         {
-            _data = data;
+            _fileStream = new FileStream(pcmPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             _channels = channels;
-            WaveFormat = new WaveFormat(48000, 16, 2); // 輸出立體聲
+            _baseTimeMs = baseTimeMs;
+            WaveFormat = new WaveFormat(48000, 16, 2);
+        }
+
+        public bool IsDataAvailable(long timeMs)
+        {
+            if (timeMs < _baseTimeMs) return false;
+            long targetOffsetBytes = (48000 * _channels * 2 * (timeMs - _baseTimeMs)) / 1000;
+            return _fileStream.Length >= targetOffsetBytes;
         }
 
         public void Seek(long timeMs)
         {
-            long bytesPerMs = (48000 * _channels * 2) / 1000;
-            _position = timeMs * bytesPerMs;
-            // 確保對齊 Frame (每個 Frame 大小為 _channels * 2 bytes)
-            _position = (_position / (_channels * 2)) * (_channels * 2);
+            long relativeMs = timeMs - _baseTimeMs;
+            if (relativeMs < 0) relativeMs = 0;
+
+            long pos = (48000 * _channels * 2 * relativeMs) / 1000;
+            pos = (pos / (_channels * 2)) * (_channels * 2);
+
+            _fileStream.Position = Math.Min(pos, _fileStream.Length);
         }
 
         public unsafe int Read(byte[] buffer, int offset, int count)
         {
             int bytesPerFrameIn = _channels * 2;
-            int bytesPerFrameOut = 4; // 2 channels * 16bit
-            int framesRequested = count / bytesPerFrameOut;
-            int bytesRead = 0;
+            int framesRequested = count / 4;
 
-            fixed (byte* pData = _data, pBuf = buffer)
+            byte[] rawBuffer = new byte[framesRequested * bytesPerFrameIn];
+            int bytesRead = _fileStream.Read(rawBuffer, 0, rawBuffer.Length);
+            int framesRead = bytesRead / bytesPerFrameIn;
+
+            if (framesRead == 0) return 0;
+
+            fixed (byte* pRaw = rawBuffer, pBuf = buffer)
             {
                 short* outPtr = (short*)(pBuf + offset);
-
-                for (int i = 0; i < framesRequested; i++)
+                for (int i = 0; i < framesRead; i++)
                 {
-                    if (_position + bytesPerFrameIn > _data.Length) break;
-
-                    short* inPtr = (short*)(pData + _position);
+                    short* inPtr = (short*)(pRaw + (i * bytesPerFrameIn));
                     long mixed = 0;
                     int active = 0;
 
@@ -51,15 +66,17 @@ namespace MxfPlayer.Services
                     }
 
                     short final = (active > 0) ? (short)Math.Clamp(mixed / active, short.MinValue, short.MaxValue) : (short)0;
-
-                    outPtr[i * 2] = final;     // L
-                    outPtr[i * 2 + 1] = final; // R
-
-                    _position += bytesPerFrameIn;
-                    bytesRead += bytesPerFrameOut;
+                    outPtr[i * 2] = final;
+                    outPtr[i * 2 + 1] = final;
                 }
             }
-            return bytesRead;
+            return framesRead * 4;
+        }
+
+        public void Dispose()
+        {
+            _fileStream?.Close();
+            _fileStream?.Dispose();
         }
     }
 }
