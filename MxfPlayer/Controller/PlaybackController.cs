@@ -1,6 +1,5 @@
 ﻿using System;
-using System.Threading.Tasks; // 必須引用
-using System.Windows.Forms;
+using System.Threading.Tasks;
 using MxfPlayer.Services;
 
 namespace MxfPlayer.Controllers
@@ -11,12 +10,9 @@ namespace MxfPlayer.Controllers
         private readonly System.Windows.Forms.Timer _meterTimer;
         private readonly Action _resetMeters;
 
-        private readonly float[] _forwardRates = { 1f, 2f, 4f, 8f, 16f };
-        private readonly float[] _reverseRates = { -1f, -2f, -4f, -8f, -16f };
-
-        private int _forwardIndex = 0;
-        private int _reverseIndex = 0;
-
+        // 增加一個變數紀錄當前倍速，避免 Seek 後倍速跑掉
+        public float _currentRate = 1.0f;
+        public float CurrentRate { get; private set; } = 1.0f;
         public PlaybackController(PlayerService player, System.Windows.Forms.Timer meterTimer, Action resetMeters)
         {
             _player = player;
@@ -24,22 +20,65 @@ namespace MxfPlayer.Controllers
             _resetMeters = resetMeters;
         }
 
-        private async Task SyncAudioToCurrentTime()
+        /// <summary>
+        /// 核心同步：確保 FFmpeg 解碼器跟上 VLC 的時間點與倍速
+        /// </summary>
+        private async Task SyncAudio(long timeMs)
         {
             if (string.IsNullOrEmpty(_player.CurrentPath)) return;
-            long currentTime = _player.MediaPlayer.Time;
-            // 等待 PlayerService 完成解析與初始化
-            await _player.StartAudioBridge(_player.CurrentPath, _player.CurrentAudioCount, currentTime);
+
+            // 呼叫 Service 的 StartAudioBridge
+            // 該方法內部已經包含了 Stop 舊連結、設定 VLC Rate、啟動 FFmpeg 濾鏡的邏輯
+            await _player.StartAudioBridge(_player.CurrentPath, _player.CurrentAudioCount, timeMs, _currentRate);
+        }
+        public async Task MoveFirst()
+        {
+            _player.MediaPlayer.Time = 0;
+            await SyncAudio(0);
         }
 
-        // ⭐ 修正：將 void 改為 Task，讓 MainForm 可以 await 它
+        public async Task MoveLast()
+        {
+            long length = _player.MediaPlayer.Length;
+            _player.MediaPlayer.Time = length;
+            await SyncAudio(length);
+        }
+
+        public float MoveBackForward()
+        {
+            // 倒帶邏輯：-1x -> -2x -> -4x ... -> -16x -> -1x
+            if (_currentRate > 0) _currentRate = -1.0f;
+            else _currentRate *= 2;
+
+            if (_currentRate < -16f) _currentRate = -1.0f;
+
+            _ = SyncAudio(_player.MediaPlayer.Time);
+            return _currentRate;
+        }
+
+        public void NegativeLog(double fps)
+        {
+            if (fps <= 0) fps = 29.97;
+            long current = _player.MediaPlayer.Time;
+            long frameMs = (long)(1000.0 / fps);
+            long target = Math.Max(0, current - frameMs);
+
+            _player.MediaPlayer.Time = target;
+            // 逐幀後退通常建議暫停音訊
+            _player.Pause();
+        }
         public async Task Play()
         {
             if (_player.MediaPlayer == null) return;
+
+            // 先啟動影像
             _player.MediaPlayer.Play();
-            ResetRate();
+            _player.MediaPlayer.SetRate(_currentRate);
+
             _meterTimer.Start();
-            if (_player.MediaPlayer.Time > 0) await SyncAudioToCurrentTime();
+
+            // 同步音訊橋接
+            await SyncAudio(_player.MediaPlayer.Time);
         }
 
         public void Pause()
@@ -49,106 +88,6 @@ namespace MxfPlayer.Controllers
             _resetMeters?.Invoke();
         }
 
-        // ⭐ 修正：回傳 Task
-        public async Task MoveFirst()
-        {
-            if (_player.MediaPlayer == null) return;
-            _player.MediaPlayer.Time = 0;
-            ResetRate();
-            await SyncAudioToCurrentTime();
-        }
-
-        // ⭐ 修正：回傳 Task
-        public async Task MoveLast()
-        {
-            if (_player.MediaPlayer == null) return;
-            long length = _player.MediaPlayer.Length;
-            if (length <= 0) return;
-
-            _player.MediaPlayer.Time = Math.Max(0, length - 1000);
-            ResetRate();
-            await SyncAudioToCurrentTime();
-        }
-
-        // ⭐ 修正：回傳 Task
-        public async Task PositiveLog()
-        {
-            if (_player.MediaPlayer == null) return;
-            _player.MediaPlayer.NextFrame();
-            ResetRate();
-            await SyncAudioToCurrentTime();
-        }
-
-        // ⭐ 修正：因為呼叫了 async 的 JumpMilliseconds，所以這裡也要 async Task
-        public async Task NegativeLog(double fps = 29.97)
-        {
-            if (_player.MediaPlayer == null) return;
-            int frameMs = (int)Math.Round(1000.0 / fps);
-            await JumpMilliseconds(-frameMs);
-        }
-
-        public float MoveFastForward()
-        {
-            if (_player.MediaPlayer == null) return 1f;
-            if (!_player.MediaPlayer.IsPlaying) _player.MediaPlayer.Play();
-            if (_forwardIndex < _forwardRates.Length - 1) _forwardIndex++;
-            _reverseIndex = 0;
-            float rate = _forwardRates[_forwardIndex];
-            _player.MediaPlayer.SetRate(rate);
-            return rate;
-        }
-
-        public float MoveBackForward()
-        {
-            if (_player.MediaPlayer == null) return -1f;
-            if (!_player.MediaPlayer.IsPlaying) _player.MediaPlayer.Play();
-            if (_reverseIndex < _reverseRates.Length - 1) _reverseIndex++;
-            _forwardIndex = 0;
-            float rate = _reverseRates[_reverseIndex];
-            _player.MediaPlayer.SetRate(rate);
-            return rate;
-        }
-
-        public async Task Jump(int seconds)
-        {
-            long current = _player.MediaPlayer.Time;
-            _player.MediaPlayer.Time = current + (seconds * 1000L);
-            await SyncAudioToCurrentTime();
-        }
-
-        // ⭐ 修正：回傳 Task
-        private async Task JumpMilliseconds(long ms)
-        {
-            if (_player.MediaPlayer == null) return;
-            long target = _player.MediaPlayer.Time + ms;
-            if (target < 0) target = 0;
-            long length = _player.MediaPlayer.Length;
-            if (length > 0 && target > length) target = length;
-
-            _player.MediaPlayer.Time = target;
-            ResetRate();
-            await SyncAudioToCurrentTime();
-        }
-
-        private void ResetRate()
-        {
-            if (_player.MediaPlayer == null) return;
-            _forwardIndex = 0;
-            _reverseIndex = 0;
-            _player.MediaPlayer.SetRate(1f);
-        }
-
-        public long GetCurrentTime() => _player.MediaPlayer?.Time ?? 0;
-        public long GetLength() => _player.MediaPlayer?.Length ?? 0;
-
-        public int GetTimelineValue(int maxValue)
-        {
-            if (_player.MediaPlayer == null) return 0;
-            long length = _player.MediaPlayer.Length;
-            if (length <= 0 || maxValue <= 0) return 0;
-            return (int)(_player.MediaPlayer.Time * maxValue / length);
-        }
-
         public async Task SeekByTimelineValue(int value, int maxValue)
         {
             if (_player.MediaPlayer == null || maxValue <= 0) return;
@@ -156,9 +95,80 @@ namespace MxfPlayer.Controllers
             if (length <= 0) return;
 
             long target = (long)value * length / maxValue;
+
+            // 1. 先讓 VLC 影像跳過去 (影像響應最重要)
             _player.MediaPlayer.Time = target;
 
-            await SyncAudioToCurrentTime();
+            // 2. 如果正在播放中，則同步音訊
+            if (_player.MediaPlayer.IsPlaying)
+            {
+                await SyncAudio(target);
+            }
+            else
+            {
+                // 如果是暫停狀態下 Seek，只需確保下一次 Play 時從正確位置開始
+                // 這裡可以選擇不啟動音訊橋接以節省效能
+            }
         }
+
+        public async Task Jump(int seconds)
+        {
+            if (_player.MediaPlayer == null) return;
+
+            long target = _player.MediaPlayer.Time + (seconds * 1000L);
+            if (target < 0) target = 0;
+            if (target > _player.MediaPlayer.Length) target = _player.MediaPlayer.Length;
+
+            _player.MediaPlayer.Time = target;
+
+            if (_player.MediaPlayer.IsPlaying)
+            {
+                await SyncAudio(target);
+            }
+        }
+
+        public float MoveFastForward()
+        {
+            // 倍速循環：1 -> 2 -> 4 -> 8 -> 16 -> 1
+            _currentRate = _currentRate * 2;
+            if (_currentRate > 16f) _currentRate = 1f;
+
+            // 立即更新影像與音訊橋接（含 atempo 濾鏡更新）
+            _ = SyncAudio(_player.MediaPlayer.Time);
+
+            return _currentRate;
+        }
+
+        public void ResetRate()
+        {
+            _currentRate = 1.0f;
+            if (_player.MediaPlayer.IsPlaying)
+            {
+                _ = SyncAudio(_player.MediaPlayer.Time);
+            }
+            else
+            {
+                _player.MediaPlayer.SetRate(1.0f);
+            }
+        }
+
+        // 逐幀前進 (Positive Log)
+        public async Task PositiveLog()
+        {
+            if (_player.MediaPlayer == null) return;
+
+            // 逐幀時通常不需要音訊橋接持續運作
+            // 但為了精準，我們讓 VLC 走一幀，然後暫停音訊橋接
+            _player.MediaPlayer.NextFrame();
+
+            // 如果你希望逐幀時也能聽到「吱」一聲的短促音訊：
+            // await SyncAudio(_player.MediaPlayer.Time);
+            // 但通常建議逐幀時 Pause 音訊以防緩衝堆積
+            _player.Pause();
+        }
+
+        public long GetCurrentTime() => _player.MediaPlayer?.Time ?? 0;
+        public long GetLength() => _player.MediaPlayer?.Length ?? 0;
+        public int GetTimelineValue(int maxValue) => (int)(GetLength() > 0 ? GetCurrentTime() * maxValue / GetLength() : 0);
     }
 }

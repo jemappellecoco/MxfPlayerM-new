@@ -9,9 +9,16 @@
     <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
   </PropertyGroup>
 
+  <ItemGroup>
+    <Content Include="config.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
  
 
   <ItemGroup>
+    <PackageReference Include="FFmpeg.AutoGen" Version="8.0.0.1" />
     <PackageReference Include="LibVLCSharp" Version="3.9.6" />
     <PackageReference Include="LibVLCSharp.WinForms" Version="3.9.6" />
     <PackageReference Include="NAudio" Version="2.3.0" />

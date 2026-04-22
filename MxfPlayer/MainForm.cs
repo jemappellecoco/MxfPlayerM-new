@@ -19,6 +19,7 @@ namespace MxfPlayer
         private readonly Dictionary<string, MediaInfoResult> _mediaCache = new();
         private readonly AudioMixerService _audioMixer = new();
         private readonly PlaybackController _playbackController;
+        private Panel _timelineLabelsPanel = null!;
         private readonly Random _rnd = new();
         private VideoView _videoView = null!;
         private TextBox _txtPath = null!;
@@ -46,8 +47,9 @@ namespace MxfPlayer
             ForeColor = Color.White;
 
             InitUI();
-            InitTimer(); 
+            InitTimer();
             _playbackController = new PlaybackController(_player, _meterTimer, ResetMeters);
+            this.FormClosing += (s, e) => _player.Dispose();
         }
         private void InitUI()
         {
@@ -482,16 +484,19 @@ namespace MxfPlayer
         }
         private void OnChannelCheckChanged(int channelIndex, bool isChecked)
         {
-            // 1. 更新 Mixer 紀錄 (用於顯示或邏輯判斷)
+            // 1. 更新遮罩
+            _player.ChannelMask[channelIndex] = isChecked;
             _audioMixer.SetChannelEnabled(channelIndex, isChecked);
 
-            // 2. ⭐ 直接更新 PlayerService 內的 Mask
-            // 因為 OnAudioPlay 每秒跑幾百次，它會即時讀到這個新狀態，達成秒切效果
-            _player.ChannelMask[channelIndex] = isChecked;
+            // 2. ⭐ 自動暫停：避免影音跑掉
+            // 呼叫控制器暫停，這會停止 Timer 並重設 Meter
+            HandlePause();
 
-            // 偵錯輸出
-            var selected = _audioMixer.GetSelectedIndices();
-            Console.WriteLine($"[Audio] Channel {channelIndex + 1} changed to {isChecked}. Selected = {string.Join(",", selected)}");
+            // 3. 立即重建濾鏡
+            // 傳入目前的倍速，確保暫停狀態下濾鏡參數也是正確的
+            _player.UpdateFilterGraph(_playbackController.CurrentRate);
+
+            Console.WriteLine($"[Audio] 聲道 {channelIndex + 1} 已變更，系統已自動暫停以確保影音同步。");
         }
         private void AddScaleLabel(Panel parent, string text, int top)
         {
@@ -689,9 +694,34 @@ namespace MxfPlayer
             if (!TryGetSelectedMediaFile(out var file) || file == null)
                 return;
 
-            // 這裡會進到我們上面改好的 StartPlaybackForFile
-            await StartPlaybackForFile(file);
-            _lblNow.Text = "1x";
+            // 1. 同步目前的 CheckBox 狀態到 Player
+            for (int i = 0; i < 8; i++)
+            {
+                _player.ChannelMask[i] = _channelChecks[i].Checked;
+            }
+
+            // 2. 顯示 Loading 並啟動
+            using (var loading = new LoadingForm(this, file.FileName))
+            {
+                loading.TopMost = true;
+                loading.Show();
+                loading.Refresh();
+
+                try
+                {
+                    // 改用 Controller 啟動，它內部會處理 PlaybackRate 與 StartAudioBridge
+                    await _playbackController.Play();
+                    _lblNow.ForeColor = Color.Orange;
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"播放失敗: {ex.Message}");
+                }
+                finally
+                {
+                    loading.Close();
+                }
+            }
         }
 
         private void HandlePause()
@@ -706,7 +736,7 @@ namespace MxfPlayer
 
         private async void HandleMoveLast()
         {
-            await  _playbackController.MoveLast();
+            await _playbackController.MoveLast();
         }
 
         private void HandleMoveBackForward()
@@ -1041,10 +1071,12 @@ namespace MxfPlayer
         private string FormatTimecodeFromMilliseconds(long ms)
         {
             if (ms < 0) ms = 0;
+            TimeSpan ts = TimeSpan.FromMilliseconds(ms);
 
-            var ts = TimeSpan.FromMilliseconds(ms);
+            // 假設 29.97 fps (每幀約 33.3ms)，如果 info 有值建議從 info 抓
+            int frame = (int)((ms % 1000) / 33.3);
 
-            return $"{ts.Hours:00}:{ts.Minutes:00}:{ts.Seconds:00}:{(ts.Milliseconds / 40):00}";
+            return $"{ts.Hours:00}:{ts.Minutes:00}:{ts.Seconds:00};{frame:00}";
         }
         private class DarkColorTable : ProfessionalColorTable
         {
