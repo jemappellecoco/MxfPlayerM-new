@@ -124,15 +124,18 @@ namespace MxfPlayer
             ShowMediaInfo(info);
         }
 
-        private async Task StartPlaybackForFile(MediaFile file, long startTimeMs = 0)
+        private async Task<bool> StartPlaybackForFile(MediaFile file, long startTimeMs = 0)
         {
-            if (_isStartingPlayback) return;
+            if (_isStartingPlayback) return false;
             _isStartingPlayback = true;
 
             try
             {
                 int audioCount = 8;
                 double fps = 29.97;
+
+                if (!_mediaCache.ContainsKey(file.FullPath))
+                    LoadAndShowMedia(file.FullPath);
 
                 if (_mediaCache.TryGetValue(file.FullPath, out var info))
                 {
@@ -164,11 +167,29 @@ namespace MxfPlayer
                 }
 
                 _meterTimer.Start();
+                return true;
             }
             finally
             {
                 _isStartingPlayback = false;
             }
+        }
+
+        private async Task PlaySelectedFileAsync(MediaFile file)
+        {
+            long startTimeMs = _player.CurrentPath == file.FullPath
+                ? _playbackController.GetCurrentTime()
+                : 0;
+
+            bool needsStart = _player.CurrentPath != file.FullPath || !_player.IsAudioReady;
+            if (needsStart)
+            {
+                bool started = await StartPlaybackForFile(file, startTimeMs);
+                if (!started) return;
+            }
+
+            await _playbackController.Play();
+            _lblNow.ForeColor = Color.Orange;
         }
         private double GetSelectedFps()
         {
@@ -315,10 +336,13 @@ namespace MxfPlayer
 
         private void UpdateVideoFrame()
         {
-            if (_player.CurrentFrameIndex == _displayedVideoFrameIndex) return;
-
-            var nextFrame = _player.CreateCurrentVideoFrameSnapshot(out var frameIndex);
+            var nextFrame = _player.CreateDisplayVideoFrameSnapshot(out var frameIndex);
             if (nextFrame == null) return;
+            if (frameIndex == _displayedVideoFrameIndex)
+            {
+                nextFrame.Dispose();
+                return;
+            }
 
             var previousFrame = _displayedVideoFrame;
             _displayedVideoFrame = nextFrame;
@@ -810,23 +834,11 @@ namespace MxfPlayer
 
             try
             {
-                // 憒??桀??????仿?獢??洵銝甈?StartAudioBridge
-                if (_player.CurrentPath != file.FullPath)
-                {
-                    await StartPlaybackForFile(file);
-                    await _playbackController.Play();
-                }
-                else
-                {
-                    // 撌脩??臬?銝??獢?撠勗??桀?雿蔭蝜潛??剜
-                    await _playbackController.Play();
-                }
-
-                _lblNow.ForeColor = Color.Orange;
+                await PlaySelectedFileAsync(file);
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"播放失敗: {ex.Message}");
+                MessageBox.Show($"æ’­æ”¾å¤±æ•—: {ex.Message}");
             }
         }
         private void HandlePause()
@@ -858,24 +870,29 @@ namespace MxfPlayer
             //_lblNow.Text = $"{rate:0}x";
         }
 
-        private void HandleNegativeLog()
+        private async void HandleNegativeLog()
         {
-            double fps = 29.97;
-
-            if (TryGetSelectedMediaFile(out var file) &&
-                file != null &&
-                _mediaCache.TryGetValue(file.FullPath, out var info) &&
-                double.TryParse(info.FrameRate, out var parsedFps))
-            {
-                fps = parsedFps;
-            }
+            double fps = GetSelectedFps();
 
             _playbackController.NegativeLog(fps);
+            await RefreshAfterFrameStepAsync(fps);
         }
 
-        private async Task HandlePositiveLog()
+        private async void HandlePositiveLog()
         {
-            await _playbackController.PositiveLog();
+            double fps = GetSelectedFps();
+            await _playbackController.PositiveLog(fps);
+            await RefreshAfterFrameStepAsync(fps);
+        }
+
+        private async Task RefreshAfterFrameStepAsync(double fps)
+        {
+            _displayedVideoFrameIndex = -1;
+            await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 1000);
+            UpdateVideoFrame();
+            UpdateTimelineUI(-1);
+            await _player.PlayFrameAudioAsync(_player.CurrentFrameIndex, fps);
+            UpdateMetersFromAudioLevel();
         }
 
         private async Task HandleJump(int seconds)
@@ -1117,12 +1134,15 @@ namespace MxfPlayer
             var row = _gridFiles.Rows[e.RowIndex];
             if (row.Tag is not MediaFile file) return;
 
-            if (_player.CurrentPath != file.FullPath)
+            try
             {
-                await StartPlaybackForFile(file);
+                _gridFiles.CurrentCell = row.Cells[0];
+                await PlaySelectedFileAsync(file);
             }
-
-            await _playbackController.Play();
+            catch (Exception ex)
+            {
+                MessageBox.Show($"æ’­æ”¾å¤±æ•—: {ex.Message}");
+            }
         }
 
         private void UpdateMetersFromAudioLevel()

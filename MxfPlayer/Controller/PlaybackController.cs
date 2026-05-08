@@ -67,11 +67,11 @@ namespace MxfPlayer.Controllers
         public void NegativeLog(double fps)
         {
             if (fps <= 0) fps = 29.97;
-            long current = _player.CurrentTimeMs;
-            long target = Math.Max(0, current - PlayerService.TimeMsFromFrame(1, fps));
+            long targetFrame = Math.Max(0, _player.CurrentFrameIndex - 1);
+            long target = PlayerService.TimeMsFromFrame(targetFrame, fps);
 
             _player.Seek(target);
-            _player.SeekAudioByFrame(PlayerService.FrameFromTimeMs(target, fps), fps);
+            _player.SeekAudioByFrame(targetFrame, fps);
             // 逐幀後退通常建議暫停音訊
             _player.Pause();
         }
@@ -159,8 +159,17 @@ namespace MxfPlayer.Controllers
         // 逐幀前進 (Positive Log)
         public async Task PositiveLog()
         {
-            _player.Seek(PlayerService.TimeMsFromFrame(PlayerService.FrameFromTimeMs(_player.CurrentTimeMs, 29.97) + 1, 29.97));
+            await PositiveLog(29.97);
+        }
+
+        public async Task PositiveLog(double fps)
+        {
+            if (fps <= 0) fps = 29.97;
+            long targetFrame = _player.CurrentFrameIndex + 1;
+            _player.Seek(PlayerService.TimeMsFromFrame(targetFrame, fps));
+            _player.SeekAudioByFrame(targetFrame, fps);
             _player.Pause();
+            await Task.CompletedTask;
         }
 
         public long GetCurrentTime() => _player.CurrentTimeMs;

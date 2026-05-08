@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Diagnostics;
+using System.Globalization;
 using NAudio.Wave;
 using FFmpeg.AutoGen;
 using System.Linq;
@@ -45,6 +46,8 @@ namespace MxfPlayer.Services
         private readonly List<Bitmap> _videoFrames = new();
         private const int MaxCachedVideoFrames = 1800;
         private const int VideoPreloadLowWaterFrames = 180;
+        private const int VideoDecoderRestartGapFrames = 12;
+        private const int MaxStaleDisplayFrames = 180;
         private long _currentFrameIndex;
         private long _totalVideoFrames;
         private CancellationTokenSource? _videoCts;
@@ -69,6 +72,7 @@ namespace MxfPlayer.Services
         public bool[] ChannelMask = new bool[8] { true, true, true, true, true, true, true, true };
         public string CurrentPath { get; private set; } = string.Empty;
         public int CurrentAudioCount { get; private set; }
+        public bool IsAudioReady => _waveOut != null && _fileAudioProvider != null;
         public long CurrentFrameIndex => _currentFrameIndex;
         public bool HasCurrentVideoFrame
         {
@@ -95,6 +99,37 @@ namespace MxfPlayer.Services
                 return _videoFrameCache.TryGetValue(_currentFrameIndex, out var frame)
                     ? (Image)frame.Clone()
                     : null;
+            }
+        }
+
+        public Image? CreateDisplayVideoFrameSnapshot(out long frameIndex)
+        {
+            lock (_lock)
+            {
+                frameIndex = _currentFrameIndex;
+                if (_videoFrameCache.TryGetValue(_currentFrameIndex, out var exactFrame))
+                    return (Image)exactFrame.Clone();
+
+                if (_videoFrameCache.Count == 0)
+                    return null;
+
+                long bestFrameIndex = _videoRate >= 0
+                    ? _videoFrameCache.Keys.Where(index => index <= _currentFrameIndex).DefaultIfEmpty(-1).Max()
+                    : _videoFrameCache.Keys.Where(index => index >= _currentFrameIndex).DefaultIfEmpty(-1).Min();
+
+                if (bestFrameIndex < 0 || !_videoFrameCache.ContainsKey(bestFrameIndex))
+                {
+                    bestFrameIndex = _videoFrameCache.Keys
+                        .OrderBy(index => Math.Abs(index - _currentFrameIndex))
+                        .First();
+                }
+
+                long maxStaleFrames = Math.Max(MaxStaleDisplayFrames, (long)Math.Ceiling(Math.Abs(_videoRate) * _audioFps));
+                if (Math.Abs(bestFrameIndex - _currentFrameIndex) > maxStaleFrames)
+                    return null;
+
+                frameIndex = bestFrameIndex;
+                return (Image)_videoFrameCache[bestFrameIndex].Clone();
             }
         }
         public long CurrentTimeMs => TimeMsFromFrame(_currentFrameIndex, _audioFps);
@@ -872,19 +907,25 @@ namespace MxfPlayer.Services
             amerge += $"amerge=inputs={_activeAudioTrackCount}[merged]";
 
             // 2. ?脤?頝舐 (pan)
-            List<string> leftChannels = new List<string>();
-            List<string> rightChannels = new List<string>();
+            List<string> selectedChannels = new List<string>();
             for (int i = 0; i < _activeAudioTrackCount; i++)
             {
                 if (i < ChannelMask.Length && ChannelMask[i])
-                {
-                    if (i % 2 == 0) leftChannels.Add($"c{i}");
-                    else rightChannels.Add($"c{i}");
-                }
+                    selectedChannels.Add($"c{i}");
             }
-            string leftMap = leftChannels.Count > 0 ? string.Join("+", leftChannels) : "0";
-            string rightMap = rightChannels.Count > 0 ? string.Join("+", rightChannels) : "0";
-            string pan = $"[merged]pan=stereo|c0={leftMap}|c1={rightMap}[panned]";
+
+            string mixedMap = "0";
+            if (selectedChannels.Count == 1)
+            {
+                mixedMap = selectedChannels[0];
+            }
+            else if (selectedChannels.Count > 1)
+            {
+                string gain = (1.0 / selectedChannels.Count).ToString("0.###", CultureInfo.InvariantCulture);
+                mixedMap = string.Join("+", selectedChannels.Select(ch => $"{gain}*{ch}"));
+            }
+
+            string pan = $"[merged]pan=stereo|c0={mixedMap}|c1={mixedMap}[panned]";
 
             // 3. ??霈???
             string tempoFilters = "";
@@ -1296,7 +1337,8 @@ namespace MxfPlayer.Services
             EnsureVideoDecoderNearCurrentFrame();
             EnsureAudioCacheForCurrentFrame();
 
-            if (_currentFrameIndex == 0 || _currentFrameIndex == _totalVideoFrames - 1)
+            if ((_videoRate < 0 && _currentFrameIndex == 0) ||
+                (_videoRate > 0 && _currentFrameIndex == _totalVideoFrames - 1))
                 Pause();
         }
 
@@ -1315,27 +1357,38 @@ namespace MxfPlayer.Services
         {
             if (string.IsNullOrEmpty(CurrentPath)) return;
 
+            long minCachedFrame = -1;
             long maxCachedFrame = -1;
+            bool restartLaggingDecoder = false;
             lock (_lock)
             {
                 if (_videoFrameCache.Count > 0)
-                    maxCachedFrame = _videoFrameCache.Keys.Max();
-
-                if (!forceRestart &&
-                    _videoFrameCache.ContainsKey(_currentFrameIndex) &&
-                    maxCachedFrame - _currentFrameIndex > VideoPreloadLowWaterFrames)
                 {
-                    return;
+                    minCachedFrame = _videoFrameCache.Keys.Min();
+                    maxCachedFrame = _videoFrameCache.Keys.Max();
                 }
+
+                if (!forceRestart && _videoFrameCache.ContainsKey(_currentFrameIndex))
+                {
+                    if (_videoRate >= 0 && maxCachedFrame - _currentFrameIndex > VideoPreloadLowWaterFrames)
+                        return;
+
+                    if (_videoRate < 0 && minCachedFrame >= 0 && _currentFrameIndex - minCachedFrame > VideoPreloadLowWaterFrames)
+                        return;
+                }
+
+                restartLaggingDecoder = _videoRate >= 0
+                    ? maxCachedFrame >= 0 && _currentFrameIndex > maxCachedFrame + VideoDecoderRestartGapFrames
+                    : minCachedFrame >= 0 && _currentFrameIndex < minCachedFrame - VideoDecoderRestartGapFrames;
             }
 
-            if (!forceRestart && _videoDecodeTask != null && !_videoDecodeTask.IsCompleted)
+            if (!forceRestart && _videoDecodeTask != null && !_videoDecodeTask.IsCompleted && !restartLaggingDecoder)
                 return;
 
             _videoCts?.Cancel();
             _videoCts?.Dispose();
             _videoCts = new CancellationTokenSource();
-            long startFrame = forceRestart || maxCachedFrame < _currentFrameIndex
+            long startFrame = forceRestart || restartLaggingDecoder || _videoRate < 0 || maxCachedFrame < _currentFrameIndex
                 ? _currentFrameIndex
                 : Math.Min(_totalVideoFrames - 1, maxCachedFrame + 1);
             var token = _videoCts.Token;
@@ -1369,6 +1422,40 @@ namespace MxfPlayer.Services
 
             _fileAudioProvider.SeekFrame(frameIndex, fps);
             _memoryAudioProvider?.SeekFrame(frameIndex, fps);
+        }
+
+        public Task PlayFrameAudioAsync(long frameIndex, double fps)
+        {
+            return Task.Run(() =>
+            {
+                if (fps <= 0) fps = 29.97;
+                if (_fileAudioProvider == null)
+                    return;
+
+                float previousRate = _videoRate;
+                bool wasPlaying = _isVideoPlaying;
+
+                _isVideoPlaying = false;
+                _playbackClock.Stop();
+                _videoRate = 1.0f;
+
+                SeekAudioByFrame(frameIndex, fps);
+                WaitForAudioBuffer(frameIndex, fps, 1.0f, 1000);
+
+                if (_fileAudioProvider != null)
+                    _fileAudioProvider.PlaybackRate = 1.0f;
+
+                PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
+
+                int frameMs = Math.Max(35, (int)Math.Ceiling(1000.0 / fps));
+                Thread.Sleep(frameMs + AudioOutputLatencyMs);
+
+                try { _waveOut?.Pause(); } catch { }
+
+                SeekAudioByFrame(frameIndex, fps);
+                _videoRate = previousRate;
+                _isVideoPlaying = wasPlaying;
+            });
         }
 
         private void EnsureAudioCacheForCurrentFrame()
