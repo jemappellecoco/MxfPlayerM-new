@@ -26,7 +26,7 @@ namespace MxfPlayer
         private DataGridView _gridFiles = null!;
         private TextBox _txtInfo = null!;
         private Label _lblCurrentFile = null!;
-        private Label _lblNow = null!;
+        private TextBox _lblNow = null!;
         private Label _lblStart = null!;
         private Label _lblDur = null!;
         private Label _lblRemain = null!;
@@ -39,6 +39,7 @@ namespace MxfPlayer
         private readonly List<Panel> _meterBars = new();
         private readonly List<CheckBox> _channelChecks = new();
         private bool _isStartingPlayback = false;
+        private bool _isEditingNowTimecode = false;
         public MainForm()
         {
             Text = "Offline xPlayer";
@@ -237,7 +238,8 @@ namespace MxfPlayer
 
                     // 4. ?湔??璅惜
                     // ?曉?? = 瑼?韏瑕?暺?(SOM) + ?剜?函??蝵?(current)
-                    _lblNow.Text = FormatTimecodeFromMilliseconds(somMs + current, fps);
+                    if (!_isEditingNowTimecode)
+                        SetNowTimecodeText(FormatTimecodeFromMilliseconds(somMs + current, fps));
 
                     // ?拚???蝣?
                     _lblRemain.Text = $"REM {FormatTimecodeFromMilliseconds(Math.Max(0, length - current), fps)}";
@@ -316,7 +318,7 @@ namespace MxfPlayer
         {
             _lblCurrentFile.Text = info.FileName;
             _lblStart.Text = $"START {info.Som}";
-            _lblNow.Text = info.Som;
+            SetNowTimecodeText(info.Som);
             _lblDur.Text = $"DUR {info.DurationTc}";
             _lblRemain.Text = $"REM {info.Eom}";
         }
@@ -447,13 +449,71 @@ namespace MxfPlayer
                 Location = new Point(410, 11)
             };
 
-            _lblNow = new Label
+            _lblNow = new TextBox
             {
-                Text = "00:00:00:00",
-                AutoSize = true,
+                Text = "00:00:00;00",
+                BorderStyle = BorderStyle.None,
+                BackColor = Color.FromArgb(58, 62, 67),
                 ForeColor = Color.Orange,
                 Font = new Font("Segoe UI", 14, FontStyle.Bold),
-                Location = new Point(540, 7)
+                Location = new Point(540, 8),
+                Size = new Size(130, 25),
+                MaxLength = 11,
+                TextAlign = HorizontalAlignment.Center
+            };
+            _lblNow.GotFocus += (_, _) =>
+            {
+                _isEditingNowTimecode = true;
+                _lblNow.SelectAll();
+            };
+            _lblNow.KeyDown += async (_, e) =>
+            {
+                if (e.KeyCode == Keys.Back || e.KeyCode == Keys.Delete)
+                {
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                    ZeroNowTimecodeDigit(e.KeyCode == Keys.Back);
+                    return;
+                }
+
+                if (e.KeyCode != Keys.Enter)
+                {
+                    _isEditingNowTimecode = true;
+                    return;
+                }
+
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                await SeekFromNowInputAsync();
+            };
+            _lblNow.KeyPress += async (_, e) =>
+            {
+                if (e.KeyChar == '\b')
+                {
+                    e.Handled = true;
+                    return;
+                }
+
+                if (char.IsDigit(e.KeyChar))
+                {
+                    e.Handled = true;
+                    ReplaceNowTimecodeDigitAtCursor(e.KeyChar);
+                    return;
+                }
+
+                if (e.KeyChar != '\r')
+                {
+                    e.Handled = true;
+                    return;
+                }
+
+                e.Handled = true;
+                await SeekFromNowInputAsync();
+            };
+            _lblNow.Leave += (_, _) =>
+            {
+                _isEditingNowTimecode = false;
+                UpdateTimelineUI(-1);
             };
 
             _lblDur = new Label
@@ -895,6 +955,61 @@ namespace MxfPlayer
             UpdateMetersFromAudioLevel();
         }
 
+        private async Task SeekFromNowInputAsync()
+        {
+            if (_isSeeking) return;
+            string input = _lblNow.Text.Trim();
+            if (string.IsNullOrEmpty(input))
+            {
+                UpdateTimelineUI(-1);
+                return;
+            }
+
+            double fps = GetSelectedFps();
+            long targetMs;
+
+            if (!TryGetMsFromTimecode(input, fps, out long inputMs))
+            {
+                _isEditingNowTimecode = false;
+                UpdateTimelineUI(-1);
+                return;
+            }
+
+            long somMs = 0;
+
+            if (TryGetSelectedMediaFile(out var file) &&
+                file != null &&
+                _mediaCache.TryGetValue(file.FullPath, out var info))
+            {
+                somMs = GetMsFromTimecode(info.Som, fps);
+            }
+
+            targetMs = inputMs >= somMs ? inputMs - somMs : inputMs;
+
+            targetMs = Math.Clamp(targetMs, 0, Math.Max(0, _player.LengthMs));
+
+            _isSeeking = true;
+            try
+            {
+                bool wasPlaying = _meterTimer.Enabled;
+                _playbackController.Pause();
+                _player.Seek(targetMs);
+                _displayedVideoFrameIndex = -1;
+                await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 3000);
+                UpdateVideoFrame();
+                _isEditingNowTimecode = false;
+                UpdateTimelineUI(-1);
+
+                if (wasPlaying)
+                    await _playbackController.Play();
+            }
+            finally
+            {
+                _isEditingNowTimecode = false;
+                _isSeeking = false;
+            }
+        }
+
         private async Task HandleJump(int seconds)
         {
             await _playbackController.Jump(seconds, GetSelectedFps());
@@ -1266,7 +1381,8 @@ namespace MxfPlayer
                         somMs = GetMsFromTimecode(info.Som, fps);
                     }
 
-                    _lblNow.Text = FormatTimecodeFromMilliseconds(somMs + current, fps);
+                    if (!_isEditingNowTimecode)
+                        SetNowTimecodeText(FormatTimecodeFromMilliseconds(somMs + current, fps));
                     _lblRemain.Text = $"REM {FormatTimecodeFromMilliseconds(Math.Max(0, length - current), fps)}";
                 }
             }
@@ -1275,6 +1391,115 @@ namespace MxfPlayer
                 _isUpdatingTimeline = false;
             }
         }
+        private bool TryGetMsFromTimecode(string tc, double fps, out long ms)
+        {
+            ms = 0;
+            string[] parts = tc.Split(':', ';');
+            if (parts.Length < 4) return false;
+
+            if (!int.TryParse(parts[0], out int h) ||
+                !int.TryParse(parts[1], out int m) ||
+                !int.TryParse(parts[2], out int s) ||
+                !int.TryParse(parts[3], out int f))
+            {
+                return false;
+            }
+
+            if (h < 0 || m < 0 || m > 59 || s < 0 || s > 59 || f < 0 || f >= Math.Ceiling(fps))
+                return false;
+
+            double totalSeconds = (h * 3600) + (m * 60) + s + (f / fps);
+            ms = (long)(totalSeconds * 1000);
+            return true;
+        }
+
+        private void ZeroNowTimecodeDigit(bool backspace)
+        {
+            _isEditingNowTimecode = true;
+            string text = _lblNow.Text;
+            int cursor = _lblNow.SelectionStart;
+
+            if (_lblNow.SelectionLength > 0)
+            {
+                int start = _lblNow.SelectionStart;
+                int end = Math.Min(text.Length, start + _lblNow.SelectionLength);
+
+                for (int i = start; i < end; i++)
+                    ReplaceNowTimecodeDigit(i, '0');
+
+                _lblNow.SelectionStart = start;
+                _lblNow.SelectionLength = 0;
+                return;
+            }
+
+            int position = backspace ? cursor - 1 : cursor;
+            int direction = backspace ? -1 : 1;
+            position = FindNowTimecodeDigitPosition(position, direction);
+
+            if (position < 0)
+                return;
+
+            ReplaceNowTimecodeDigit(position, '0');
+            _lblNow.SelectionStart = position;
+            _lblNow.SelectionLength = 0;
+        }
+
+        private void ReplaceNowTimecodeDigitAtCursor(char digit)
+        {
+            _isEditingNowTimecode = true;
+            int position = FindNowTimecodeDigitPosition(_lblNow.SelectionStart, 1);
+            if (position < 0) return;
+
+            ReplaceNowTimecodeDigit(position, digit);
+            int nextPosition = FindNowTimecodeDigitPosition(position + 1, 1);
+            _lblNow.SelectionStart = nextPosition >= 0 ? nextPosition : position;
+            _lblNow.SelectionLength = 0;
+        }
+
+        private void ReplaceNowTimecodeDigit(int position, char digit)
+        {
+            if (!IsNowTimecodeDigitPosition(position))
+                return;
+
+            char[] chars = NormalizeNowTimecodeText(_lblNow.Text).ToCharArray();
+            chars[position] = digit;
+            _lblNow.Text = new string(chars);
+        }
+
+        private int FindNowTimecodeDigitPosition(int position, int direction)
+        {
+            while (position >= 0 && position < 11)
+            {
+                if (IsNowTimecodeDigitPosition(position))
+                    return position;
+                position += direction;
+            }
+
+            return -1;
+        }
+
+        private bool IsNowTimecodeDigitPosition(int position)
+        {
+            return position >= 0 && position < 11 && position != 2 && position != 5 && position != 8;
+        }
+
+        private void SetNowTimecodeText(string timecode)
+        {
+            _lblNow.Text = NormalizeNowTimecodeText(timecode);
+        }
+
+        private string NormalizeNowTimecodeText(string timecode)
+        {
+            if (string.IsNullOrWhiteSpace(timecode))
+                return "00:00:00;00";
+
+            string normalized = timecode.Trim();
+            if (normalized.Length == 11 && (normalized[8] == ':' || normalized[8] == ';'))
+                normalized = normalized[..8] + ";" + normalized[9..];
+
+            return normalized;
+        }
+
         private long GetMsFromTimecode(string tc, double fps)
         {
             try
@@ -1352,7 +1577,8 @@ namespace MxfPlayer
                     somMs = GetMsFromTimecode(info.Som, fps);
                 }
 
-                _lblNow.Text = FormatTimecodeFromMilliseconds(somMs + elapsedMs, fps);
+                if (!_isEditingNowTimecode)
+                    SetNowTimecodeText(FormatTimecodeFromMilliseconds(somMs + elapsedMs, fps));
                 _lblRemain.Text = $"REM {FormatTimecodeFromMilliseconds(Math.Max(0, lengthMs - elapsedMs), fps)}";
             }
             finally
