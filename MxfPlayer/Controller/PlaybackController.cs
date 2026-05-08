@@ -10,8 +10,8 @@ namespace MxfPlayer.Controllers
         private readonly System.Windows.Forms.Timer _meterTimer;
         private readonly Action _resetMeters;
 
-        // 增加一個變數紀錄當前倍速，避免 Seek 後倍速跑掉
-        public float _currentRate = 1.0f;
+  
+    
         public float CurrentRate { get; private set; } = 1.0f;
         public PlaybackController(PlayerService player, System.Windows.Forms.Timer meterTimer, Action resetMeters)
         {
@@ -20,65 +20,69 @@ namespace MxfPlayer.Controllers
             _resetMeters = resetMeters;
         }
 
-        /// <summary>
-        /// 核心同步：確保 FFmpeg 解碼器跟上 VLC 的時間點與倍速
-        /// </summary>
-        private async Task SyncAudio(long timeMs)
-        {
-            if (string.IsNullOrEmpty(_player.CurrentPath)) return;
-
-            // 呼叫 Service 的 StartAudioBridge
-            // 該方法內部已經包含了 Stop 舊連結、設定 VLC Rate、啟動 FFmpeg 濾鏡的邏輯
-            await _player.StartAudioBridge(_player.CurrentPath, _player.CurrentAudioCount, timeMs, _currentRate);
-        }
+       
         public async Task MoveFirst()
         {
-            _player.MediaPlayer.Time = 0;
-            await SyncAudio(0);
+            _player.SeekVideoByFrame(0);
+            _player.SeekAudioByFrame(0, 29.97);
+            await Task.CompletedTask;
+        }
+
+        public async Task MoveFirst(double fps)
+        {
+            _player.SeekVideoByFrame(0);
+            _player.SeekAudioByFrame(0, fps);
+            await Task.CompletedTask;
         }
 
         public async Task MoveLast()
         {
-            long length = _player.MediaPlayer.Length;
-            _player.MediaPlayer.Time = length;
-            await SyncAudio(length);
+            long length = _player.LengthMs;
+            _player.SeekAudio(length);
+            _player.Seek(length);
+            await Task.CompletedTask;
+        }
+
+        public async Task MoveLast(double fps)
+        {
+            long length = _player.LengthMs;
+            long frame = PlayerService.FrameFromTimeMs(length, fps);
+            _player.SeekVideoByFrame(frame);
+            _player.SeekAudioByFrame(frame, fps);
+            await Task.CompletedTask;
         }
 
         public float MoveBackForward()
         {
-            // 倒帶邏輯：-1x -> -2x -> -4x ... -> -16x -> -1x
-            if (_currentRate > 0) _currentRate = -1.0f;
-            else _currentRate *= 2;
+            if (CurrentRate > 0) CurrentRate = -1.0f;
+            else CurrentRate *= 2;
+            if (CurrentRate < -16f) CurrentRate = -1.0f;
 
-            if (_currentRate < -16f) _currentRate = -1.0f;
+            _player.SetVideoRate(CurrentRate);
+            _meterTimer.Start();
 
-            _ = SyncAudio(_player.MediaPlayer.Time);
-            return _currentRate;
+            return CurrentRate;
         }
 
         public void NegativeLog(double fps)
         {
             if (fps <= 0) fps = 29.97;
-            long current = _player.MediaPlayer.Time;
-            long frameMs = (long)(1000.0 / fps);
-            long target = Math.Max(0, current - frameMs);
+            long current = _player.CurrentTimeMs;
+            long target = Math.Max(0, current - PlayerService.TimeMsFromFrame(1, fps));
 
-            _player.MediaPlayer.Time = target;
+            _player.Seek(target);
+            _player.SeekAudioByFrame(PlayerService.FrameFromTimeMs(target, fps), fps);
             // 逐幀後退通常建議暫停音訊
             _player.Pause();
         }
         public async Task Play()
         {
-            if (_player.MediaPlayer == null) return;
-
-            // 先啟動影像
-            _player.MediaPlayer.Play();
-            _player.MediaPlayer.SetRate(_currentRate);
+            _player.SetVideoRate(CurrentRate);
+            _player.ResumeAudio();
 
             _meterTimer.Start();
 
-            // 同步音訊橋接
-            await SyncAudio(_player.MediaPlayer.Time);
+            await Task.CompletedTask;
         }
 
         public void Pause()
@@ -88,87 +92,79 @@ namespace MxfPlayer.Controllers
             _resetMeters?.Invoke();
         }
 
-        public async Task SeekByTimelineValue(int value, int maxValue)
+        public void SeekByTimelineValue(int value, int maxValue)
         {
-            if (_player.MediaPlayer == null || maxValue <= 0) return;
-            long length = _player.MediaPlayer.Length;
+            SeekByTimelineValue(value, maxValue, 29.97);
+        }
+
+        public void SeekByTimelineValue(int value, int maxValue, double fps)
+        {
+            if (maxValue <= 0) return;
+
+            long length = _player.LengthMs;
             if (length <= 0) return;
 
-            long target = (long)value * length / maxValue;
+            long totalFrames = PlayerService.FrameFromTimeMs(length, fps);
+            long targetFrame = value * totalFrames / maxValue;
+            long target = PlayerService.TimeMsFromFrame(targetFrame, fps);
 
-            // 1. 先讓 VLC 影像跳過去 (影像響應最重要)
-            _player.MediaPlayer.Time = target;
+            if (target < 0) target = 0;
+            if (target > length) target = length;
 
-            // 2. 如果正在播放中，則同步音訊
-            if (_player.MediaPlayer.IsPlaying)
-            {
-                await SyncAudio(target);
-            }
-            else
-            {
-                // 如果是暫停狀態下 Seek，只需確保下一次 Play 時從正確位置開始
-                // 這裡可以選擇不啟動音訊橋接以節省效能
-            }
+            _player.Seek(target);
+            _player.SeekAudioByFrame(targetFrame, fps);
         }
 
         public async Task Jump(int seconds)
         {
-            if (_player.MediaPlayer == null) return;
+            await Jump(seconds, 29.97);
+        }
 
-            long target = _player.MediaPlayer.Time + (seconds * 1000L);
-            if (target < 0) target = 0;
-            if (target > _player.MediaPlayer.Length) target = _player.MediaPlayer.Length;
+        public async Task Jump(int seconds, double fps)
+        {
+            long length = _player.LengthMs;
+            long currentFrame = PlayerService.FrameFromTimeMs(_player.CurrentTimeMs, fps);
+            long jumpFrames = (long)Math.Round(seconds * fps);
+            long targetFrame = Math.Max(0, currentFrame + jumpFrames);
+            long totalFrames = PlayerService.FrameFromTimeMs(length, fps);
 
-            _player.MediaPlayer.Time = target;
+            if (length > 0 && targetFrame > totalFrames)
+                targetFrame = totalFrames;
 
-            if (_player.MediaPlayer.IsPlaying)
-            {
-                await SyncAudio(target);
-            }
+            long target = PlayerService.TimeMsFromFrame(targetFrame, fps);
+
+            _player.Seek(target);
+            _player.SeekAudioByFrame(targetFrame, fps);
+
+            await Task.CompletedTask;
         }
 
         public float MoveFastForward()
         {
-            // 倍速循環：1 -> 2 -> 4 -> 8 -> 16 -> 1
-            _currentRate = _currentRate * 2;
-            if (_currentRate > 16f) _currentRate = 1f;
+            if (CurrentRate < 0) CurrentRate = 1.0f;
+            else CurrentRate *= 2;
+            if (CurrentRate > 16.0f) CurrentRate = 1.0f;
 
-            // 立即更新影像與音訊橋接（含 atempo 濾鏡更新）
-            _ = SyncAudio(_player.MediaPlayer.Time);
-
-            return _currentRate;
+            _player.SetVideoRate(CurrentRate);
+            return CurrentRate;
         }
 
         public void ResetRate()
         {
-            _currentRate = 1.0f;
-            if (_player.MediaPlayer.IsPlaying)
-            {
-                _ = SyncAudio(_player.MediaPlayer.Time);
-            }
-            else
-            {
-                _player.MediaPlayer.SetRate(1.0f);
-            }
+            CurrentRate = 1.0f;
+            _player.SetVideoRate(1.0f);
+            _player.SetAudioRate(1.0f);
         }
 
         // 逐幀前進 (Positive Log)
         public async Task PositiveLog()
         {
-            if (_player.MediaPlayer == null) return;
-
-            // 逐幀時通常不需要音訊橋接持續運作
-            // 但為了精準，我們讓 VLC 走一幀，然後暫停音訊橋接
-            _player.MediaPlayer.NextFrame();
-
-            // 如果你希望逐幀時也能聽到「吱」一聲的短促音訊：
-            // await SyncAudio(_player.MediaPlayer.Time);
-            // 但通常建議逐幀時 Pause 音訊以防緩衝堆積
+            _player.Seek(PlayerService.TimeMsFromFrame(PlayerService.FrameFromTimeMs(_player.CurrentTimeMs, 29.97) + 1, 29.97));
             _player.Pause();
         }
 
-        public long GetCurrentTime() => _player.MediaPlayer?.Time ?? 0;
-        public long GetLength() => _player.MediaPlayer?.Length ?? 0;
+        public long GetCurrentTime() => _player.CurrentTimeMs;
+        public long GetLength() => _player.LengthMs;
         public int GetTimelineValue(int maxValue) => (int)(GetLength() > 0 ? GetCurrentTime() * maxValue / GetLength() : 0);
     }
 }

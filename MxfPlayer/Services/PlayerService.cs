@@ -1,14 +1,16 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using LibVLCSharp.Shared;
+using System.Diagnostics;
 using NAudio.Wave;
 using FFmpeg.AutoGen;
 using System.Linq;
+using System.Drawing;
+using System.Drawing.Imaging;
 
 namespace MxfPlayer.Services
 {
@@ -19,46 +21,94 @@ namespace MxfPlayer.Services
 
     public unsafe class PlayerService : IDisposable
     {
-        private readonly LibVLC _vlc;
-        private readonly MediaPlayer _mp;
-        private bool _filterReady = false; // 關鍵：確保解碼執行緒不會在重建期間推入資料
-        private Media? _currentMedia;
-        // --- 核心解碼變數 ---
+        private bool _filterReady = false; // ?嚗Ⅱ靽圾蝣澆銵?銝??券?撱箸???亥???
+        // --- ?詨?閫?Ⅳ霈 ---
         private AVFormatContext* _formatContext;
         private Dictionary<int, PointerWrapper<AVCodecContext>> _audioDecoders = new();
         private List<int> _audioStreamIndices = new();
-
-        // --- 濾鏡核心變數 ---
+        private readonly object _ffmpegResourceLock = new object();
+        private readonly object _audioCacheLock = new object();
+        // --- 瞈暸?詨?霈 ---
         private AVFilterGraph* _filterGraph;
         private AVFilterContext** _srcContexts;
         private AVFilterContext* _sinkContext;
         private int _activeAudioTrackCount = 0;
 
         private const int AV_BUFFERSRC_FLAG_KEEP_REF = 8;
-        private IWavePlayer _waveOut;
+        private IWavePlayer? _waveOut;
         private BufferedWaveProvider _waveProvider;
+        private MxfAudioProvider? _fileAudioProvider;
+        private MemoryPcmAudioProvider? _memoryAudioProvider;
+        private double _audioFps = 29.97;
+        private readonly Dictionary<long, Bitmap> _videoFrameCache = new();
+        private readonly Queue<long> _videoFrameCacheOrder = new();
+        private readonly List<Bitmap> _videoFrames = new();
+        private const int MaxCachedVideoFrames = 1800;
+        private const int VideoPreloadLowWaterFrames = 180;
+        private long _currentFrameIndex;
+        private long _totalVideoFrames;
+        private CancellationTokenSource? _videoCts;
+        private Task? _videoDecodeTask;
+        private CancellationTokenSource? _audioCacheCts;
+        private Task? _audioCacheTask;
+        private string? _pcmCachePath;
+        private int _audioCacheGeneration;
+        private double _videoFrameAccumulator;
+        private bool _isVideoPlaying;
+        private float _videoRate = 1.0f;
+        private readonly Stopwatch _playbackClock = new();
+        private long _playbackStartFrame;
+        private const int AudioOutputLatencyMs = 30;
+        private const int ReverseAudioCacheWindowMs = 15000;
+        private const int ReverseAudioCacheRefreshBehindMs = 1200;
 
-        private CancellationTokenSource _cts;
+        private CancellationTokenSource? _cts;
         private bool _isDecoding;
         private readonly object _lock = new object();
 
         public bool[] ChannelMask = new bool[8] { true, true, true, true, true, true, true, true };
-        public MediaPlayer MediaPlayer => _mp;
-        public string CurrentPath { get; private set; }
+        public string CurrentPath { get; private set; } = string.Empty;
         public int CurrentAudioCount { get; private set; }
+        public long CurrentFrameIndex => _currentFrameIndex;
+        public bool HasCurrentVideoFrame
+        {
+            get
+            {
+                lock (_lock)
+                    return _videoFrameCache.ContainsKey(_currentFrameIndex);
+            }
+        }
+        public Image? CurrentVideoFrame
+        {
+            get
+            {
+                lock (_lock)
+                    return _videoFrameCache.TryGetValue(_currentFrameIndex, out var frame) ? frame : null;
+            }
+        }
+        public Image? CreateCurrentVideoFrameSnapshot() => CreateCurrentVideoFrameSnapshot(out _);
+        public Image? CreateCurrentVideoFrameSnapshot(out long frameIndex)
+        {
+            lock (_lock)
+            {
+                frameIndex = _currentFrameIndex;
+                return _videoFrameCache.TryGetValue(_currentFrameIndex, out var frame)
+                    ? (Image)frame.Clone()
+                    : null;
+            }
+        }
+        public long CurrentTimeMs => TimeMsFromFrame(_currentFrameIndex, _audioFps);
+        public long LengthMs => _totalVideoFrames <= 0 ? 0 : TimeMsFromFrame(_totalVideoFrames - 1, _audioFps);
 
         private class PointerWrapper<T> where T : unmanaged { public T* Ptr; }
 
         public PlayerService()
         {
             LoadFFmpegFromConfig();
-            _vlc = new LibVLC();
-            _mp = new MediaPlayer(_vlc);
-            _mp.Mute = true;
 
             _waveProvider = new BufferedWaveProvider(new WaveFormat(48000, 16, 2))
             {
-                BufferDuration = TimeSpan.FromMilliseconds(3000),
+                BufferDuration = TimeSpan.FromMilliseconds(8000),
                 DiscardOnBufferOverflow = true
             };
         }
@@ -79,47 +129,599 @@ namespace MxfPlayer.Services
             catch { }
         }
 
-        public async Task StartAudioBridge(string path, int audioCount, long startTimeMs = 0, float rate = 1.0f)
+        public Task StartAudioBridge(string path, int audioCount, long startTimeMs = 0, float rate = 1.0f, double fps = 29.97)
         {
-            StopAudioBridge(); // 確保乾淨的開始
+            LoadForBufferedPlayback(path, audioCount, startTimeMs, rate, fps);
+            return WaitForFrameBufferAsync(FrameFromTimeMs(startTimeMs, fps), 3000);
+        }
+
+        private void LoadFullFile(string path, int audioCount, long startTimeMs, float rate, double fps)
+        {
+            LoadForBufferedPlayback(path, audioCount, startTimeMs, rate, fps);
+            return;
+
+            StopAudioBridge();
             CurrentPath = path;
             CurrentAudioCount = audioCount;
-            _cts = new CancellationTokenSource();
+            _audioFps = fps > 0 ? fps : 29.97;
+            DecodeVideoFrames(path);
+            byte[] pcmData = CreatePcmCacheData(path);
 
-            // 1. 初始化 FFmpeg
-            InitFFmpeg(path, rate);
+            // 1. ????FFmpeg
+            
 
-            // 2. 啟動音訊輸出 (NAudio)
-            _waveOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, 50);
-            _waveOut.Init(_waveProvider);
-            _waveOut.Play(); // 必須 Play 才有聲音
+            // 2. ???唾?頛詨 (NAudio)
+            _memoryAudioProvider = new MemoryPcmAudioProvider(pcmData, 2);
+            _memoryAudioProvider.PlaybackRate = Math.Abs(rate) > 0 ? Math.Abs(rate) : 1.0f;
+            _waveOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, 30);
+            _waveOut.Init(_memoryAudioProvider);
 
-            // 3. 啟動解碼執行緒
-            _isDecoding = true; // 必須設為 true
-            Task.Run(() => DecodeLoop(startTimeMs, _cts.Token)); // 啟動背景解碼
+            // 3. ??閫?Ⅳ?瑁?蝺?
+            
 
-            // 4. 初始化 VLC 媒體
-            _currentMedia = new Media(_vlc, path, FromType.FromPath);
+            SetVideoRate(rate);
+            long startFrame = FrameFromTimeMs(startTimeMs, _audioFps);
+            SeekAudioByFrame(startFrame, _audioFps);
+            SeekVideoByFrame(startFrame);
+        }
 
-            // 高倍速優化：增加緩存並降低硬體解碼抖動
-            _currentMedia.AddOption(":hwdec=auto");
-            _currentMedia.AddOption(":file-caching=2000"); // 增加快取有助於高倍速穩定
-            _currentMedia.AddOption($":start-time={startTimeMs / 1000.0}");
-            _currentMedia.AddOption(":clock-synchro=0"); // 告訴 VLC 不要因為音訊同步而等待
+        private byte[] CreatePcmCacheData(string path)
+        {
+            lock (_meterSamplesLock)
+            {
+                _meterSamples.Clear();
+            }
 
-            // 5. 使用事件回調，絕對不使用 Wait() 阻塞 UI
-            EventHandler<MediaPlayerMediaChangedEventArgs> handler = null!;
-            handler = (s, e) => {
-                _mp.MediaChanged -= handler;
-                // 在背景執行緒或非同步上下文設定 Rate，避免干擾渲染
-                Task.Run(() => {
-                    Thread.Sleep(100); // 給予底層解碼器極短的緩衝時間
-                    _mp.SetRate(rate);
-                });
-            };
-            _mp.MediaChanged += handler;
+            InitFFmpeg(path, 1.0f);
 
-            _mp.Play(_currentMedia);
+            using (var output = new MemoryStream())
+            {
+                DecodeToFile(output, CancellationToken.None);
+                CloseDecodeResources();
+                return output.ToArray();
+            }
+        }
+
+        private void LoadForBufferedPlayback(string path, int audioCount, long startTimeMs, float rate, double fps)
+        {
+            StopAudioBridge();
+            CurrentPath = path;
+            CurrentAudioCount = audioCount;
+            _audioFps = fps > 0 ? fps : 29.97;
+
+            long startFrame = FrameFromTimeMs(startTimeMs, _audioFps);
+            _totalVideoFrames = ProbeVideoFrameCount(path, _audioFps);
+
+            lock (_lock)
+            {
+                ClearVideoFrameCacheLocked();
+                _currentFrameIndex = Math.Clamp(startFrame, 0, Math.Max(0, _totalVideoFrames - 1));
+                _playbackStartFrame = _currentFrameIndex;
+            }
+
+            SetVideoRate(rate);
+            SeekVideoByFrame(startFrame);
+            StartAudioCacheFromFrame(startFrame, _audioFps, rate, false);
+        }
+
+        private void StartAudioCacheFromFrame(long frameIndex, double fps, float rate, bool keepPlaying)
+        {
+            lock (_audioCacheLock)
+            {
+                if (string.IsNullOrEmpty(CurrentPath)) return;
+
+                _audioCacheCts?.Cancel();
+
+                try
+                {
+                    _audioCacheTask?.Wait(500);
+                }
+                catch { }
+
+                _audioCacheCts?.Dispose();
+                _audioCacheCts = new CancellationTokenSource();
+                _audioCacheGeneration++;
+
+                try { _waveOut?.Stop(); } catch { }
+                try { _waveOut?.Dispose(); } catch { }
+                _waveOut = null;
+
+                _fileAudioProvider?.Dispose();
+                _fileAudioProvider = null;
+
+                if (!string.IsNullOrEmpty(_pcmCachePath))
+                {
+                    try { File.Delete(_pcmCachePath); } catch { }
+                    _pcmCachePath = null;
+                }
+
+                _pcmCachePath = Path.Combine(Path.GetTempPath(), $"MxfPlayer_{Guid.NewGuid():N}.pcm");
+                using (File.Create(_pcmCachePath)) { }
+
+                float effectiveRate = Math.Abs(rate) > 0 ? rate : 1.0f;
+                bool reverse = effectiveRate < 0;
+                long cacheStartFrame = frameIndex;
+
+                if (reverse)
+                {
+                    long reverseWindowFrames = FrameFromTimeMs((long)(ReverseAudioCacheWindowMs * Math.Abs(effectiveRate)), fps);
+                    cacheStartFrame = Math.Max(0, frameIndex - reverseWindowFrames);
+                }
+
+                long baseTimeMs = TimeMsFromFrame(cacheStartFrame, fps);
+
+                _fileAudioProvider = new MxfAudioProvider(_pcmCachePath, 2, baseTimeMs)
+                {
+                    PlaybackRate = effectiveRate
+                };
+
+                _fileAudioProvider.SeekFrame(frameIndex, fps);
+
+                _waveOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, 30);
+                _waveOut.Init(_fileAudioProvider);
+                var waveOut = _waveOut;
+                int generation = _audioCacheGeneration;
+
+                var token = _audioCacheCts.Token;
+                string pcmPath = _pcmCachePath;
+                string path = CurrentPath;
+
+                _audioCacheTask = Task.Run(() =>
+                {
+                    CreatePcmCacheFile(path, pcmPath, cacheStartFrame, fps, token);
+                }, token);
+
+                if (keepPlaying)
+                {
+                    Task.Run(() =>
+                    {
+                        WaitForAudioBuffer(frameIndex, fps, effectiveRate, 1000);
+                        PlayWaveOutIfCurrent(waveOut, generation);
+                    });
+                }
+            }
+        }
+
+        private void PlayWaveOutIfCurrent(IWavePlayer? waveOut, int generation)
+        {
+            if (waveOut == null) return;
+
+            lock (_audioCacheLock)
+            {
+                if (generation != _audioCacheGeneration || !ReferenceEquals(waveOut, _waveOut))
+                    return;
+
+                try
+                {
+                    waveOut.Play();
+                }
+                catch (ObjectDisposedException) { }
+                catch (NullReferenceException ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("[Audio Play ignored] " + ex.Message);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("[Audio Play ignored] " + ex.Message);
+                }
+            }
+        }
+
+        private void WaitForAudioBuffer(long frameIndex, double fps, float rate, int timeoutMs)
+        {
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                if (_fileAudioProvider == null)
+                    return;
+
+                bool available = rate < 0
+                    ? _fileAudioProvider.IsReverseFrameDataAvailable(frameIndex, fps, 50)
+                    : _fileAudioProvider.IsFrameDataAvailable(frameIndex, fps, 250);
+
+                if (available)
+                    return;
+
+                Thread.Sleep(20);
+            }
+        }
+
+        private void CreatePcmCacheFile(string path, string pcmPath, long startFrame, double fps, CancellationToken token)
+        {
+            try
+            {
+                lock (_meterSamplesLock)
+                {
+                    _meterSamples.Clear();
+                }
+
+                InitFFmpeg(path, 1.0f);
+
+                if (_formatContext != null && startFrame > 0)
+                {
+                    long startTimeMs = TimeMsFromFrame(startFrame, fps);
+                    long seekTarget = startTimeMs * ffmpeg.AV_TIME_BASE / 1000;
+
+                    if (ffmpeg.av_seek_frame(_formatContext, -1, seekTarget, ffmpeg.AVSEEK_FLAG_BACKWARD) >= 0)
+                    {
+                        foreach (var decoder in _audioDecoders.Values)
+                        {
+                            if (decoder.Ptr != null)
+                                ffmpeg.avcodec_flush_buffers(decoder.Ptr);
+                        }
+                    }
+                }
+
+                using (var output = new FileStream(pcmPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite))
+                {
+                    DecodeToFile(output, token);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            catch (SEHException ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[AudioCache SEH] " + ex.Message);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[AudioCache Error] " + ex.Message);
+            }
+            finally
+            {
+                CloseDecodeResources();
+            }
+        }
+
+        public Task WaitForFrameBufferAsync(long frameIndex, int timeoutMs = 3000)
+        {
+            return Task.Run(() =>
+            {
+                var sw = Stopwatch.StartNew();
+
+                while (sw.ElapsedMilliseconds < timeoutMs)
+                {
+                    lock (_lock)
+                    {
+                        if (_videoFrameCache.ContainsKey(frameIndex))
+                            return;
+                    }
+
+                    EnsureVideoDecoderNearCurrentFrame();
+                    Thread.Sleep(25);
+                }
+            });
+        }
+
+        private long ProbeVideoFrameCount(string path, double fps)
+        {
+            AVFormatContext* formatContext = null;
+            if (ffmpeg.avformat_open_input(&formatContext, path, null, null) < 0)
+                return 0;
+
+            try
+            {
+                ffmpeg.avformat_find_stream_info(formatContext, null);
+
+                for (int i = 0; i < formatContext->nb_streams; i++)
+                {
+                    var stream = formatContext->streams[i];
+                    if (stream->codecpar->codec_type != AVMediaType.AVMEDIA_TYPE_VIDEO)
+                        continue;
+
+                    if (stream->nb_frames > 0)
+                        return stream->nb_frames;
+
+                    long duration = stream->duration;
+                    AVRational timeBase = stream->time_base;
+                    if (duration <= 0 && formatContext->duration > 0)
+                    {
+                        duration = formatContext->duration;
+                        timeBase = new AVRational { num = 1, den = ffmpeg.AV_TIME_BASE };
+                    }
+
+                    if (duration > 0)
+                    {
+                        double seconds = duration * ffmpeg.av_q2d(timeBase);
+                        return Math.Max(1, (long)Math.Ceiling(seconds * fps));
+                    }
+                }
+            }
+            finally
+            {
+                ffmpeg.avformat_close_input(&formatContext);
+            }
+
+            return 0;
+        }
+
+        private void DecodeVideoFrames(string path)
+        {
+            DecodeVideoFrameWindow(path, _currentFrameIndex, CancellationToken.None);
+            return;
+
+            foreach (var cachedFrame in _videoFrames)
+                cachedFrame.Dispose();
+
+            _videoFrames.Clear();
+            _currentFrameIndex = 0;
+            _videoFrameAccumulator = 0;
+
+            AVFormatContext* formatContext = null;
+            if (ffmpeg.avformat_open_input(&formatContext, path, null, null) < 0) return;
+
+            AVCodecContext* codecContext = null;
+            SwsContext* swsContext = null;
+            AVFrame* frame = null;
+            AVFrame* rgbFrame = null;
+            AVPacket* packet = null;
+            byte* rgbBuffer = null;
+
+            try
+            {
+                ffmpeg.avformat_find_stream_info(formatContext, null);
+
+                int videoStreamIndex = -1;
+                for (int i = 0; i < formatContext->nb_streams; i++)
+                {
+                    if (formatContext->streams[i]->codecpar->codec_type == AVMediaType.AVMEDIA_TYPE_VIDEO)
+                    {
+                        videoStreamIndex = i;
+                        break;
+                    }
+                }
+
+                if (videoStreamIndex < 0) return;
+
+                var codecParameters = formatContext->streams[videoStreamIndex]->codecpar;
+                var codec = ffmpeg.avcodec_find_decoder(codecParameters->codec_id);
+                if (codec == null) return;
+
+                codecContext = ffmpeg.avcodec_alloc_context3(codec);
+                ffmpeg.avcodec_parameters_to_context(codecContext, codecParameters);
+                if (ffmpeg.avcodec_open2(codecContext, codec, null) < 0) return;
+
+                int width = codecContext->width;
+                int height = codecContext->height;
+                var sourceFormat = codecContext->pix_fmt;
+                var targetFormat = AVPixelFormat.AV_PIX_FMT_BGR24;
+
+                swsContext = ffmpeg.sws_getContext(
+                    width,
+                    height,
+                    sourceFormat,
+                    width,
+                    height,
+                    targetFormat,
+                    2,
+                    null,
+                    null,
+                    null);
+
+                int rgbBufferSize = width * height * 3;
+                rgbBuffer = (byte*)ffmpeg.av_malloc((ulong)rgbBufferSize);
+
+                frame = ffmpeg.av_frame_alloc();
+                rgbFrame = ffmpeg.av_frame_alloc();
+                packet = ffmpeg.av_packet_alloc();
+
+                rgbFrame->data[0] = rgbBuffer;
+                rgbFrame->linesize[0] = width * 3;
+
+                while (ffmpeg.av_read_frame(formatContext, packet) >= 0)
+                {
+                    if (packet->stream_index == videoStreamIndex)
+                    {
+                        if (ffmpeg.avcodec_send_packet(codecContext, packet) >= 0)
+                            ReceiveVideoFrames(codecContext, frame, rgbFrame, swsContext, width, height);
+                    }
+
+                    ffmpeg.av_packet_unref(packet);
+                }
+
+                ffmpeg.avcodec_send_packet(codecContext, null);
+                ReceiveVideoFrames(codecContext, frame, rgbFrame, swsContext, width, height);
+            }
+            finally
+            {
+                if (packet != null) ffmpeg.av_packet_free(&packet);
+                if (frame != null) ffmpeg.av_frame_free(&frame);
+                if (rgbFrame != null) ffmpeg.av_frame_free(&rgbFrame);
+                if (rgbBuffer != null) ffmpeg.av_free(rgbBuffer);
+                if (swsContext != null) ffmpeg.sws_freeContext(swsContext);
+                if (codecContext != null) ffmpeg.avcodec_free_context(&codecContext);
+                if (formatContext != null) ffmpeg.avformat_close_input(&formatContext);
+            }
+        }
+
+        private void ReceiveVideoFrames(AVCodecContext* codecContext, AVFrame* frame, AVFrame* rgbFrame, SwsContext* swsContext, int width, int height)
+        {
+            while (ffmpeg.avcodec_receive_frame(codecContext, frame) == 0)
+            {
+                ffmpeg.sws_scale(
+                    swsContext,
+                    frame->data,
+                    frame->linesize,
+                    0,
+                    height,
+                    rgbFrame->data,
+                    rgbFrame->linesize);
+
+                _videoFrames.Add(CreateBitmapFromFrame(rgbFrame, width, height));
+                ffmpeg.av_frame_unref(frame);
+            }
+        }
+
+        private Bitmap CreateBitmapFromFrame(AVFrame* rgbFrame, int width, int height)
+        {
+            var bitmap = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+            var data = bitmap.LockBits(
+                new Rectangle(0, 0, width, height),
+                ImageLockMode.WriteOnly,
+                System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+
+            try
+            {
+                int sourceStride = rgbFrame->linesize[0];
+                int targetStride = data.Stride;
+                int rowBytes = width * 3;
+
+                for (int y = 0; y < height; y++)
+                {
+                    IntPtr source = (IntPtr)(rgbFrame->data[0] + (y * sourceStride));
+                    IntPtr target = data.Scan0 + (y * targetStride);
+                    byte[] row = new byte[rowBytes];
+                    Marshal.Copy(source, row, 0, rowBytes);
+                    Marshal.Copy(row, 0, target, rowBytes);
+                }
+            }
+            finally
+            {
+                bitmap.UnlockBits(data);
+            }
+
+            return bitmap;
+        }
+
+        private void DecodeVideoFrameWindow(string path, long startFrame, CancellationToken token)
+        {
+            AVFormatContext* formatContext = null;
+            if (ffmpeg.avformat_open_input(&formatContext, path, null, null) < 0) return;
+
+            AVCodecContext* codecContext = null;
+            SwsContext* swsContext = null;
+            AVFrame* frame = null;
+            AVFrame* rgbFrame = null;
+            AVPacket* packet = null;
+            byte* rgbBuffer = null;
+
+            try
+            {
+                ffmpeg.avformat_find_stream_info(formatContext, null);
+
+                int videoStreamIndex = -1;
+                for (int i = 0; i < formatContext->nb_streams; i++)
+                {
+                    if (formatContext->streams[i]->codecpar->codec_type == AVMediaType.AVMEDIA_TYPE_VIDEO)
+                    {
+                        videoStreamIndex = i;
+                        break;
+                    }
+                }
+
+                if (videoStreamIndex < 0) return;
+
+                var stream = formatContext->streams[videoStreamIndex];
+                var codecParameters = stream->codecpar;
+                var codec = ffmpeg.avcodec_find_decoder(codecParameters->codec_id);
+                if (codec == null) return;
+
+                codecContext = ffmpeg.avcodec_alloc_context3(codec);
+                ffmpeg.avcodec_parameters_to_context(codecContext, codecParameters);
+                if (ffmpeg.avcodec_open2(codecContext, codec, null) < 0) return;
+
+                int width = codecContext->width;
+                int height = codecContext->height;
+                swsContext = ffmpeg.sws_getContext(
+                    width, height, codecContext->pix_fmt,
+                    width, height, AVPixelFormat.AV_PIX_FMT_BGR24,
+                    2, null, null, null);
+
+                int rgbBufferSize = width * height * 3;
+                rgbBuffer = (byte*)ffmpeg.av_malloc((ulong)rgbBufferSize);
+                frame = ffmpeg.av_frame_alloc();
+                rgbFrame = ffmpeg.av_frame_alloc();
+                packet = ffmpeg.av_packet_alloc();
+                rgbFrame->data[0] = rgbBuffer;
+                rgbFrame->linesize[0] = width * 3;
+
+                long seekFrame = Math.Max(0, startFrame - 3);
+                long seekTarget = ffmpeg.av_rescale_q(
+                    TimeMsFromFrame(seekFrame, _audioFps),
+                    new AVRational { num = 1, den = 1000 },
+                    stream->time_base);
+
+                if (ffmpeg.av_seek_frame(formatContext, videoStreamIndex, seekTarget, ffmpeg.AVSEEK_FLAG_BACKWARD) >= 0)
+                    ffmpeg.avcodec_flush_buffers(codecContext);
+
+                long nextFrameIndex = startFrame;
+
+                long windowEndFrame = Math.Min(_totalVideoFrames > 0 ? _totalVideoFrames : long.MaxValue, startFrame + MaxCachedVideoFrames);
+
+                while (!token.IsCancellationRequested && nextFrameIndex < windowEndFrame && ffmpeg.av_read_frame(formatContext, packet) >= 0)
+                {
+                    if (packet->stream_index == videoStreamIndex &&
+                        ffmpeg.avcodec_send_packet(codecContext, packet) >= 0)
+                    {
+                        DecodeWindowFrames(codecContext, frame, rgbFrame, swsContext, width, height, ref nextFrameIndex, token);
+
+                        if (nextFrameIndex >= windowEndFrame)
+                            break;
+                    }
+
+                    ffmpeg.av_packet_unref(packet);
+                }
+            }
+            finally
+            {
+                if (packet != null) ffmpeg.av_packet_free(&packet);
+                if (frame != null) ffmpeg.av_frame_free(&frame);
+                if (rgbFrame != null) ffmpeg.av_frame_free(&rgbFrame);
+                if (rgbBuffer != null) ffmpeg.av_free(rgbBuffer);
+                if (swsContext != null) ffmpeg.sws_freeContext(swsContext);
+                if (codecContext != null) ffmpeg.avcodec_free_context(&codecContext);
+                if (formatContext != null) ffmpeg.avformat_close_input(&formatContext);
+            }
+        }
+
+        private void DecodeWindowFrames(AVCodecContext* codecContext, AVFrame* frame, AVFrame* rgbFrame, SwsContext* swsContext, int width, int height, ref long nextFrameIndex, CancellationToken token)
+        {
+            while (!token.IsCancellationRequested && ffmpeg.avcodec_receive_frame(codecContext, frame) == 0)
+            {
+                long frameIndex = nextFrameIndex++;
+                ffmpeg.sws_scale(swsContext, frame->data, frame->linesize, 0, height, rgbFrame->data, rgbFrame->linesize);
+                AddVideoFrameToCache(frameIndex, CreateBitmapFromFrame(rgbFrame, width, height));
+
+                ffmpeg.av_frame_unref(frame);
+            }
+        }
+
+        private void AddVideoFrameToCache(long frameIndex, Bitmap bitmap)
+        {
+            lock (_lock)
+            {
+                if (_videoFrameCache.ContainsKey(frameIndex))
+                {
+                    bitmap.Dispose();
+                    return;
+                }
+
+                _videoFrameCache[frameIndex] = bitmap;
+                _videoFrameCacheOrder.Enqueue(frameIndex);
+
+                while (_videoFrameCacheOrder.Count > MaxCachedVideoFrames)
+                {
+                    long oldIndex = _videoFrameCacheOrder.Dequeue();
+                    if (Math.Abs(oldIndex - _currentFrameIndex) < 3)
+                    {
+                        _videoFrameCacheOrder.Enqueue(oldIndex);
+                        break;
+                    }
+
+                    if (_videoFrameCache.Remove(oldIndex, out var oldFrame))
+                        oldFrame.Dispose();
+                }
+            }
+        }
+
+        private void ClearVideoFrameCacheLocked()
+        {
+            foreach (var frame in _videoFrameCache.Values)
+                frame.Dispose();
+
+            _videoFrameCache.Clear();
+            _videoFrameCacheOrder.Clear();
         }
 
         private void InitFFmpeg(string path, float rate)
@@ -151,15 +753,27 @@ namespace MxfPlayer.Services
 
             _activeAudioTrackCount = _audioStreamIndices.Count;
             UpdateFilterGraph(rate);
-        }
 
+        }
+        private readonly float[] _channelLevels = new float[8];
+        private readonly object _levelLock = new();
+
+        public float GetChannelLevel(int index)
+        {
+            if (index < 0 || index >= _channelLevels.Length) return 0f;
+
+            lock (_levelLock)
+            {
+                return _channelLevels[index];
+            }
+        }
         public void UpdateFilterGraph(float rate)
         {
             lock (_lock)
             {
                 _filterReady = false;
 
-                // A. 重建前先清空緩衝區，確保下一秒聽到的就是新設定的聲音
+                // A. ?遣??皜征蝺抵??嚗Ⅱ靽?銝蝘?啁?撠望?啗身摰??脤
                 _waveProvider?.ClearBuffer();
 
                 if (_filterGraph != null)
@@ -175,7 +789,7 @@ namespace MxfPlayer.Services
                     _srcContexts = null;
                 }
 
-                if (_activeAudioTrackCount == 0) return;
+                if (_activeAudioTrackCount == 0 || _audioDecoders.Count == 0) return;
 
                 _filterGraph = ffmpeg.avfilter_graph_alloc();
                 _srcContexts = (AVFilterContext**)Marshal.AllocHGlobal(sizeof(AVFilterContext*) * _activeAudioTrackCount);
@@ -190,6 +804,7 @@ namespace MxfPlayer.Services
 
                     byte[] layoutName = new byte[64];
                     fixed (byte* pLayout = layoutName)
+                        // 撠?(int) ?寧 (nuint) 隞亦泵??size_t ??瘙?
                         ffmpeg.av_channel_layout_describe(&ctx->ch_layout, pLayout, (ulong)layoutName.Length);
 
                     string args = $"sample_rate={ctx->sample_rate}:sample_fmt={ffmpeg.av_get_sample_fmt_name(ctx->sample_fmt)}:channel_layout={System.Text.Encoding.UTF8.GetString(layoutName).TrimEnd('\0')}";
@@ -222,26 +837,26 @@ namespace MxfPlayer.Services
                 inputs->pad_idx = 0;
                 inputs->next = null;
 
-                // B. 使用修正後的 BuildFilterDesc
+                // B. 雿輻靽格迤敺? BuildFilterDesc
                 string filterDesc = BuildFilterDesc(rate);
 
                 int ret = ffmpeg.avfilter_graph_parse_ptr(_filterGraph, filterDesc, &inputs, &outputs, null);
                 
                 if (ret < 0)
                 {
-                    // 取得 FFmpeg 錯誤訊息
+                    // ?? FFmpeg ?航炊閮
                     byte* errBuff = (byte*)Marshal.AllocHGlobal(256);
                     ffmpeg.av_strerror(ret, errBuff, 256);
                     string errMsg = Marshal.PtrToStringAnsi((IntPtr)errBuff);
                     Marshal.FreeHGlobal((IntPtr)errBuff);
 
                     System.Diagnostics.Debug.WriteLine($"[FFmpeg Filter Error] {errMsg}");
-                    return; // 這裡失敗了，DecodeLoop 就不會運作，導致無聲
+                    return; // ?ㄐ憭望?鈭?DecodeLoop 撠曹???雿?撠?∟
                 }
                 if (ret >= 0)
                 {
                     ffmpeg.avfilter_graph_config(_filterGraph, null);
-                    _filterReady = true; // 重建完成，放行 DecodeLoop
+                    _filterReady = true; // ?遣摰?嚗銵?DecodeLoop
                 }
 
                 ffmpeg.avfilter_inout_free(&inputs);
@@ -251,12 +866,12 @@ namespace MxfPlayer.Services
 
         private string BuildFilterDesc(float rate)
         {
-            // 1. 建立基礎混音：將所有音軌合併成一個 merged 串流
+            // 1. 撱箇??箇?瘛琿
             string amerge = "";
             for (int i = 0; i < _activeAudioTrackCount; i++) amerge += $"[in{i}]";
             amerge += $"amerge=inputs={_activeAudioTrackCount}[merged]";
 
-            // 2. 聲道路由 (pan)：根據 ChannelMask 決定哪些聲道進 L/R
+            // 2. ?脤?頝舐 (pan)
             List<string> leftChannels = new List<string>();
             List<string> rightChannels = new List<string>();
             for (int i = 0; i < _activeAudioTrackCount; i++)
@@ -271,131 +886,209 @@ namespace MxfPlayer.Services
             string rightMap = rightChannels.Count > 0 ? string.Join("+", rightChannels) : "0";
             string pan = $"[merged]pan=stereo|c0={leftMap}|c1={rightMap}[panned]";
 
-            // 3. 處理變速濾鏡鏈
+            // 3. ??霈???
             string tempoFilters = "";
+            // ?詨?靽格迤嚗ate < 0 ?身??volume=0
             if (rate <= 0)
             {
-                // 暫時將 0x 或負數速設為靜音，直到實作 areverse
                 tempoFilters = "volume=0";
             }
             else
             {
-                List<string> listatempo = new List<string>();
+                // 甇??霈?頛?(atempo ??
+                List<string> filters = new List<string>();
                 float tempRate = rate;
-
-                // 當倍速大於 2.0，不斷疊加 2.0x 濾鏡
-                while (tempRate > 2.0f)
-                {
-                    listatempo.Add("atempo=2.0");
-                    tempRate /= 2.0f;
-                }
-
-                // 當倍速小於 0.5，不斷疊加 0.5x 濾鏡
-                while (tempRate < 0.5f)
-                {
-                    listatempo.Add("atempo=0.5");
-                    tempRate /= 0.5f;
-                }
-
-                // 最後補上剩餘的倍速（如果是 1.0 則會自動忽略或微調）
-                if (tempRate != 1.0f || listatempo.Count == 0)
-                {
-                    listatempo.Add($"atempo={tempRate:F2}");
-                }
-
-                tempoFilters = string.Join(",", listatempo);
+                while (tempRate > 2.0f) { filters.Add("atempo=2.0"); tempRate /= 2.0f; }
+                while (tempRate < 0.5f) { filters.Add("atempo=0.5"); tempRate /= 0.5f; }
+                if (tempRate != 1.0f || filters.Count == 0) filters.Add($"atempo={tempRate:F2}");
+                tempoFilters = string.Join(",", filters);
             }
 
-            // 4. 最終組合：混合 -> 聲道路由 -> 變速鏈 -> 強制轉碼
             return $"{amerge};{pan};[panned]{tempoFilters},aresample=48000,aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo";
+        }
+        public float GetChannelLevelAtTime(int channel, long currentTimeMs)
+        {
+            const long windowMs = 120;
+            float peak = 0f;
+
+            lock (_meterSamplesLock)
+            {
+                for (int i = _meterSamples.Count - 1; i >= 0; i--)
+                {
+                    var s = _meterSamples[i];
+
+                    if (s.TimeMs < currentTimeMs - windowMs)
+                        break;
+
+                    if (s.Channel == channel &&
+                        s.TimeMs <= currentTimeMs &&
+                        s.TimeMs >= currentTimeMs - windowMs)
+                    {
+                        peak = Math.Max(peak, s.Peak);
+                    }
+                }
+            }
+
+            return peak;
         }
         private void DecodeLoop(long startTimeMs, CancellationToken token)
         {
+            System.Diagnostics.Debug.WriteLine("[Decode] started");
+
             AVPacket* packet = ffmpeg.av_packet_alloc();
             AVFrame* frame = ffmpeg.av_frame_alloc();
             AVFrame* filtFrame = ffmpeg.av_frame_alloc();
 
             try
             {
-                // 1. 尋求起始時間點
-                lock (_lock)
+                // startTimeMs = 0 銝? seek嚗??MXF ?∩?
+                if (startTimeMs > 0)
                 {
-                    if (_formatContext != null)
-                        ffmpeg.av_seek_frame(_formatContext, -1, startTimeMs * 1000, ffmpeg.AVSEEK_FLAG_BACKWARD);
-                }
+                    System.Diagnostics.Debug.WriteLine("[Decode] seek start");
 
-                while (!token.IsCancellationRequested && _isDecoding)
-                {
-                    int readRet = -1;
-
-                    // 2. 讀取封包 (僅在讀取時鎖定)
                     lock (_lock)
                     {
                         if (_formatContext != null)
-                            readRet = ffmpeg.av_read_frame(_formatContext, packet);
+                        {
+                            long seekTarget = startTimeMs * 1000;
+                            int seekRet = ffmpeg.av_seek_frame(
+                                _formatContext,
+                                -1,
+                                seekTarget,
+                                ffmpeg.AVSEEK_FLAG_BACKWARD
+                            );
+
+                            System.Diagnostics.Debug.WriteLine($"[Decode] seek ret={seekRet}");
+                        }
+                    }
+                }
+
+                System.Diagnostics.Debug.WriteLine("[Decode] loop enter");
+
+                while (!token.IsCancellationRequested && _isDecoding)
+                {
+                    int readRet;
+
+                    lock (_lock)
+                    {
+                        if (_formatContext == null)
+                            break;
+
+                        readRet = ffmpeg.av_read_frame(_formatContext, packet);
                     }
 
-                    if (readRet >= 0)
+                    if (readRet < 0)
                     {
-                        if (_audioDecoders.TryGetValue(packet->stream_index, out var ctxWrapper))
+                        if (readRet == ffmpeg.AVERROR_EOF)
                         {
-                            if (ffmpeg.avcodec_send_packet(ctxWrapper.Ptr, packet) >= 0)
+                            //System.Diagnostics.Debug.WriteLine("[Decode] EOF");
+                            //break;
+                        }
+
+                        Thread.Sleep(1);
+                        continue;
+                    }
+
+                    int streamIndex = packet->stream_index;
+
+                    if (!_audioDecoders.TryGetValue(streamIndex, out var ctxWrapper))
+                    {
+                        ffmpeg.av_packet_unref(packet);
+                        continue;
+                    }
+
+                    int idx = _audioStreamIndices.IndexOf(streamIndex);
+
+                    int sendRet = ffmpeg.avcodec_send_packet(ctxWrapper.Ptr, packet);
+                    ffmpeg.av_packet_unref(packet);
+
+                    if (sendRet < 0)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[SendPacket Error] stream={streamIndex}, ret={sendRet}");
+                        continue;
+                    }
+
+                    while (true)
+                    {
+                        int recvRet = ffmpeg.avcodec_receive_frame(ctxWrapper.Ptr, frame);
+
+                        if (recvRet == ffmpeg.AVERROR(ffmpeg.EAGAIN) || recvRet == ffmpeg.AVERROR_EOF)
+                            break;
+
+                        if (recvRet < 0)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"[ReceiveFrame Error] stream={streamIndex}, ret={recvRet}");
+                            break;
+                        }
+
+                        if (idx >= 0 && idx < 8)
+                        {
+
+                            float peak = CalculatePeakFromFrame(frame);
+
+                            long ptsMs = 0;
+                            var stream = _formatContext->streams[streamIndex];
+
+                            if (frame->best_effort_timestamp != ffmpeg.AV_NOPTS_VALUE)
                             {
-                                while (ffmpeg.avcodec_receive_frame(ctxWrapper.Ptr, frame) >= 0)
+                                ptsMs = ffmpeg.av_rescale_q(
+                                    frame->best_effort_timestamp,
+                                    stream->time_base,
+                                    new AVRational { num = 1, den = 1000 }
+                                );
+                            }
+
+                            lock (_meterSamplesLock)
+                            {
+                                _meterSamples.Add(new MeterSample
                                 {
-                                    byte[] pcmData = null;
+                                    TimeMs = ptsMs,
+                                    Channel = idx,
+                                    Peak = peak
+                                });
+                            }
+                        }
 
-                                    // 3. 濾鏡處理 (僅針對 FFmpeg 指標操作進行鎖定)
-                                    lock (_lock)
+                        lock (_lock)
+                        {
+                            if (_filterReady && _srcContexts != null && _sinkContext != null && idx >= 0)
+                            {
+                                int addRet = ffmpeg.av_buffersrc_add_frame_flags(
+                                    _srcContexts[idx],
+                                    frame,
+                                    (int)AV_BUFFERSRC_FLAG_KEEP_REF
+                                );
+
+                                if (addRet >= 0)
+                                {
+                                    while (ffmpeg.av_buffersink_get_frame(_sinkContext, filtFrame) >= 0)
                                     {
-                                        int idx = _audioStreamIndices.IndexOf(packet->stream_index);
-                                        if (_filterReady && _srcContexts != null && _sinkContext != null && idx >= 0)
-                                        {
-                                            ffmpeg.av_buffersrc_add_frame_flags(_srcContexts[idx], frame, AV_BUFFERSRC_FLAG_KEEP_REF);
+                                        byte[] pcmData = ExtractPcm(filtFrame);
+                                        ffmpeg.av_frame_unref(filtFrame);
 
-                                            if (ffmpeg.av_buffersink_get_frame(_sinkContext, filtFrame) >= 0)
-                                            {
-                                                pcmData = ExtractPcm(filtFrame);
-                                                ffmpeg.av_frame_unref(filtFrame);
-                                            }
-                                        }
+                                        if (pcmData.Length > 0)
+                                            _waveProvider.AddSamples(pcmData, 0, pcmData.Length);
                                     }
-
-                                    // 4. 關鍵優化：將 AddSamples 移出 lock，防止阻塞渲染執行緒
-                                    if (pcmData != null && pcmData.Length > 0)
-                                    {
-                                        _waveProvider.AddSamples(pcmData, 0, pcmData.Length);
-                                    }
-
-                                    ffmpeg.av_frame_unref(frame);
                                 }
                             }
                         }
-                        ffmpeg.av_packet_unref(packet);
-                    }
-                    else if (readRet == ffmpeg.AVERROR_EOF)
-                    {
-                        break;
+
+                        ffmpeg.av_frame_unref(frame);
                     }
 
-                    // 5. 動態頻率控制：根據倍速調整睡眠時間
-                    // 取得目前的播放倍速 (避免頻繁跨執行緒讀取，可考慮在 PlayerService 存一個 float _currentRate)
-                    float currentRate = _mp.Rate;
+                    //float currentRate = Math.Abs(_mp.Rate);
+                    //if (currentRate <= 0) currentRate = 1;
 
-                    // 緩衝區控制：高倍速下允許更多的預載 (2000ms)，一般速度維持 500ms
-                    int bufferLimit = currentRate > 2.0f ? 2000 : 500;
+                    //int bufferLimit = currentRate > 2.0f ? 2000 : 500;
 
-                    if (_waveProvider.BufferedDuration.TotalMilliseconds > bufferLimit)
+                    //if (_waveProvider.BufferedDuration.TotalMilliseconds > bufferLimit)
+                    //    Thread.Sleep(currentRate > 4.0f ? 5 : 15);
+                    //else
+                    //    Thread.Sleep(0);
+                    // 潃?摰銝?撟脫?唾? pipeline
+                    if (_waveProvider.BufferedDuration.TotalMilliseconds > 4000)
                     {
-                        // 緩衝足夠時，根據倍速決定睡眠長度
-                        // 倍速越高，睡眠越短，以免來不及填補消耗
-                        int sleepMs = currentRate > 4.0f ? 5 : 15;
-                        Thread.Sleep(sleepMs);
-                    }
-                    else
-                    {
-                        // 緩衝不足時，全力解碼，僅釋放 CPU 時間片
-                        Thread.Sleep(0);
+                        Thread.Sleep(1); // ?芸??頛凝靽風
                     }
                 }
             }
@@ -408,8 +1101,130 @@ namespace MxfPlayer.Services
                 ffmpeg.av_packet_free(&packet);
                 ffmpeg.av_frame_free(&frame);
                 ffmpeg.av_frame_free(&filtFrame);
+
+                System.Diagnostics.Debug.WriteLine("[Decode] ended");
             }
         }
+
+        private void DecodeToFile(Stream output, CancellationToken token)
+        {
+            AVPacket* packet = ffmpeg.av_packet_alloc();
+            AVFrame* frame = ffmpeg.av_frame_alloc();
+            AVFrame* filtFrame = ffmpeg.av_frame_alloc();
+
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    int readRet;
+
+                    lock (_lock)
+                    {
+                        if (_formatContext == null)
+                            break;
+
+                        readRet = ffmpeg.av_read_frame(_formatContext, packet);
+                    }
+
+                    if (readRet < 0)
+                        break;
+
+                    int streamIndex = packet->stream_index;
+
+                    if (!_audioDecoders.TryGetValue(streamIndex, out var ctxWrapper))
+                    {
+                        ffmpeg.av_packet_unref(packet);
+                        continue;
+                    }
+
+                    int idx = _audioStreamIndices.IndexOf(streamIndex);
+                    int sendRet = ffmpeg.avcodec_send_packet(ctxWrapper.Ptr, packet);
+                    ffmpeg.av_packet_unref(packet);
+
+                    if (sendRet < 0)
+                        continue;
+
+                    while (true)
+                    {
+                        int recvRet = ffmpeg.avcodec_receive_frame(ctxWrapper.Ptr, frame);
+
+                        if (recvRet == ffmpeg.AVERROR(ffmpeg.EAGAIN) || recvRet == ffmpeg.AVERROR_EOF)
+                            break;
+
+                        if (recvRet < 0)
+                            break;
+
+                        if (idx >= 0 && idx < 8)
+                        {
+                            float peak = CalculatePeakFromFrame(frame);
+                            long ptsMs = 0;
+                            var stream = _formatContext->streams[streamIndex];
+
+                            if (frame->best_effort_timestamp != ffmpeg.AV_NOPTS_VALUE)
+                            {
+                                ptsMs = ffmpeg.av_rescale_q(
+                                    frame->best_effort_timestamp,
+                                    stream->time_base,
+                                    new AVRational { num = 1, den = 1000 }
+                                );
+                            }
+
+                            lock (_meterSamplesLock)
+                            {
+                                _meterSamples.Add(new MeterSample
+                                {
+                                    TimeMs = ptsMs,
+                                    Channel = idx,
+                                    Peak = peak
+                                });
+                            }
+                        }
+
+                        lock (_lock)
+                        {
+                            if (_filterReady && _srcContexts != null && _sinkContext != null && idx >= 0)
+                            {
+                                int addRet = ffmpeg.av_buffersrc_add_frame_flags(
+                                    _srcContexts[idx],
+                                    frame,
+                                    (int)AV_BUFFERSRC_FLAG_KEEP_REF
+                                );
+
+                                if (addRet >= 0)
+                                {
+                                    while (ffmpeg.av_buffersink_get_frame(_sinkContext, filtFrame) >= 0)
+                                    {
+                                        byte[] pcmData = ExtractPcm(filtFrame);
+                                        ffmpeg.av_frame_unref(filtFrame);
+
+                                        if (pcmData.Length > 0)
+                                            output.Write(pcmData, 0, pcmData.Length);
+                                    }
+                                }
+                            }
+                        }
+
+                        ffmpeg.av_frame_unref(frame);
+                    }
+                }
+            }
+            finally
+            {
+                ffmpeg.av_packet_free(&packet);
+                ffmpeg.av_frame_free(&frame);
+                ffmpeg.av_frame_free(&filtFrame);
+            }
+        }
+
+        private class MeterSample
+        {
+            public long TimeMs;
+            public int Channel;
+            public float Peak;
+        }
+
+        private readonly List<MeterSample> _meterSamples = new();
+        private readonly object _meterSamplesLock = new();
         private byte[] ExtractPcm(AVFrame* frame)
         {
             int channels = frame->ch_layout.nb_channels;
@@ -419,29 +1234,258 @@ namespace MxfPlayer.Services
             return res;
         }
 
-        public void Pause() { _mp.Pause(); _waveOut?.Pause(); }
 
+        public void Pause()
+        {
+            _isVideoPlaying = false;
+            _playbackClock.Stop();
+            try { _waveOut?.Pause(); } catch { }
+
+            // ???歇蝬??圾憟賜??脤嚗??resume ???buffer
+            _waveProvider?.ClearBuffer();
+        }
+
+        public void ResumeAudio()
+        {
+            SeekAudioByFrame(_currentFrameIndex, _audioFps);
+            _playbackStartFrame = _currentFrameIndex;
+            WaitForAudioBuffer(_currentFrameIndex, _audioFps, _videoRate, 1000);
+            _playbackClock.Restart();
+            _isVideoPlaying = true;
+            PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
+        }
+
+        public void SetAudioRate(float rate)
+        {
+            float effectiveRate = Math.Abs(rate) > 0 ? rate : 1.0f;
+
+            if (_fileAudioProvider != null)
+                _fileAudioProvider.PlaybackRate = effectiveRate;
+            if (_memoryAudioProvider != null)
+                _memoryAudioProvider.PlaybackRate = effectiveRate;
+
+            if (_isVideoPlaying && _fileAudioProvider != null)
+            {
+                StartAudioCacheFromFrame(_currentFrameIndex, _audioFps, effectiveRate, false);
+                WaitForAudioBuffer(_currentFrameIndex, _audioFps, effectiveRate, 1000);
+                PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
+            }
+        }
+
+        public void SetVideoRate(float rate)
+        {
+            AdvanceVideo(0);
+            _videoRate = rate == 0 ? 1.0f : rate;
+            SetAudioRate(_videoRate);
+            _playbackStartFrame = _currentFrameIndex;
+            if (_isVideoPlaying)
+                _playbackClock.Restart();
+        }
+
+        public void AdvanceVideo(int elapsedMs)
+        {
+            if (!_isVideoPlaying || _totalVideoFrames <= 0) return;
+
+            double clockElapsedMs = Math.Max(0, _playbackClock.Elapsed.TotalMilliseconds - AudioOutputLatencyMs);
+            long framesToMove = (long)Math.Floor(clockElapsedMs * _audioFps * Math.Abs(_videoRate) / 1000.0);
+            if (_videoRate >= 0)
+                _currentFrameIndex = Math.Min(_totalVideoFrames - 1, _playbackStartFrame + framesToMove);
+            else
+                _currentFrameIndex = Math.Max(0, _playbackStartFrame - framesToMove);
+
+            EnsureVideoDecoderNearCurrentFrame();
+            EnsureAudioCacheForCurrentFrame();
+
+            if (_currentFrameIndex == 0 || _currentFrameIndex == _totalVideoFrames - 1)
+                Pause();
+        }
+
+        public void SeekVideoByFrame(long frameIndex)
+        {
+            if (_totalVideoFrames <= 0) return;
+            _currentFrameIndex = Math.Clamp(frameIndex, 0, _totalVideoFrames - 1);
+            _videoFrameAccumulator = 0;
+            _playbackStartFrame = _currentFrameIndex;
+            EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
+            if (_isVideoPlaying)
+                _playbackClock.Restart();
+        }
+
+        private void EnsureVideoDecoderNearCurrentFrame(bool forceRestart = false)
+        {
+            if (string.IsNullOrEmpty(CurrentPath)) return;
+
+            long maxCachedFrame = -1;
+            lock (_lock)
+            {
+                if (_videoFrameCache.Count > 0)
+                    maxCachedFrame = _videoFrameCache.Keys.Max();
+
+                if (!forceRestart &&
+                    _videoFrameCache.ContainsKey(_currentFrameIndex) &&
+                    maxCachedFrame - _currentFrameIndex > VideoPreloadLowWaterFrames)
+                {
+                    return;
+                }
+            }
+
+            if (!forceRestart && _videoDecodeTask != null && !_videoDecodeTask.IsCompleted)
+                return;
+
+            _videoCts?.Cancel();
+            _videoCts?.Dispose();
+            _videoCts = new CancellationTokenSource();
+            long startFrame = forceRestart || maxCachedFrame < _currentFrameIndex
+                ? _currentFrameIndex
+                : Math.Min(_totalVideoFrames - 1, maxCachedFrame + 1);
+            var token = _videoCts.Token;
+            _videoDecodeTask = Task.Run(() => DecodeVideoFrameWindow(CurrentPath, startFrame, token), token);
+        }
+
+        public void Seek(long timeMs)
+        {
+            long frame = FrameFromTimeMs(timeMs, _audioFps);
+            SeekVideoByFrame(frame);
+            SeekAudioByFrame(frame, _audioFps);
+        }
+
+        public void SeekAudio(long timeMs)
+        {
+            SeekAudioByFrame(FrameFromTimeMs(timeMs, _audioFps), _audioFps);
+        }
+
+        public void SeekAudioByFrame(long frameIndex, double fps)
+        {
+            bool hasData = _fileAudioProvider != null &&
+                (_videoRate < 0
+                    ? _fileAudioProvider.IsReverseFrameDataAvailable(frameIndex, fps, ReverseAudioCacheRefreshBehindMs)
+                    : _fileAudioProvider.IsFrameDataAvailable(frameIndex, fps));
+
+            if (!hasData)
+            {
+                StartAudioCacheFromFrame(frameIndex, fps, Math.Abs(_videoRate) > 0 ? _videoRate : 1.0f, _isVideoPlaying);
+                return;
+            }
+
+            _fileAudioProvider.SeekFrame(frameIndex, fps);
+            _memoryAudioProvider?.SeekFrame(frameIndex, fps);
+        }
+
+        private void EnsureAudioCacheForCurrentFrame()
+        {
+            if (_videoRate >= 0 || _fileAudioProvider == null)
+                return;
+
+            if (_audioCacheTask != null && !_audioCacheTask.IsCompleted)
+                return;
+
+            if (!_fileAudioProvider.IsReverseFrameDataAvailable(_currentFrameIndex, _audioFps, ReverseAudioCacheRefreshBehindMs))
+                StartAudioCacheFromFrame(_currentFrameIndex, _audioFps, _videoRate, true);
+        }
+
+        public static long FrameFromTimeMs(long timeMs, double fps)
+        {
+            if (timeMs < 0) timeMs = 0;
+            if (fps <= 0) fps = 29.97;
+            return (long)Math.Round(timeMs * fps / 1000.0);
+        }
+
+        public static long TimeMsFromFrame(long frameIndex, double fps)
+        {
+            if (frameIndex < 0) frameIndex = 0;
+            if (fps <= 0) fps = 29.97;
+            return (long)Math.Round(frameIndex * 1000.0 / fps);
+        }
+        private void UpdateOriginalChannelLevel(int ch, float peak)
+        {
+
+            lock (_levelLock)
+            {
+                _channelLevels[ch] = Math.Max(peak, _channelLevels[ch] * 0.85f);
+            }
+        }
+        private float CalculatePeakFromFrame(AVFrame* frame)
+        {
+            float peak = 0f;
+            int samples = frame->nb_samples;
+            int channels = Math.Max(1, frame->ch_layout.nb_channels);
+            var fmt = (AVSampleFormat)frame->format;
+
+            if (fmt == AVSampleFormat.AV_SAMPLE_FMT_S16)
+            {
+                short* data = (short*)frame->data[0];
+                int total = samples * channels;
+
+                for (int i = 0; i < total; i++)
+                    peak = Math.Max(peak, Math.Abs(data[i]) / 32768f);
+            }
+            else if (fmt == AVSampleFormat.AV_SAMPLE_FMT_S16P)
+            {
+                for (uint ch = 0; ch < channels; ch++)
+                {
+                    short* data = (short*)frame->data[ch];
+                    for (int i = 0; i < samples; i++)
+                        peak = Math.Max(peak, Math.Abs(data[i]) / 32768f);
+                }
+            }
+            else if (fmt == AVSampleFormat.AV_SAMPLE_FMT_S32)
+            {
+                int* data = (int*)frame->data[0];
+                int total = samples * channels;
+
+                for (int i = 0; i < total; i++)
+                    peak = Math.Max(peak, Math.Abs((long)data[i]) / 2147483648f);
+            }
+            else if (fmt == AVSampleFormat.AV_SAMPLE_FMT_S32P)
+            {
+                for (uint ch = 0; ch < channels; ch++)
+                {
+                    int* data = (int*)frame->data[ch];
+                    for (int i = 0; i < samples; i++)
+                        peak = Math.Max(peak, Math.Abs((long)data[i]) / 2147483648f);
+                }
+            }
+
+            return Math.Min(1f, peak);
+        }
         public void StopAudioBridge()
         {
-            // A. 立即發出停止訊號，讓 DecodeLoop 知道該跳出了
             _isDecoding = false;
+
             _cts?.Cancel();
+            _videoCts?.Cancel();
+            _audioCacheCts?.Cancel();
+            _audioCacheGeneration++;
 
-            // B. 給予背景執行緒極短的緩衝時間來感知停止訊號
-            Thread.Sleep(50);
+            try
+            {
+                _videoDecodeTask?.Wait(500);
+            }
+            catch { }
 
-            // C. 進入鎖定區塊進行資源物理釋放
+            try
+            {
+                _audioCacheTask?.Wait(500);
+            }
+            catch { }
+
             lock (_lock)
             {
                 _filterReady = false;
 
-                // 停止 NAudio 輸出
-                _waveOut?.Stop();
-                _waveOut?.Dispose();
+                try { _waveOut?.Stop(); } catch { }
+                try { _waveOut?.Dispose(); } catch { }
                 _waveOut = null;
+
+                _fileAudioProvider?.Dispose();
+                _fileAudioProvider = null;
+
+                _memoryAudioProvider = null;
                 _waveProvider?.ClearBuffer();
 
-                // 釋放解碼器上下文
+                ClearVideoFrameCacheLocked();
+                _totalVideoFrames = 0;
+
                 foreach (var decoder in _audioDecoders.Values)
                 {
                     var p = decoder.Ptr;
@@ -449,7 +1493,6 @@ namespace MxfPlayer.Services
                 }
                 _audioDecoders.Clear();
 
-                // 核心修正：釋放 FormatContext 並設為 null
                 if (_formatContext != null)
                 {
                     var p = _formatContext;
@@ -457,7 +1500,6 @@ namespace MxfPlayer.Services
                     _formatContext = null;
                 }
 
-                // 釋放濾鏡資源
                 if (_filterGraph != null)
                 {
                     var p = _filterGraph;
@@ -473,12 +1515,74 @@ namespace MxfPlayer.Services
 
                 _sinkContext = null;
             }
-            _currentMedia?.Dispose();
-            _currentMedia = null;
-            // 停止影像播放
-            _mp?.Stop();
+
+            lock (_levelLock)
+            {
+                Array.Clear(_channelLevels, 0, _channelLevels.Length);
+            }
+
+            _videoCts?.Dispose();
+            _videoCts = null;
+            _videoDecodeTask = null;
+
+            _audioCacheCts?.Dispose();
+            _audioCacheCts = null;
+            _audioCacheTask = null;
+
+            if (!string.IsNullOrEmpty(_pcmCachePath))
+            {
+                try { File.Delete(_pcmCachePath); } catch { }
+                _pcmCachePath = null;
+            }
         }
 
-        public void Dispose() { StopAudioBridge(); _vlc?.Dispose(); _mp?.Dispose(); }
+        private void CloseDecodeResources()
+        {
+            lock (_ffmpegResourceLock)
+            {
+                foreach (var decoder in _audioDecoders.Values)
+                {
+                    if (decoder.Ptr != null)
+                    {
+                        var p = decoder.Ptr;
+                        ffmpeg.avcodec_free_context(&p);
+                        decoder.Ptr = null;
+                    }
+                }
+
+                _audioDecoders.Clear();
+
+                if (_formatContext != null)
+                {
+                    var p = _formatContext;
+                    ffmpeg.avformat_close_input(&p);
+                    _formatContext = null;
+                }
+
+                if (_filterGraph != null)
+                {
+                    var p = _filterGraph;
+                    ffmpeg.avfilter_graph_free(&p);
+                    _filterGraph = null;
+                }
+
+                if (_srcContexts != null)
+                {
+                    Marshal.FreeHGlobal((IntPtr)_srcContexts);
+                    _srcContexts = null;
+                }
+
+                _sinkContext = null;
+                _filterReady = false;
+            }
+        }
+
+        public void Dispose()
+        {
+            StopAudioBridge();
+            foreach (var frame in _videoFrames)
+                frame.Dispose();
+            _videoFrames.Clear();
+        }
     }
 }
