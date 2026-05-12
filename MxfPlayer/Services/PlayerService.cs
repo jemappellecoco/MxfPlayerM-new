@@ -62,7 +62,7 @@ namespace MxfPlayer.Services
         private float _videoRate = 1.0f;
         private readonly Stopwatch _playbackClock = new();
         private long _playbackStartFrame;
-        private const int AudioOutputLatencyMs = 30;
+        private const int AudioOutputLatencyMs = 0;
         private const int ReverseAudioCacheWindowMs = 15000;
         private const int ReverseAudioCacheRefreshBehindMs = 1200;
 
@@ -1474,7 +1474,7 @@ namespace MxfPlayer.Services
                 return;
 
             _videoCts?.Cancel();
-            _videoCts?.Dispose();
+            //_videoCts?.Dispose();
             _videoCts = new CancellationTokenSource();
             long startFrame = forceRestart || restartLaggingDecoder || _videoRate < 0 || maxCachedFrame < _currentFrameIndex
                 ? _currentFrameIndex

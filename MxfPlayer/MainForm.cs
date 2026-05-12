@@ -43,6 +43,8 @@ namespace MxfPlayer
         private bool _isEditingNowTimecode = false;
         private bool _isBuffering = false;
         private MediaInfoResult? _currentMediaInfo;
+        private readonly AudioMeterScaleService _meterScale = new();
+        private int _meterAreaHeight = 0;
         public MainForm()
         {
             Text = "Offline xPlayer";
@@ -264,19 +266,22 @@ namespace MxfPlayer
                     double fps = GetSelectedFps();
                     if (fps <= 0) return;
 
-                    long somMs = 0;
+                    bool dropFrame = IsSelectedDropFrame();
+                    long somFrame = 0;
                     if (TryGetSelectedMediaFile(out var file) &&
                         file != null &&
                         _mediaCache.TryGetValue(file.FullPath, out var info))
                     {
-                        somMs = GetMsFromTimecode(info.Som, fps);
+                        somFrame = TimecodeToFrame(info.Som, fps, dropFrame);
                     }
 
 
                     if (!_isEditingNowTimecode)
-                        SetNowTimecodeText(FormatTimecodeFromMilliseconds(somMs + current, fps));
+                        SetNowTimecodeText(FrameToTimecode(somFrame + _player.CurrentFrameIndex, fps, dropFrame));
 
-                    _lblRemain.Text = $"REM {FormatTimecodeFromMilliseconds(Math.Max(0, length - current), fps)}";
+                    long lastFrame = PlayerService.FrameFromTimeMs(length, fps);
+                    long remainFrames = Math.Max(0, lastFrame - _player.CurrentFrameIndex);
+                    _lblRemain.Text = $"REM {FrameToTimecode(remainFrames, fps, dropFrame)}";
                 }
             }
             catch (Exception ex)
@@ -455,23 +460,23 @@ namespace MxfPlayer
             previousFrame?.Dispose();
         }
 
-        //private void BuildMenu()
-        //{
-        //    var menu = new MenuStrip
-        //    {
-        //        Dock = DockStyle.Top,
-        //        BackColor = Color.FromArgb(36, 39, 43),
-        //        ForeColor = Color.White,
-        //        Renderer = new ToolStripProfessionalRenderer(new DarkColorTable())
-        //    };
+        private void BuildMenu()
+        {
+            var menu = new MenuStrip
+            {
+                Dock = DockStyle.Top,
+                BackColor = Color.FromArgb(36, 39, 43),
+                ForeColor = Color.White,
+                Renderer = new ToolStripProfessionalRenderer(new DarkColorTable())
+            };
 
-        //    menu.Items.Add("檔案");
-        //    menu.Items.Add("播放");
-        //    menu.Items.Add("Tools");
+            menu.Items.Add("檔案");
+            menu.Items.Add("播放");
+            menu.Items.Add("Tools");
 
-        //    MainMenuStrip = menu;
-        //    Controls.Add(menu);
-        //}
+            MainMenuStrip = menu;
+            Controls.Add(menu);
+        }
 
         private void BuildLeftPlayerArea(Control parent)
         {
@@ -694,11 +699,11 @@ namespace MxfPlayer
                 Margin = new Padding(0),
                 Padding = new Padding(0)
             };
-            root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 46));   // ?餃漲??祝
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 46));  
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             host.Controls.Add(root);
 
-            // 撌阡??餃漲
+           
             var scalePanel = new Panel
             {
                 Dock = DockStyle.Fill,
@@ -706,7 +711,7 @@ namespace MxfPlayer
             };
             root.Controls.Add(scalePanel, 0, 0);
 
-            string[] dbLabels = { "0", "-6", "-12", "-18", "-24", "-30", "-36", "-48", "-54", "dB" };
+            double[] dbLabels = { 0, -6, -12, -18, -24, -30, -36, -42, -48, -54, -60 };
 
             scalePanel.Resize += (_, _) =>
             {
@@ -715,35 +720,42 @@ namespace MxfPlayer
                 int h = scalePanel.ClientSize.Height;
                 if (h <= 0) return;
 
-                for (int i = 0; i < dbLabels.Length; i++)
-                {
-                    int top;
+                _meterAreaHeight = Math.Max(12, h - 4);
 
-                    if (dbLabels[i] == "dB")
-                    {
-                        top = h - 18;
-                    }
-                    else
-                    {
-                        top = 6 + (int)((h - 42) * i / 8.0);
-                       
-                    }
+                foreach (double db in dbLabels)
+                {
+                    int y = _meterScale.DbToY(db, _meterAreaHeight);
 
                     var lbl = new Label
                     {
-                        Text = dbLabels[i],
+                        Text = db.ToString("0"),
                         ForeColor = Color.White,
                         AutoSize = false,
                         Width = 42,
                         Height = 16,
                         Left = 0,
-                        Top = Math.Max(0, Math.Min(top, h - 16)),
+                        Top = Math.Max(0, Math.Min(y - 8, h - 16)),
                         TextAlign = ContentAlignment.MiddleRight,
                         Font = new Font("Segoe UI", 8f, FontStyle.Regular)
                     };
 
                     scalePanel.Controls.Add(lbl);
                 }
+
+                var dbUnit = new Label
+                {
+                    Text = "dB",
+                    ForeColor = Color.White,
+                    AutoSize = false,
+                    Width = 42,
+                    Height = 16,
+                    Left = 0,
+                    Top = h - 18,
+                    TextAlign = ContentAlignment.MiddleRight,
+                    Font = new Font("Segoe UI", 8f, FontStyle.Regular)
+                };
+
+                scalePanel.Controls.Add(dbUnit);
             };
             var barsLayout = new TableLayoutPanel
             {
@@ -764,7 +776,7 @@ namespace MxfPlayer
 
             for (int i = 0; i < 8; i++)
             {
-                // 瘥?甈?銝?checkbox?? meter
+          
                 var channelLayout = new TableLayoutPanel
                 {
                     Dock = DockStyle.Fill,
@@ -892,10 +904,11 @@ namespace MxfPlayer
             double fps = GetFpsFromInfo(info);
             if (fps <= 0) return;
 
-            long totalMs = GetMsFromTimecode(info.DurationTc, fps);
-            long somMs = GetMsFromTimecode(info.Som, fps);
+            bool dropFrame = IsDropFrame(info);
+            long durationFrames = TimecodeToFrame(info.DurationTc, fps, dropFrame);
+            long somFrame = TimecodeToFrame(info.Som, fps, dropFrame);
 
-            if (totalMs <= 0)
+            if (durationFrames <= 0)
                 return;
 
             int tickCount = 8;
@@ -903,11 +916,11 @@ namespace MxfPlayer
 
             for (int i = 0; i < tickCount; i++)
             {
-                long currentTickMs = somMs + (totalMs * i / (tickCount - 1));
+                long tickFrame = somFrame + (durationFrames * i / (tickCount - 1));
 
                 var lbl = new Label
                 {
-                    Text = FormatTimecodeFromMilliseconds(currentTickMs, fps),
+                    Text = FrameToTimecode(tickFrame, fps, dropFrame),
                     ForeColor = Color.White,
                     AutoSize = true,
                     Top = 2,
@@ -1099,9 +1112,9 @@ namespace MxfPlayer
             _playbackController.Pause();
         }
 
-        private async void HandleMoveFirst() // 潃?async void ?舀迤蝣箇? UI 鈭辣撖急?
+        private async void HandleMoveFirst() 
         {
-            await _playbackController.MoveFirst(GetSelectedFps()); // 潃??曉?ㄐ?臭誑甇?虜 await 鈭?
+            await _playbackController.MoveFirst(GetSelectedFps()); 
         }
 
         private async void HandleMoveLast()
@@ -1209,27 +1222,34 @@ namespace MxfPlayer
             }
 
             double fps = GetSelectedFps();
-            long targetMs;
-
-            if (!TryGetMsFromTimecode(input, fps, out long inputMs))
+            if (fps <= 0)
             {
                 _isEditingNowTimecode = false;
                 UpdateTimelineUI(-1);
                 return;
             }
 
-            long somMs = 0;
+            bool dropFrame = IsSelectedDropFrame();
+            if (!TryGetFrameFromTimecode(input, fps, dropFrame, out long inputFrame))
+            {
+                _isEditingNowTimecode = false;
+                UpdateTimelineUI(-1);
+                return;
+            }
+
+            long somFrame = 0;
 
             if (TryGetSelectedMediaFile(out var file) &&
                 file != null &&
                 _mediaCache.TryGetValue(file.FullPath, out var info))
             {
-                somMs = GetMsFromTimecode(info.Som, fps);
+                somFrame = TimecodeToFrame(info.Som, fps, dropFrame);
             }
 
-            targetMs = inputMs >= somMs ? inputMs - somMs : inputMs;
-
-            targetMs = Math.Clamp(targetMs, 0, Math.Max(0, _player.LengthMs));
+            long targetFrame = inputFrame >= somFrame ? inputFrame - somFrame : inputFrame;
+            long lastFrame = PlayerService.FrameFromTimeMs(_player.LengthMs, fps);
+            targetFrame = Math.Clamp(targetFrame, 0, Math.Max(0, lastFrame));
+            long targetMs = PlayerService.TimeMsFromFrame(targetFrame, fps);
 
             _isSeeking = true;
             try
@@ -1522,6 +1542,16 @@ namespace MxfPlayer
 
         private void UpdateMetersFromAudioLevel()
         {
+            int meterHeight = _meterAreaHeight;
+
+            if (meterHeight <= 0 && _meterBars.Count > 0 && _meterBars[0].Parent != null)
+                meterHeight = Math.Max(12, _meterBars[0].Parent.ClientSize.Height - 4);
+
+            if (meterHeight <= 0)
+                return;
+
+            long currentMs = _playbackController.GetCurrentTime();
+
             for (int i = 0; i < _meterBars.Count; i++)
             {
                 var bar = _meterBars[i];
@@ -1529,28 +1559,12 @@ namespace MxfPlayer
 
                 if (i < _channelChecks.Count && !_channelChecks[i].Checked)
                 {
-                    bar.Height = 8;
+                    bar.Height = AudioMeterScaleService.MinBarHeight;
                     continue;
                 }
 
-                //float level = _player.GetChannelLevel(i);
-                long currentMs = _playbackController.GetCurrentTime();
                 float level = _player.GetChannelLevelAtTime(i, currentMs);
-                int maxHeight = Math.Max(12, bar.Parent.ClientSize.Height - 4);
-
-                if (level <= 0.0001f)
-                {
-                    bar.Height = 8;
-                    continue;
-                }
-
-                double db = 20.0 * Math.Log10(level);
-
-                // -60dB ~ 0dB 頧? 0~1
-                double normalized = (db + 60.0) / 60.0;
-                normalized = Math.Max(0, Math.Min(1, normalized));
-
-                bar.Height = 8 + (int)((maxHeight - 8) * normalized);
+                bar.Height = _meterScale.LevelToBarHeight(level, meterHeight);
             }
         }
 
@@ -1636,17 +1650,25 @@ namespace MxfPlayer
                     double fps = GetSelectedFps();
                     if (fps <= 0) return;
 
-                    long somMs = 0;
+                    bool dropFrame = IsSelectedDropFrame();
+                    long somFrame = 0;
+                    long currentFrame = overrideTime != -1
+                        ? PlayerService.FrameFromTimeMs(overrideTime, fps)
+                        : _player.CurrentFrameIndex;
+
                     if (TryGetSelectedMediaFile(out var file) &&
                         file != null &&
                         _mediaCache.TryGetValue(file.FullPath, out var info))
                     {
-                        somMs = GetMsFromTimecode(info.Som, fps);
+                        somFrame = TimecodeToFrame(info.Som, fps, dropFrame);
                     }
 
                     if (!_isEditingNowTimecode)
-                        SetNowTimecodeText(FormatTimecodeFromMilliseconds(somMs + current, fps));
-                    _lblRemain.Text = $"REM {FormatTimecodeFromMilliseconds(Math.Max(0, length - current), fps)}";
+                        SetNowTimecodeText(FrameToTimecode(somFrame + currentFrame, fps, dropFrame));
+
+                    long lastFrame = PlayerService.FrameFromTimeMs(length, fps);
+                    long remainFrames = Math.Max(0, lastFrame - currentFrame);
+                    _lblRemain.Text = $"REM {FrameToTimecode(remainFrames, fps, dropFrame)}";
                 }
             }
             finally
@@ -1799,13 +1821,108 @@ namespace MxfPlayer
                 file != null &&
                 _mediaCache.TryGetValue(file.FullPath, out var info))
             {
-                return string.Equals(info.DropFrame, "True", StringComparison.OrdinalIgnoreCase)
-                    || info.Som.Contains(';')
-                    || info.Eom.Contains(';');
+                return IsDropFrame(info);
             }
 
             return false;
         }
+
+        private bool IsDropFrame(MediaInfoResult info)
+        {
+            return string.Equals(info.DropFrame, "True", StringComparison.OrdinalIgnoreCase)
+                || info.Som.Contains(';')
+                || info.Eom.Contains(';');
+        }
+
+        private long TimecodeToFrame(string tc, double fps, bool dropFrame)
+        {
+            return TryGetFrameFromTimecode(tc, fps, dropFrame, out long frameNumber)
+                ? frameNumber
+                : 0;
+        }
+
+        private bool TryGetFrameFromTimecode(string tc, double fps, bool dropFrame, out long frameNumber)
+        {
+            frameNumber = 0;
+            string[] parts = tc.Split(':', ';');
+            if (parts.Length < 4) return false;
+
+            if (!int.TryParse(parts[0], out int h) ||
+                !int.TryParse(parts[1], out int m) ||
+                !int.TryParse(parts[2], out int s) ||
+                !int.TryParse(parts[3], out int f))
+            {
+                return false;
+            }
+
+            int nominalFps = GetNominalFps(fps);
+            if (h < 0 || m < 0 || m > 59 || s < 0 || s > 59 || f < 0 || f >= nominalFps)
+                return false;
+
+            frameNumber = TimecodePartsToFrame(h, m, s, f, fps, dropFrame);
+            return true;
+        }
+
+        private long TimecodePartsToFrame(int hours, int minutes, int seconds, int frames, double fps, bool dropFrame)
+        {
+            int nominalFps = GetNominalFps(fps);
+            long totalMinutes = (hours * 60L) + minutes;
+            long frameNumber = (((hours * 3600L) + (minutes * 60L) + seconds) * nominalFps) + frames;
+
+            if (dropFrame)
+            {
+                int dropFrames = GetDropFrameCount(fps);
+                frameNumber -= dropFrames * (totalMinutes - (totalMinutes / 10));
+            }
+
+            return Math.Max(0, frameNumber);
+        }
+
+        private string FrameToTimecode(long frameNumber, double fps, bool dropFrame)
+        {
+            if (frameNumber < 0) frameNumber = 0;
+
+            int nominalFps = GetNominalFps(fps);
+            long timecodeFrameNumber = frameNumber;
+
+            if (dropFrame)
+            {
+                int dropFrames = GetDropFrameCount(fps);
+                long framesPerMinute = (nominalFps * 60L) - dropFrames;
+                long framesPer10Minutes = (nominalFps * 600L) - (dropFrames * 9L);
+
+                long tenMinuteBlocks = frameNumber / framesPer10Minutes;
+                long remainingFrames = frameNumber % framesPer10Minutes;
+                long droppedFrames = dropFrames * 9L * tenMinuteBlocks;
+
+                if (remainingFrames >= dropFrames)
+                    droppedFrames += dropFrames * ((remainingFrames - dropFrames) / framesPerMinute);
+
+                timecodeFrameNumber += droppedFrames;
+            }
+
+            long hours = timecodeFrameNumber / (nominalFps * 3600L);
+            timecodeFrameNumber %= nominalFps * 3600L;
+            long minutes = timecodeFrameNumber / (nominalFps * 60L);
+            timecodeFrameNumber %= nominalFps * 60L;
+            long seconds = timecodeFrameNumber / nominalFps;
+            long frame = timecodeFrameNumber % nominalFps;
+            string separator = dropFrame ? ";" : ":";
+
+            return $"{hours:00}:{minutes:00}:{seconds:00}{separator}{frame:00}";
+        }
+
+        private int GetNominalFps(double fps)
+        {
+            if (fps <= 0) fps = 29.97;
+            return Math.Max(1, (int)Math.Round(fps));
+        }
+
+        private int GetDropFrameCount(double fps)
+        {
+            return Math.Max(0, (int)Math.Round(GetNominalFps(fps) * 0.0666666667));
+        }
+
         private async Task SeekFromTimeline()
         {
             if (_isSeeking) return;
@@ -1838,24 +1955,27 @@ namespace MxfPlayer
 
                 UpdateVideoFrame();
 
-                long elapsedMs = _playbackController.GetCurrentTime();
                 long lengthMs = _playbackController.GetLength();
 
                 double fps = GetSelectedFps();
                 if (fps <= 0) return;
 
-                long somMs = 0;
+                bool dropFrame = IsSelectedDropFrame();
+                long somFrame = 0;
 
                 if (TryGetSelectedMediaFile(out var file) &&
                     file != null &&
                     _mediaCache.TryGetValue(file.FullPath, out var info))
                 {
-                    somMs = GetMsFromTimecode(info.Som, fps);
+                    somFrame = TimecodeToFrame(info.Som, fps, dropFrame);
                 }
 
                 if (!_isEditingNowTimecode)
-                    SetNowTimecodeText(FormatTimecodeFromMilliseconds(somMs + elapsedMs, fps));
-                _lblRemain.Text = $"REM {FormatTimecodeFromMilliseconds(Math.Max(0, lengthMs - elapsedMs), fps)}";
+                    SetNowTimecodeText(FrameToTimecode(somFrame + _player.CurrentFrameIndex, fps, dropFrame));
+
+                long lastFrame = PlayerService.FrameFromTimeMs(lengthMs, fps);
+                long remainFrames = Math.Max(0, lastFrame - _player.CurrentFrameIndex);
+                _lblRemain.Text = $"REM {FrameToTimecode(remainFrames, fps, dropFrame)}";
             }
             finally
             {
