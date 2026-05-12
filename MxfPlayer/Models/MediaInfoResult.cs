@@ -22,12 +22,17 @@
         public string AudioBitRate { get; set; } = "";
 
         public string DisplayAspect { get; set; } = "";
-        public string SpecCheck { get; set; } = "";
+        
 
         public string FrameRateDisplay { get; set; } = "";
         public string FrameRateValue { get; set; } = "";
         public string FrameRateNum { get; set; } = "";
         public string FrameRateDen { get; set; } = "";
         public string DropFrame { get; set; } = "";
+        public string VideoBitDepth { get; set; } = "";
+        public string AudioSamplingRate { get; set; } = "";
+        public string AudioBitDepth { get; set; } = "";
+        public string TimeCodeMode { get; set; } = "";
+
     }
 }

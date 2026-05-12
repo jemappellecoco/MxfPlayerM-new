@@ -16,6 +16,7 @@ namespace MxfPlayer
         private readonly PlayerService _player = new();
         private readonly FolderService _folder = new();
         private readonly MediaInfoService _mediaInfo = new();
+        private readonly MediaSpecService _mediaSpec = new();
         private readonly Dictionary<string, MediaInfoResult> _mediaCache = new();
         private readonly AudioMixerService _audioMixer = new();
         private readonly PlaybackController _playbackController;
@@ -92,6 +93,12 @@ namespace MxfPlayer
             {
                 RefreshTimelineTicks(info);
             }));
+            var check = _mediaSpec.CheckWeiLaiSpec(info);
+            string specType = _mediaSpec.GetSpecType(info);
+            string errorText = check.Errors.Count > 0
+                ? string.Join(Environment.NewLine + "                    ", check.Errors)
+                : "無";
+
 
             _txtInfo.Text =
                 $"寬度:               {info.Width} pixels{Environment.NewLine}" +
@@ -105,7 +112,7 @@ namespace MxfPlayer
                 $"SOM:                {info.Som}{Environment.NewLine}" +
                 $"EOM:                {info.Eom}{Environment.NewLine}" +
                 $"長度:               {info.DurationTc}{Environment.NewLine}" +
-                $"規格檢查:           {info.SpecCheck}{Environment.NewLine}" +
+             
                 $"影片位元率:         {info.VideoBitRate}{Environment.NewLine}" +
                 $"音訊單軌位元率:     {info.AudioBitRate}{Environment.NewLine}" +
                 $"整體位元率:         {info.OverallBitRate}{Environment.NewLine}" +
@@ -315,6 +322,7 @@ namespace MxfPlayer
                 string eom = "00:00:00;00";
                 string duration = "00:00:00;00";
                 string specCheck = "Error";
+                string specErrorText = "";
 
                 try
                 {
@@ -328,11 +336,31 @@ namespace MxfPlayer
                     eom = string.IsNullOrWhiteSpace(info.Eom) ? "00:00:00;00" : info.Eom;
                     duration = string.IsNullOrWhiteSpace(info.DurationTc) ? "00:00:00;00" : info.DurationTc;
 
-                    specCheck = IsSpecPass(info) ? "HD" : "Error";
+                    var check = _mediaSpec.CheckWeiLaiSpec(info);
+                    string specType = _mediaSpec.GetSpecType(info);
+
+                    if (check.IsPass)
+                    {
+                        specCheck = specType; // HD 或 SD
+                        specErrorText = "";
+                    }
+                    else
+                    {
+                        specCheck = "Error";
+                        specErrorText = string.Join(Environment.NewLine, check.Errors);
+
+                        // 先印到 Output 視窗，方便你 debug
+                        System.Diagnostics.Debug.WriteLine($"[Spec Error] {file.FileName}");
+                        System.Diagnostics.Debug.WriteLine(specErrorText);
+                    }
                 }
-                catch
+                catch (Exception ex)
                 {
                     specCheck = "Error";
+                    specErrorText = $"讀取 MediaInfo 失敗：{ex.Message}";
+
+                    System.Diagnostics.Debug.WriteLine($"[MediaInfo Error] {file.FileName}");
+                    System.Diagnostics.Debug.WriteLine(ex.Message);
                 }
 
                 int rowIndex = _gridFiles.Rows.Add(
@@ -347,6 +375,9 @@ namespace MxfPlayer
                 var row = _gridFiles.Rows[rowIndex];
                 row.Tag = file;
 
+                // 把錯誤原因放在格式檢查欄的 Tooltip
+                row.Cells[5].ToolTipText = specErrorText;
+
                 if (specCheck == "Error")
                 {
                     row.Cells[5].Style.ForeColor = Color.Red;
@@ -355,17 +386,11 @@ namespace MxfPlayer
                 else
                 {
                     row.Cells[5].Style.ForeColor = Color.White;
+                    row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Regular);
                 }
             }
         }
-        private bool IsSpecPass(MediaInfoResult info)
-        {
-            // 目前先照你說的：不是 HD 就 Error
-            if (!string.Equals(info.SpecCheck, "HD", StringComparison.OrdinalIgnoreCase))
-                return false;
 
-            return true;
-        }
         private double CalculateTotalSizeGB(List<MediaFile> files)
         {
             long totalBytes = 0;
@@ -406,27 +431,7 @@ namespace MxfPlayer
 
                 float rate = _playbackController.CurrentRate;
 
-                //if (Math.Abs(rate - 1.0f) > 0.001f && !_player.HasCurrentVideoFrame)
-                //{
-                //    _isBuffering = true;
-
-                //    try
-                //    {
-                //        _meterTimer.Stop();
-                //        _player.Pause();
-
-                //        await CheckBufferForRateAsync(rate);
-
-                //        await _playbackController.Play();
-                //    }
-                //    finally
-                //    {
-                //        _isBuffering = false;
-                //    }
-
-                //    return;
-                //}
-
+               
                 UpdateVideoFrame();
                 UpdateMetersFromAudioLevel();
                 UpdateTimelineFromPlayer();
@@ -450,23 +455,23 @@ namespace MxfPlayer
             previousFrame?.Dispose();
         }
 
-        private void BuildMenu()
-        {
-            var menu = new MenuStrip
-            {
-                Dock = DockStyle.Top,
-                BackColor = Color.FromArgb(36, 39, 43),
-                ForeColor = Color.White,
-                Renderer = new ToolStripProfessionalRenderer(new DarkColorTable())
-            };
+        //private void BuildMenu()
+        //{
+        //    var menu = new MenuStrip
+        //    {
+        //        Dock = DockStyle.Top,
+        //        BackColor = Color.FromArgb(36, 39, 43),
+        //        ForeColor = Color.White,
+        //        Renderer = new ToolStripProfessionalRenderer(new DarkColorTable())
+        //    };
 
-            menu.Items.Add("檔案");
-            menu.Items.Add("播放");
-            menu.Items.Add("Tools");
+        //    menu.Items.Add("檔案");
+        //    menu.Items.Add("播放");
+        //    menu.Items.Add("Tools");
 
-            MainMenuStrip = menu;
-            Controls.Add(menu);
-        }
+        //    MainMenuStrip = menu;
+        //    Controls.Add(menu);
+        //}
 
         private void BuildLeftPlayerArea(Control parent)
         {

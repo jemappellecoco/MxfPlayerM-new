@@ -114,8 +114,14 @@ namespace MxfPlayer.Services
                 VideoBitRate = FormatBitRate(Get(video, "BitRate")),
                 AudioBitRate = FormatBitRate(Get(audio, "BitRate")),
                 OverallBitRate = FormatBitRate(Get(general, "OverallBitRate")),
+                VideoBitDepth = Get(video, "BitDepth"),
+                AudioSamplingRate = Get(audio, "SamplingRate"),
+                AudioBitDepth = Get(audio, "BitDepth"),
+                TimeCodeMode = string.Equals(dropFrame, "True", StringComparison.OrdinalIgnoreCase)
+                ? "Drop Frame"
+                : "Non Drop Frame",
                 DisplayAspect = ConvertAspect(Get(video, "DisplayAspectRatio")),
-                SpecCheck = BuildSpecCheck(width, height)
+              
             };
         }
         private string FormatFrameRate(string frameRate, string fpsNum, string fpsDen)
@@ -130,13 +136,9 @@ namespace MxfPlayer.Services
         }
         private string DetectDropFrame(JsonElement video, JsonElement timecode)
         {
-            string fromVideo = Get(video, "Delay_DropFrame");
-            if (!string.IsNullOrWhiteSpace(fromVideo))
-                return fromVideo;
-
-            string som = Get(timecode, "TimeCode_FirstFrame");
-            if (!string.IsNullOrWhiteSpace(som))
-                return som.Contains(';') ? "True" : "False";
+            string tcSom = Get(timecode, "TimeCode_FirstFrame");
+            if (!string.IsNullOrWhiteSpace(tcSom))
+                return tcSom.Contains(';') ? "True" : "False";
 
             string videoSom = Get(video, "TimeCode_FirstFrame");
             if (!string.IsNullOrWhiteSpace(videoSom))
@@ -155,13 +157,7 @@ namespace MxfPlayer.Services
             return value.GetString() ?? "";
         }
 
-        private string BuildSpecCheck(string width, string height)
-        {
-            if (width == "1920" && height == "1080")
-                return "HD";
-
-            return "Unknown";
-        }
+       
 
         private string ConvertScanOrder(string scanOrder)
         {
@@ -177,6 +173,9 @@ namespace MxfPlayer.Services
         {
             if (aspect == "1.778")
                 return "16:9";
+
+            if (aspect == "1.333")
+                return "4:3";
 
             return aspect;
         }
