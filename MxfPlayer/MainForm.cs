@@ -40,6 +40,8 @@ namespace MxfPlayer
         private readonly List<CheckBox> _channelChecks = new();
         private bool _isStartingPlayback = false;
         private bool _isEditingNowTimecode = false;
+        private bool _isBuffering = false;
+        private MediaInfoResult? _currentMediaInfo;
         public MainForm()
         {
             Text = "Offline xPlayer";
@@ -79,16 +81,23 @@ namespace MxfPlayer
                 mainSplit.SplitterDistance = Math.Max(mainSplit.Panel1MinSize, Math.Min(880, safeDistance));
             };
         }
-       
+
         private void ShowMediaInfo(MediaInfoResult info)
         {
+            _currentMediaInfo = info;
+
             UpdateTimeLabels(info);
-            RefreshTimelineTicks(info);
+
+            BeginInvoke(new Action(() =>
+            {
+                RefreshTimelineTicks(info);
+            }));
+
             _txtInfo.Text =
                 $"寬度:               {info.Width} pixels{Environment.NewLine}" +
                 $"高度:               {info.Height} pixels{Environment.NewLine}" +
-                $"影格率:             {info.FrameRate} FPS{Environment.NewLine}" +
-                $"Drop Frame:         True{Environment.NewLine}" +
+                $"影格率:             {info.FrameRateDisplay} FPS{Environment.NewLine}" +
+                $"Drop Frame:         {info.DropFrame}{Environment.NewLine}" +
                 $"音訊聲道:           {info.AudioCount}{Environment.NewLine}" +
                 $"格式名稱:           {info.CommercialName}{Environment.NewLine}" +
                 $"掃描方式:           {info.ScanType}{Environment.NewLine}" +
@@ -97,9 +106,10 @@ namespace MxfPlayer
                 $"EOM:                {info.Eom}{Environment.NewLine}" +
                 $"長度:               {info.DurationTc}{Environment.NewLine}" +
                 $"規格檢查:           {info.SpecCheck}{Environment.NewLine}" +
-                $"位元率:             {info.BitRate}{Environment.NewLine}" +
+                $"影片位元率:         {info.VideoBitRate}{Environment.NewLine}" +
+                $"音訊單軌位元率:     {info.AudioBitRate}{Environment.NewLine}" +
+                $"整體位元率:         {info.OverallBitRate}{Environment.NewLine}" +
                 $"顯示比例:           {info.DisplayAspect}{Environment.NewLine}" +
-                Environment.NewLine +
                 $"檔案名稱: {info.FileName}{Environment.NewLine}" +
                 $"完整路徑: {info.FullPath}";
         }
@@ -133,7 +143,7 @@ namespace MxfPlayer
             try
             {
                 int audioCount = 8;
-                double fps = 29.97;
+                double fps = 0;
 
                 if (!_mediaCache.ContainsKey(file.FullPath))
                     LoadAndShowMedia(file.FullPath);
@@ -141,7 +151,13 @@ namespace MxfPlayer
                 if (_mediaCache.TryGetValue(file.FullPath, out var info))
                 {
                     int.TryParse(info.AudioCount, out audioCount);
-                    double.TryParse(info.FrameRate, out fps);
+                }
+
+                fps = GetSelectedFps();
+                if (fps <= 0)
+                {
+                    MessageBox.Show("讀不到影片 FPS，無法播放。");
+                    return false;
                 }
 
                 for (int i = 0; i < 8; i++)
@@ -194,25 +210,35 @@ namespace MxfPlayer
         }
         private double GetSelectedFps()
         {
-            double fps = 29.97;
-
-            if (TryGetSelectedMediaFile(out var file) &&
-                file != null &&
-                _mediaCache.TryGetValue(file.FullPath, out var info) &&
-                double.TryParse(info.FrameRate, out var parsedFps) &&
-                parsedFps > 0)
+            if (!TryGetSelectedMediaFile(out var file) ||
+                file == null ||
+                !_mediaCache.TryGetValue(file.FullPath, out var info))
             {
-                fps = parsedFps;
+                return 0;
             }
 
-            return fps;
+            string frameRateText = info.FrameRateValue;
+
+            if (string.IsNullOrWhiteSpace(frameRateText))
+                frameRateText = info.FrameRate;
+
+            if (string.IsNullOrWhiteSpace(frameRateText))
+                frameRateText = info.FrameRateDisplay;
+
+            
+            int spaceIndex = frameRateText.IndexOf(' ');
+            if (spaceIndex > 0)
+                frameRateText = frameRateText.Substring(0, spaceIndex);
+
+            if (double.TryParse(frameRateText, out double fps) && fps > 0)
+                return fps;
+
+            return 0;
         }
-        /// <summary>
-        /// 撠?鞎痊?湔隞銝??脣漲璇??Ⅳ璅惜
-        /// </summary>
+   
         private void UpdateTimelineUI()
         {
-            // 1. 瑼Ｘ?臬甇???嚗??啗?蝒?
+           
             if (_isDraggingTimeline) return;
 
             _isUpdatingTimeline = true;
@@ -224,24 +250,25 @@ namespace MxfPlayer
 
                 if (length > 0)
                 {
-                    // 2. ?湔 TrackBar ?脣漲
+               
                     _timeline.Value = Math.Clamp(_playbackController.GetTimelineValue(_timeline.Maximum), _timeline.Minimum, _timeline.Maximum);
 
-                    // 3. ???嗅?瑼???擃?閮?FPS ??SOM嚗誑閮?蝎曄Ⅱ??蝣?
-                    double fps = 29.97;
+
+                    double fps = GetSelectedFps();
+                    if (fps <= 0) return;
+
                     long somMs = 0;
-                    if (TryGetSelectedMediaFile(out var file) && _mediaCache.TryGetValue(file.FullPath, out var info))
+                    if (TryGetSelectedMediaFile(out var file) &&
+                        file != null &&
+                        _mediaCache.TryGetValue(file.FullPath, out var info))
                     {
-                        double.TryParse(info.FrameRate, out fps);
                         somMs = GetMsFromTimecode(info.Som, fps);
                     }
 
-                    // 4. ?湔??璅惜
-                    // ?曉?? = 瑼?韏瑕?暺?(SOM) + ?剜?函??蝵?(current)
+
                     if (!_isEditingNowTimecode)
                         SetNowTimecodeText(FormatTimecodeFromMilliseconds(somMs + current, fps));
 
-                    // ?拚???蝣?
                     _lblRemain.Text = $"REM {FormatTimecodeFromMilliseconds(Math.Max(0, length - current), fps)}";
                 }
             }
@@ -254,17 +281,7 @@ namespace MxfPlayer
                 _isUpdatingTimeline = false;
             }
         }
-        //private void SyncChannelSelectionToMixer()
-        //{
-        //    for (int i = 0; i < _channelChecks.Count; i++)
-        //    {
-        //        _audioMixer.SetChannelEnabled(i, _channelChecks[i].Checked);
-        //    }
-
-        //    var selected = _audioMixer.GetSelectedIndices();
-        //    Console.WriteLine("[Audio] Play with selected = " + string.Join(",", selected));
-        //}
-
+     
         private void LoadFolderToGrid(string folderPath)
         {
             _txtPath.Text = folderPath;
@@ -276,6 +293,16 @@ namespace MxfPlayer
 
             double totalGB = CalculateTotalSizeGB(files);
             UpdateRightSummary(files.Count, totalGB);
+            ClearSelectedMediaInfo();
+        }
+
+        private void ClearSelectedMediaInfo()
+        {
+            _gridFiles.ClearSelection();
+            _gridFiles.CurrentCell = null;
+            _currentMediaInfo = null;
+            _txtInfo.Clear();
+            _timelineLabelsPanel.Controls.Clear();
         }
 
         private void PopulateGrid(List<MediaFile> files)
@@ -284,18 +311,61 @@ namespace MxfPlayer
 
             foreach (var file in files)
             {
+                string som = "00:00:00;00";
+                string eom = "00:00:00;00";
+                string duration = "00:00:00;00";
+                string specCheck = "Error";
+
+                try
+                {
+                    if (!_mediaCache.TryGetValue(file.FullPath, out var info))
+                    {
+                        info = _mediaInfo.GetInfo(file.FullPath);
+                        _mediaCache[file.FullPath] = info;
+                    }
+
+                    som = string.IsNullOrWhiteSpace(info.Som) ? "00:00:00;00" : info.Som;
+                    eom = string.IsNullOrWhiteSpace(info.Eom) ? "00:00:00;00" : info.Eom;
+                    duration = string.IsNullOrWhiteSpace(info.DurationTc) ? "00:00:00;00" : info.DurationTc;
+
+                    specCheck = IsSpecPass(info) ? "HD" : "Error";
+                }
+                catch
+                {
+                    specCheck = "Error";
+                }
+
                 int rowIndex = _gridFiles.Rows.Add(
                     file.FileName,
-                    "00:00:00;00",
-                    "00:00:59;29",
-                    "00:01:00;02",
+                    som,
+                    eom,
+                    duration,
                     Path.GetExtension(file.FileName),
-                    "HD");
+                    specCheck
+                );
 
-                _gridFiles.Rows[rowIndex].Tag = file;
+                var row = _gridFiles.Rows[rowIndex];
+                row.Tag = file;
+
+                if (specCheck == "Error")
+                {
+                    row.Cells[5].Style.ForeColor = Color.Red;
+                    row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
+                }
+                else
+                {
+                    row.Cells[5].Style.ForeColor = Color.White;
+                }
             }
         }
+        private bool IsSpecPass(MediaInfoResult info)
+        {
+            // 目前先照你說的：不是 HD 就 Error
+            if (!string.Equals(info.SpecCheck, "HD", StringComparison.OrdinalIgnoreCase))
+                return false;
 
+            return true;
+        }
         private double CalculateTotalSizeGB(List<MediaFile> files)
         {
             long totalBytes = 0;
@@ -327,9 +397,36 @@ namespace MxfPlayer
             _meterTimer = new System.Windows.Forms.Timer();
      
             _meterTimer.Interval = 33;
-            _meterTimer.Tick += (_, _) =>
+            _meterTimer.Tick += async (_, _) =>
             {
+                if (_isBuffering)
+                    return;
+
                 _player.AdvanceVideo(_meterTimer.Interval);
+
+                float rate = _playbackController.CurrentRate;
+
+                //if (Math.Abs(rate - 1.0f) > 0.001f && !_player.HasCurrentVideoFrame)
+                //{
+                //    _isBuffering = true;
+
+                //    try
+                //    {
+                //        _meterTimer.Stop();
+                //        _player.Pause();
+
+                //        await CheckBufferForRateAsync(rate);
+
+                //        await _playbackController.Play();
+                //    }
+                //    finally
+                //    {
+                //        _isBuffering = false;
+                //    }
+
+                //    return;
+                //}
+
                 UpdateVideoFrame();
                 UpdateMetersFromAudioLevel();
                 UpdateTimelineFromPlayer();
@@ -430,42 +527,68 @@ namespace MxfPlayer
                 BackColor = Color.FromArgb(58, 62, 67)
             };
 
+            var layout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 5,
+                RowCount = 1,
+                BackColor = Color.FromArgb(58, 62, 67),
+                Margin = new Padding(0),
+                Padding = new Padding(0)
+            };
+
+            // 檔名區會吃掉剩餘空間
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+
+            // 其他時間欄位固定寬度，縮小時比較不會被切掉
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 130)); // START
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 145)); // NOW
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 135)); // DUR
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150)); // REM
+
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+
             _lblCurrentFile = new Label
             {
                 Text = "尚未選擇檔案",
+                Dock = DockStyle.Fill,
                 AutoSize = false,
-                Location = new Point(10, 8),
-                Size = new Size(360, 24),
                 TextAlign = ContentAlignment.MiddleLeft,
                 ForeColor = Color.White,
-                Font = new Font("Segoe UI", 11, FontStyle.Regular)
+                Font = new Font("Segoe UI", 11, FontStyle.Regular),
+                AutoEllipsis = true,
+                Margin = new Padding(0, 0, 8, 0)
             };
 
             _lblStart = new Label
             {
                 Text = "START 00:00:00:00",
-                AutoSize = true,
+                Dock = DockStyle.Fill,
+                AutoSize = false,
                 ForeColor = Color.Gainsboro,
-                Location = new Point(410, 11)
+                TextAlign = ContentAlignment.MiddleCenter,
+                Margin = new Padding(0)
             };
 
             _lblNow = new TextBox
             {
                 Text = "00:00:00;00",
+                Dock = DockStyle.Fill,
                 BorderStyle = BorderStyle.None,
                 BackColor = Color.FromArgb(58, 62, 67),
                 ForeColor = Color.Orange,
                 Font = new Font("Segoe UI", 14, FontStyle.Bold),
-                Location = new Point(540, 8),
-                Size = new Size(130, 25),
                 MaxLength = 11,
-                TextAlign = HorizontalAlignment.Center
+                TextAlign = HorizontalAlignment.Center,
+                Margin = new Padding(0, 3, 0, 0)
             };
+
             _lblNow.GotFocus += (_, _) =>
             {
                 _isEditingNowTimecode = true;
                 _lblNow.SelectAll();
             };
+
             _lblNow.KeyDown += async (_, e) =>
             {
                 if (e.KeyCode == Keys.Back || e.KeyCode == Keys.Delete)
@@ -486,6 +609,7 @@ namespace MxfPlayer
                 e.SuppressKeyPress = true;
                 await SeekFromNowInputAsync();
             };
+
             _lblNow.KeyPress += async (_, e) =>
             {
                 if (e.KeyChar == '\b')
@@ -510,6 +634,7 @@ namespace MxfPlayer
                 e.Handled = true;
                 await SeekFromNowInputAsync();
             };
+
             _lblNow.Leave += (_, _) =>
             {
                 _isEditingNowTimecode = false;
@@ -519,24 +644,30 @@ namespace MxfPlayer
             _lblDur = new Label
             {
                 Text = "DUR 00:00:00:00",
-                AutoSize = true,
+                Dock = DockStyle.Fill,
+                AutoSize = false,
                 ForeColor = Color.Gainsboro,
-                Location = new Point(685, 11)
+                TextAlign = ContentAlignment.MiddleCenter,
+                Margin = new Padding(0)
             };
 
             _lblRemain = new Label
             {
                 Text = "REM 00:00:00:00",
-                AutoSize = true,
+                Dock = DockStyle.Fill,
+                AutoSize = false,
                 ForeColor = Color.Orange,
-                Location = new Point(820, 11)
+                TextAlign = ContentAlignment.MiddleRight,
+                Margin = new Padding(0)
             };
 
-            panel.Controls.Add(_lblCurrentFile);
-            panel.Controls.Add(_lblStart);
-            panel.Controls.Add(_lblNow);
-            panel.Controls.Add(_lblDur);
-            panel.Controls.Add(_lblRemain);
+            layout.Controls.Add(_lblCurrentFile, 0, 0);
+            layout.Controls.Add(_lblStart, 1, 0);
+            layout.Controls.Add(_lblNow, 2, 0);
+            layout.Controls.Add(_lblDur, 3, 0);
+            layout.Controls.Add(_lblRemain, 4, 0);
+
+            panel.Controls.Add(layout);
 
             return panel;
         }
@@ -570,18 +701,45 @@ namespace MxfPlayer
             };
             root.Controls.Add(scalePanel, 0, 0);
 
-            AddScaleLabel(scalePanel, "0", 6);
-            AddScaleLabel(scalePanel, "-6", 85);
-            AddScaleLabel(scalePanel, "-12", 165);
-            AddScaleLabel(scalePanel, "-18", 245);
-            AddScaleLabel(scalePanel, "-24", 325);
-            AddScaleLabel(scalePanel, "-30", 405);
-            AddScaleLabel(scalePanel, "-36", 485);
-            AddScaleLabel(scalePanel, "-48", 615);
-            AddScaleLabel(scalePanel, "-54", 695);
-            AddScaleLabel(scalePanel, "dB", 770);
+            string[] dbLabels = { "0", "-6", "-12", "-18", "-24", "-30", "-36", "-48", "-54", "dB" };
 
-            // ?喲? 8 ?脤?
+            scalePanel.Resize += (_, _) =>
+            {
+                scalePanel.Controls.Clear();
+
+                int h = scalePanel.ClientSize.Height;
+                if (h <= 0) return;
+
+                for (int i = 0; i < dbLabels.Length; i++)
+                {
+                    int top;
+
+                    if (dbLabels[i] == "dB")
+                    {
+                        top = h - 18;
+                    }
+                    else
+                    {
+                        top = 6 + (int)((h - 42) * i / 8.0);
+                       
+                    }
+
+                    var lbl = new Label
+                    {
+                        Text = dbLabels[i],
+                        ForeColor = Color.White,
+                        AutoSize = false,
+                        Width = 42,
+                        Height = 16,
+                        Left = 0,
+                        Top = Math.Max(0, Math.Min(top, h - 16)),
+                        TextAlign = ContentAlignment.MiddleRight,
+                        Font = new Font("Segoe UI", 8f, FontStyle.Regular)
+                    };
+
+                    scalePanel.Controls.Add(lbl);
+                }
+            };
             var barsLayout = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
@@ -676,22 +834,7 @@ namespace MxfPlayer
 
             Console.WriteLine($"[Audio] Channel {channelIndex + 1} changed.");
         }
-        private void AddScaleLabel(Panel parent, string text, int top)
-        {
-            var lbl = new Label
-            {
-                Text = text,
-                ForeColor = Color.White,
-                AutoSize = false,
-                Width = 42,
-                Height = 16,
-                Left = 0,
-                Top = top,
-                TextAlign = ContentAlignment.MiddleRight,
-                Font = new Font("Segoe UI", 8f, FontStyle.Regular)
-            };
-            parent.Controls.Add(lbl);
-        }
+   
         private Button CreatePlaybackButton(string text, int width, bool highlight = false)
         {
             var btn = new Button
@@ -718,27 +861,43 @@ namespace MxfPlayer
         {
             _timelineLabelsPanel = new Panel
             {
-                Dock = DockStyle.Top,
-                Height = 22
+                Dock = DockStyle.Fill,
+                Height = 22,
+                BackColor = Color.FromArgb(58, 62, 67)
             };
+
+            _timelineLabelsPanel.Resize += (_, _) =>
+            {
+                if (_currentMediaInfo != null)
+                    RefreshTimelineTicks(_currentMediaInfo);
+            };
+
             return _timelineLabelsPanel;
         }
         private void RefreshTimelineTicks(MediaInfoResult info)
         {
             _timelineLabelsPanel.Controls.Clear();
 
-            if (string.IsNullOrEmpty(info.Som) || string.IsNullOrEmpty(info.DurationTc)) return;
+            if (_timelineLabelsPanel.ClientSize.Width <= 80)
+                return;
 
-            // ?? FPS ?脰???閮?
-            if (!double.TryParse(info.FrameRate, out double fps)) fps = 29.97;
+            if (string.IsNullOrWhiteSpace(info.Som) || string.IsNullOrWhiteSpace(info.DurationTc))
+                return;
+
+            double fps = GetFpsFromInfo(info);
+            if (fps <= 0) return;
 
             long totalMs = GetMsFromTimecode(info.DurationTc, fps);
             long somMs = GetMsFromTimecode(info.Som, fps);
 
-            int tickCount = 8; // 閮剖?憿舐內 8 ????蝐?
+            if (totalMs <= 0)
+                return;
+
+            int tickCount = 8;
+            int panelWidth = _timelineLabelsPanel.ClientSize.Width;
+
             for (int i = 0; i < tickCount; i++)
             {
-                // 閮?閰脤??神蝘 (蝯??? = SOM + ?詨??脣漲)
                 long currentTickMs = somMs + (totalMs * i / (tickCount - 1));
 
                 var lbl = new Label
@@ -746,12 +905,21 @@ namespace MxfPlayer
                     Text = FormatTimecodeFromMilliseconds(currentTickMs, fps),
                     ForeColor = Color.White,
                     AutoSize = true,
-                    // ?寞??Ｘ撖砍漲???
-                    Left = (int)((_timelineLabelsPanel.Width - 60) * i / (tickCount - 1)),
                     Top = 2,
-                    Font = new Font("Segoe UI", 8.5f)
+                    Font = new Font("Segoe UI", 8.5f),
+                    BackColor = Color.Transparent
                 };
+
                 _timelineLabelsPanel.Controls.Add(lbl);
+
+                int x = (int)((panelWidth - 1) * i / (double)(tickCount - 1));
+
+                if (i == 0)
+                    lbl.Left = 0;
+                else if (i == tickCount - 1)
+                    lbl.Left = Math.Max(0, panelWidth - lbl.Width);
+                else
+                    lbl.Left = Math.Max(0, x - lbl.Width / 2);
             }
         }
         private Label _lblRate = null!;
@@ -858,9 +1026,29 @@ namespace MxfPlayer
 
             buttonHost.Controls.Add(btnRow, 1, 0);
 
-            panel.Controls.Add(buttonHost);
-            panel.Controls.Add(_timeline);
-            panel.Controls.Add(timeRow);
+            var playbackLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 3,
+                BackColor = Color.FromArgb(58, 62, 67),
+                Margin = new Padding(0),
+                Padding = new Padding(0)
+            };
+
+            playbackLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 22)); // 時間刻度
+            playbackLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28)); // TrackBar
+            playbackLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); // 按鈕
+
+            timeRow.Dock = DockStyle.Fill;
+            _timeline.Dock = DockStyle.Fill;
+            buttonHost.Dock = DockStyle.Fill;
+
+            playbackLayout.Controls.Add(timeRow, 0, 0);
+            playbackLayout.Controls.Add(_timeline, 0, 1);
+            playbackLayout.Controls.Add(buttonHost, 0, 2);
+
+            panel.Controls.Add(playbackLayout);
 
             return panel;
         }
@@ -884,8 +1072,8 @@ namespace MxfPlayer
             btnMoveFastForward.Click += (_, _) => HandleMoveFastForward();
             btnNegativeLog.Click += (_, _) => HandleNegativeLog();
             btnPositiveLog.Click += (_, _) => HandlePositiveLog();
-            btnMinus10.Click += (_, _) => HandleJump(-10);
-            btnPlus10.Click += (_, _) => HandleJump(10);
+            btnMinus10.Click += async (_, _) => await HandleJump(-10);
+            btnPlus10.Click += async (_, _) => await HandleJump(10);
         }
         private async void HandlePlay()
         {
@@ -915,21 +1103,24 @@ namespace MxfPlayer
         {
             await _playbackController.MoveLast(GetSelectedFps());
         }
+        private void ApplyPlaybackRate(float rate)
+        {
+            _lblRate.Text = $"{rate:0}x";
 
+            if (Math.Abs(rate - 1.0f) > 0.001f)
+                _player.PrepareVideoBuffer();
+        }
         private void HandleMoveBackForward()
         {
             float rate = _playbackController.MoveBackForward();
-            _lblRate.Text = $"{rate:0}x";
-            //_lblNow.Text = $"{rate:0}x";
+            ApplyPlaybackRate(rate);
         }
-
+        
         private void HandleMoveFastForward()
         {
             float rate = _playbackController.MoveFastForward();
-            _lblRate.Text = $"{rate:0}x";
-            //_lblNow.Text = $"{rate:0}x";
+            ApplyPlaybackRate(rate);
         }
-
         private async void HandleNegativeLog()
         {
             double fps = GetSelectedFps();
@@ -954,7 +1145,54 @@ namespace MxfPlayer
             await _player.PlayFrameAudioAsync(_player.CurrentFrameIndex, fps);
             UpdateMetersFromAudioLevel();
         }
+        private async Task CheckBufferForRateAsync(float rate)
+        {
+            if (Math.Abs(rate - 1.0f) < 0.001f)
+                return;
 
+            if (!TryGetSelectedMediaFile(out var file) || file == null)
+                return;
+
+            if (_player.HasVideoBufferForRate(rate))
+                return;
+
+            using var loading = new LoadingForm(this, file.FileName);
+            loading.TopMost = true;
+            loading.Show();
+            loading.Refresh();
+
+            var start = DateTime.Now;
+
+            while ((DateTime.Now - start).TotalMilliseconds < 3000)
+            {
+                if (_player.HasVideoBufferForRate(rate))
+                    break;
+
+                await Task.Delay(50);
+            }
+
+            _displayedVideoFrameIndex = -1;
+            UpdateVideoFrame();
+        }
+        private double GetFpsFromInfo(MediaInfoResult info)
+        {
+            string frameRateText = info.FrameRateValue;
+
+            if (string.IsNullOrWhiteSpace(frameRateText))
+                frameRateText = info.FrameRate;
+
+            if (string.IsNullOrWhiteSpace(frameRateText))
+                frameRateText = info.FrameRateDisplay;
+
+            int spaceIndex = frameRateText.IndexOf(' ');
+            if (spaceIndex > 0)
+                frameRateText = frameRateText.Substring(0, spaceIndex);
+
+            if (double.TryParse(frameRateText, out double fps) && fps > 0)
+                return fps;
+
+            return 0;
+        }
         private async Task SeekFromNowInputAsync()
         {
             if (_isSeeking) return;
@@ -1012,9 +1250,25 @@ namespace MxfPlayer
 
         private async Task HandleJump(int seconds)
         {
-            await _playbackController.Jump(seconds, GetSelectedFps());
-        }
+            double fps = GetSelectedFps();
+            if (fps <= 0) return;
 
+            bool wasPlaying = _meterTimer.Enabled;
+
+            _playbackController.Pause();
+
+            await _playbackController.Jump(seconds, fps);
+
+            _displayedVideoFrameIndex = -1;
+            await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 1000);
+
+            UpdateVideoFrame();
+            UpdateTimelineUI(-1);
+            UpdateMetersFromAudioLevel();
+
+            if (wasPlaying)
+                await _playbackController.Play();
+        }
         private void HandleFullScreen()
         {
             if (WindowState == FormWindowState.Maximized)
@@ -1127,14 +1381,14 @@ namespace MxfPlayer
                 }
             };
 
-            _gridFiles.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "檔案名稱", Width = 250 });
-            _gridFiles.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "起始 TC", Width = 90 });
-            _gridFiles.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "格式", Width = 90 });
-            _gridFiles.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "副檔名", Width = 90 });
-            _gridFiles.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "規格", Width = 70 });
-            _gridFiles.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "狀態", Width = 80 });
+            _gridFiles.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "檔案名", Width = 300 });
+            _gridFiles.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "入點", Width = 120 });
+            _gridFiles.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "出點", Width = 120 });
+            _gridFiles.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "時長", Width = 120 });
+            _gridFiles.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "副檔名", Width = 70 });
+            _gridFiles.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "格式檢查", Width = 100 });
 
-            _gridFiles.SelectionChanged += OnGridSelectionChanged;
+            _gridFiles.CellClick += OnGridFileClick;
             _gridFiles.CellDoubleClick += OnGridFileDoubleClick;
 
             topPanel.Controls.Add(_gridFiles);
@@ -1214,9 +1468,10 @@ namespace MxfPlayer
             outer.Controls.Add(statusPanel, 0, 1);
             outer.Controls.Add(bottomPanel, 0, 2);
         }
-        private void OnGridSelectionChanged(object? sender, EventArgs e)
+        private void OnGridFileClick(object? sender, DataGridViewCellEventArgs e)
         {
-            if (!TryGetSelectedMediaFile(out var file) || file == null) return;
+            if (e.RowIndex < 0) return;
+            if (_gridFiles.Rows[e.RowIndex].Tag is not MediaFile file) return;
 
             try
             {
@@ -1373,11 +1628,14 @@ namespace MxfPlayer
                     // 撱箄降?寧??閮?隞仿???overrideTime
                     _timeline.Value = Math.Clamp((int)(current * _timeline.Maximum / length), _timeline.Minimum, _timeline.Maximum);
 
-                    double fps = 29.97;
+                    double fps = GetSelectedFps();
+                    if (fps <= 0) return;
+
                     long somMs = 0;
-                    if (TryGetSelectedMediaFile(out var file) && _mediaCache.TryGetValue(file.FullPath, out var info))
+                    if (TryGetSelectedMediaFile(out var file) &&
+                        file != null &&
+                        _mediaCache.TryGetValue(file.FullPath, out var info))
                     {
-                        double.TryParse(info.FrameRate, out fps);
                         somMs = GetMsFromTimecode(info.Som, fps);
                     }
 
@@ -1519,17 +1777,29 @@ namespace MxfPlayer
             catch { return 0; }
         }
 
-        private string FormatTimecodeFromMilliseconds(long totalMs, double fps)
+        private string FormatTimecodeFromMilliseconds(long ms, double fps)
         {
-            if (totalMs < 0) totalMs = 0;
+            if (ms < 0) ms = 0;
+            if (fps <= 0) fps = 29.97;
 
-            TimeSpan ts = TimeSpan.FromMilliseconds(totalMs);
-            // 雿輻蝎曄Ⅱ FPS 閮?撟??
-            int frame = (int)((totalMs % 1000) * fps / 1000.0);
-            string separator = (Math.Abs(fps - 29.97) < 0.01) ? ";" : ":";
+            TimeSpan ts = TimeSpan.FromMilliseconds(ms);
+            int frame = (int)((ms % 1000) * fps / 1000.0);
+            string separator = IsSelectedDropFrame() ? ";" : ":";
 
-            // 雿輻 TotalHours ?踹?頞? 24 撠????憿?(?敶梁?敺??獐??
             return $"{((int)ts.TotalHours):00}:{ts.Minutes:00}:{ts.Seconds:00}{separator}{frame:00}";
+        }
+        private bool IsSelectedDropFrame()
+        {
+            if (TryGetSelectedMediaFile(out var file) &&
+                file != null &&
+                _mediaCache.TryGetValue(file.FullPath, out var info))
+            {
+                return string.Equals(info.DropFrame, "True", StringComparison.OrdinalIgnoreCase)
+                    || info.Som.Contains(';')
+                    || info.Eom.Contains(';');
+            }
+
+            return false;
         }
         private async Task SeekFromTimeline()
         {
@@ -1566,14 +1836,15 @@ namespace MxfPlayer
                 long elapsedMs = _playbackController.GetCurrentTime();
                 long lengthMs = _playbackController.GetLength();
 
-                double fps = 29.97;
+                double fps = GetSelectedFps();
+                if (fps <= 0) return;
+
                 long somMs = 0;
 
                 if (TryGetSelectedMediaFile(out var file) &&
                     file != null &&
                     _mediaCache.TryGetValue(file.FullPath, out var info))
                 {
-                    double.TryParse(info.FrameRate, out fps);
                     somMs = GetMsFromTimecode(info.Som, fps);
                 }
 
@@ -1587,16 +1858,7 @@ namespace MxfPlayer
                 _meterTimer.Start();
             }
         }
-        private string FormatTimecodeFromMilliseconds(long ms)
-        {
-            if (ms < 0) ms = 0;
-            TimeSpan ts = TimeSpan.FromMilliseconds(ms);
-
-            // ?身 29.97 fps (瘥?蝝?33.3ms)嚗???info ?澆遣霅啣? info ??
-            int frame = (int)((ms % 1000) / 33.3);
-
-            return $"{ts.Hours:00}:{ts.Minutes:00}:{ts.Seconds:00};{frame:00}";
-        }
+        
         private class DarkColorTable : ProfessionalColorTable
         {
             public override Color MenuItemSelected => Color.FromArgb(72, 76, 82);

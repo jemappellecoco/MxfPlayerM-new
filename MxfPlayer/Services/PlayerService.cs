@@ -17,19 +17,19 @@ namespace MxfPlayer.Services
 {
     public class ConfigModel
     {
-        public string FFmpegPath { get; set; }
+        public string FFmpegPath { get; set; } = "";
     }
 
     public unsafe class PlayerService : IDisposable
     {
-        private bool _filterReady = false; // ?嚗Ⅱ靽圾蝣澆銵?銝??券?撱箸???亥???
-        // --- ?詨?閫?Ⅳ霈 ---
+        private bool _filterReady = false; 
+
         private AVFormatContext* _formatContext;
         private Dictionary<int, PointerWrapper<AVCodecContext>> _audioDecoders = new();
         private List<int> _audioStreamIndices = new();
         private readonly object _ffmpegResourceLock = new object();
         private readonly object _audioCacheLock = new object();
-        // --- 瞈暸?詨?霈 ---
+   
         private AVFilterGraph* _filterGraph;
         private AVFilterContext** _srcContexts;
         private AVFilterContext* _sinkContext;
@@ -41,12 +41,13 @@ namespace MxfPlayer.Services
         private MxfAudioProvider? _fileAudioProvider;
         private MemoryPcmAudioProvider? _memoryAudioProvider;
         private double _audioFps = 29.97;
+        public double CurrentFps => _audioFps > 0 ? _audioFps : 29.97;
         private readonly Dictionary<long, Bitmap> _videoFrameCache = new();
         private readonly Queue<long> _videoFrameCacheOrder = new();
         private readonly List<Bitmap> _videoFrames = new();
-        private const int MaxCachedVideoFrames = 1800;
-        private const int VideoPreloadLowWaterFrames = 180;
-        private const int VideoDecoderRestartGapFrames = 12;
+        private const int MaxCachedVideoFrames = 1800; //MaxCachedVideoFrames = 最多保留多少張畫面
+        private const int VideoPreloadLowWaterFrames = 360;//VideoPreloadLowWaterFrames = 前方剩多少 frame 時開始補 buffe
+        private const int VideoDecoderRestartGapFrames = 30; //VideoDecoderRestartGapFrames = 落後多少 frame 才重啟 decoder
         private const int MaxStaleDisplayFrames = 180;
         private long _currentFrameIndex;
         private long _totalVideoFrames;
@@ -74,6 +75,41 @@ namespace MxfPlayer.Services
         public int CurrentAudioCount { get; private set; }
         public bool IsAudioReady => _waveOut != null && _fileAudioProvider != null;
         public long CurrentFrameIndex => _currentFrameIndex;
+
+        public bool HasVideoBufferForRate(float rate)
+        {
+            lock (_lock)
+            {
+                if (_videoFrameCache.Count == 0)
+                    return false;
+
+                long requiredFrames = Math.Abs(rate) switch
+                {
+                    >= 16 => 900,
+                    >= 8 => 600,
+                    >= 4 => 360,
+                    >= 2 => 180,
+                    _ => 60
+                };
+
+                if (rate >= 0)
+                {
+                    long maxCached = _videoFrameCache.Keys.Max();
+                    return maxCached - _currentFrameIndex >= requiredFrames;
+                }
+                else
+                {
+                    long minCached = _videoFrameCache.Keys.Min();
+                    return _currentFrameIndex - minCached >= requiredFrames;
+                }
+            }
+        }
+
+        public void PrepareVideoBuffer()
+        {
+            EnsureVideoDecoderNearCurrentFrame();
+        }
+       
         public bool HasCurrentVideoFrame
         {
             get
@@ -164,8 +200,10 @@ namespace MxfPlayer.Services
             catch { }
         }
 
-        public Task StartAudioBridge(string path, int audioCount, long startTimeMs = 0, float rate = 1.0f, double fps = 29.97)
+        public Task StartAudioBridge(string path, int audioCount, long startTimeMs = 0, float rate = 1.0f, double fps = 0)
         {
+            fps = fps > 0 ? fps : CurrentFps;
+
             LoadForBufferedPlayback(path, audioCount, startTimeMs, rate, fps);
             return WaitForFrameBufferAsync(FrameFromTimeMs(startTimeMs, fps), 3000);
         }
@@ -182,17 +220,12 @@ namespace MxfPlayer.Services
             DecodeVideoFrames(path);
             byte[] pcmData = CreatePcmCacheData(path);
 
-            // 1. ????FFmpeg
-            
-
-            // 2. ???唾?頛詨 (NAudio)
             _memoryAudioProvider = new MemoryPcmAudioProvider(pcmData, 2);
             _memoryAudioProvider.PlaybackRate = Math.Abs(rate) > 0 ? Math.Abs(rate) : 1.0f;
             _waveOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, 30);
             _waveOut.Init(_memoryAudioProvider);
 
-            // 3. ??閫?Ⅳ?瑁?蝺?
-            
+         
 
             SetVideoRate(rate);
             long startFrame = FrameFromTimeMs(startTimeMs, _audioFps);
@@ -222,7 +255,7 @@ namespace MxfPlayer.Services
             StopAudioBridge();
             CurrentPath = path;
             CurrentAudioCount = audioCount;
-            _audioFps = fps > 0 ? fps : 29.97;
+            _audioFps = fps > 0 ? fps : CurrentFps;
 
             long startFrame = FrameFromTimeMs(startTimeMs, _audioFps);
             _totalVideoFrames = ProbeVideoFrameCount(path, _audioFps);
@@ -351,7 +384,7 @@ namespace MxfPlayer.Services
                     return;
 
                 bool available = rate < 0
-                    ? _fileAudioProvider.IsReverseFrameDataAvailable(frameIndex, fps, 50)
+                    ? _fileAudioProvider.IsReverseFrameDataAvailable(frameIndex, fps, 500)
                     : _fileAudioProvider.IsFrameDataAvailable(frameIndex, fps, 250);
 
                 if (available)
@@ -680,19 +713,35 @@ namespace MxfPlayer.Services
                 if (ffmpeg.av_seek_frame(formatContext, videoStreamIndex, seekTarget, ffmpeg.AVSEEK_FLAG_BACKWARD) >= 0)
                     ffmpeg.avcodec_flush_buffers(codecContext);
 
-                long nextFrameIndex = startFrame;
-
                 long windowEndFrame = Math.Min(_totalVideoFrames > 0 ? _totalVideoFrames : long.MaxValue, startFrame + MaxCachedVideoFrames);
+                long fallbackFrameIndex = seekFrame;
+                long cachedThroughFrame = startFrame - 1;
 
-                while (!token.IsCancellationRequested && nextFrameIndex < windowEndFrame && ffmpeg.av_read_frame(formatContext, packet) >= 0)
+                while (!token.IsCancellationRequested && cachedThroughFrame < windowEndFrame && ffmpeg.av_read_frame(formatContext, packet) >= 0)
                 {
                     if (packet->stream_index == videoStreamIndex &&
                         ffmpeg.avcodec_send_packet(codecContext, packet) >= 0)
                     {
-                        DecodeWindowFrames(codecContext, frame, rgbFrame, swsContext, width, height, ref nextFrameIndex, token);
+                        DecodeWindowFrames(
+                            codecContext,
+                            frame,
+                            rgbFrame,
+                            swsContext,
+                            width,
+                            height,
+                            stream->time_base,
+                            stream->start_time,
+                            startFrame,
+                            windowEndFrame,
+                            ref fallbackFrameIndex,
+                            ref cachedThroughFrame,
+                            token);
 
-                        if (nextFrameIndex >= windowEndFrame)
+                        if (cachedThroughFrame >= windowEndFrame)
+                        {
+                            ffmpeg.av_packet_unref(packet);
                             break;
+                        }
                     }
 
                     ffmpeg.av_packet_unref(packet);
@@ -710,16 +759,55 @@ namespace MxfPlayer.Services
             }
         }
 
-        private void DecodeWindowFrames(AVCodecContext* codecContext, AVFrame* frame, AVFrame* rgbFrame, SwsContext* swsContext, int width, int height, ref long nextFrameIndex, CancellationToken token)
+        private void DecodeWindowFrames(
+            AVCodecContext* codecContext,
+            AVFrame* frame,
+            AVFrame* rgbFrame,
+            SwsContext* swsContext,
+            int width,
+            int height,
+            AVRational streamTimeBase,
+            long streamStartTime,
+            long windowStartFrame,
+            long windowEndFrame,
+            ref long fallbackFrameIndex,
+            ref long cachedThroughFrame,
+            CancellationToken token)
         {
             while (!token.IsCancellationRequested && ffmpeg.avcodec_receive_frame(codecContext, frame) == 0)
             {
-                long frameIndex = nextFrameIndex++;
+                long frameIndex = GetFrameIndexFromTimestamp(frame, streamTimeBase, streamStartTime, fallbackFrameIndex);
+                fallbackFrameIndex++;
+
+                if (frameIndex < windowStartFrame || frameIndex >= windowEndFrame)
+                {
+                    ffmpeg.av_frame_unref(frame);
+                    continue;
+                }
+
                 ffmpeg.sws_scale(swsContext, frame->data, frame->linesize, 0, height, rgbFrame->data, rgbFrame->linesize);
                 AddVideoFrameToCache(frameIndex, CreateBitmapFromFrame(rgbFrame, width, height));
+                cachedThroughFrame = Math.Max(cachedThroughFrame, frameIndex);
 
                 ffmpeg.av_frame_unref(frame);
             }
+        }
+
+        private long GetFrameIndexFromTimestamp(AVFrame* frame, AVRational streamTimeBase, long streamStartTime, long fallbackFrameIndex)
+        {
+            if (frame->best_effort_timestamp == ffmpeg.AV_NOPTS_VALUE)
+                return fallbackFrameIndex;
+
+            long timestamp = frame->best_effort_timestamp;
+            if (streamStartTime != ffmpeg.AV_NOPTS_VALUE)
+                timestamp -= streamStartTime;
+
+            long timeMs = ffmpeg.av_rescale_q(
+                timestamp,
+                streamTimeBase,
+                new AVRational { num = 1, den = 1000 });
+
+            return FrameFromTimeMs(timeMs, _audioFps);
         }
 
         private void AddVideoFrameToCache(long frameIndex, Bitmap bitmap)
@@ -1428,7 +1516,7 @@ namespace MxfPlayer.Services
         {
             return Task.Run(() =>
             {
-                if (fps <= 0) fps = 29.97;
+                if (fps <= 0) fps = CurrentFps;
                 if (_fileAudioProvider == null)
                     return;
 

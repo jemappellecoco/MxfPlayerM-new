@@ -40,7 +40,7 @@ namespace MxfPlayer
             // 顯示文字
             _lblInfo = new Label
             {
-                Text = $"正在解析音訊，請稍候...\n檔案：{fileName}",
+                Text = $"Loading...\n檔案：{fileName}",
                 ForeColor = Color.White,
                 Font = new Font("Microsoft JhengHei", 10, FontStyle.Bold),
                 TextAlign = ContentAlignment.MiddleLeft,

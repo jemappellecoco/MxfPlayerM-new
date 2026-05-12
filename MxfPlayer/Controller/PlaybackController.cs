@@ -20,35 +20,29 @@ namespace MxfPlayer.Controllers
             _resetMeters = resetMeters;
         }
 
-       
-        public async Task MoveFirst()
-        {
-            _player.SeekVideoByFrame(0);
-            _player.SeekAudioByFrame(0, 29.97);
-            await Task.CompletedTask;
-        }
 
         public async Task MoveFirst(double fps)
         {
+            if (fps <= 0) return;
+
             _player.SeekVideoByFrame(0);
             _player.SeekAudioByFrame(0, fps);
             await Task.CompletedTask;
         }
 
-        public async Task MoveLast()
-        {
-            long length = _player.LengthMs;
-            _player.SeekAudio(length);
-            _player.Seek(length);
-            await Task.CompletedTask;
-        }
 
         public async Task MoveLast(double fps)
         {
+            if (fps <= 0) return;
+
             long length = _player.LengthMs;
+            if (length <= 0) return;
+
             long frame = PlayerService.FrameFromTimeMs(length, fps);
+
             _player.SeekVideoByFrame(frame);
             _player.SeekAudioByFrame(frame, fps);
+
             await Task.CompletedTask;
         }
 
@@ -59,14 +53,14 @@ namespace MxfPlayer.Controllers
             if (CurrentRate < -16f) CurrentRate = -1.0f;
 
             _player.SetVideoRate(CurrentRate);
-            _meterTimer.Start();
+            //_meterTimer.Start();
 
             return CurrentRate;
         }
 
         public void NegativeLog(double fps)
         {
-            if (fps <= 0) fps = 29.97;
+            if (fps <= 0) return;
             long targetFrame = Math.Max(0, _player.CurrentFrameIndex - 1);
             long target = PlayerService.TimeMsFromFrame(targetFrame, fps);
 
@@ -92,10 +86,7 @@ namespace MxfPlayer.Controllers
             _resetMeters?.Invoke();
         }
 
-        public void SeekByTimelineValue(int value, int maxValue)
-        {
-            SeekByTimelineValue(value, maxValue, 29.97);
-        }
+       
 
         public void SeekByTimelineValue(int value, int maxValue, double fps)
         {
@@ -115,13 +106,10 @@ namespace MxfPlayer.Controllers
             _player.SeekAudioByFrame(targetFrame, fps);
         }
 
-        public async Task Jump(int seconds)
-        {
-            await Jump(seconds, 29.97);
-        }
-
         public async Task Jump(int seconds, double fps)
         {
+            if (fps <= 0) fps = _player.CurrentFps;
+
             long length = _player.LengthMs;
             long currentFrame = PlayerService.FrameFromTimeMs(_player.CurrentTimeMs, fps);
             long jumpFrames = (long)Math.Round(seconds * fps);
@@ -156,15 +144,11 @@ namespace MxfPlayer.Controllers
             _player.SetAudioRate(1.0f);
         }
 
-        // 逐幀前進 (Positive Log)
-        public async Task PositiveLog()
-        {
-            await PositiveLog(29.97);
-        }
+       
 
         public async Task PositiveLog(double fps)
         {
-            if (fps <= 0) fps = 29.97;
+            if (fps <= 0) fps = _player.CurrentFps;
             long targetFrame = _player.CurrentFrameIndex + 1;
             _player.Seek(PlayerService.TimeMsFromFrame(targetFrame, fps));
             _player.SeekAudioByFrame(targetFrame, fps);

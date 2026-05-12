@@ -49,18 +49,30 @@ namespace MxfPlayer.Services
 
             JsonElement general = default;
             JsonElement video = default;
+            JsonElement audio = default;
             JsonElement timecode = default;
-
             foreach (var t in tracks.EnumerateArray())
             {
                 string type = Get(t, "@type");
 
                 if (type == "General")
+                {
                     general = t;
+                }
                 else if (type == "Video")
+                {
                     video = t;
-                else if (type == "Other" && t.TryGetProperty("TimeCode_FirstFrame", out _))
-                    timecode = t;
+                }
+                else if (type == "Audio" && audio.ValueKind == JsonValueKind.Undefined)
+                {
+                    // 只抓第一軌 Audio，因為 A1~A8 都是 1152 kb/s
+                    audio = t;
+                }
+                else if (type == "Other")
+                {
+                    if (t.TryGetProperty("TimeCode_LastFrame", out _))
+                        timecode = t;
+                }
             }
 
             string width = Get(video, "Width");
@@ -72,7 +84,9 @@ namespace MxfPlayer.Services
 
             string som = Get(video, "TimeCode_FirstFrame");
             string eom = Get(timecode, "TimeCode_LastFrame");
-            string durationTc = BuildDurationTc(frameCount, fpsNum, fpsDen);
+            string dropFrame = DetectDropFrame(video, timecode);
+            string durationTc = BuildDurationTc(frameCount, fpsNum, fpsDen, dropFrame);
+            string frameRateDisplay = FormatFrameRate(frameRate, fpsNum, fpsDen);
 
             if (string.IsNullOrWhiteSpace(durationTc))
                 durationTc = Get(general, "Duration");
@@ -83,7 +97,12 @@ namespace MxfPlayer.Services
                 FullPath = filePath,
                 Width = width,
                 Height = height,
-                FrameRate = frameRate,
+                FrameRate = frameRate,                 // 純數字，給 TryParse 用
+                FrameRateValue = frameRate,            // 純數字
+                FrameRateNum = fpsNum,
+                FrameRateDen = fpsDen,
+                FrameRateDisplay = frameRateDisplay,   // 顯示用：29.970 (30000/1001)
+                DropFrame = dropFrame,
                 AudioCount = Get(general, "AudioCount"),
                 CommercialName = Get(general, "Format_Commercial_IfAny"),
                 ScanType = Get(video, "ScanType"),
@@ -91,12 +110,40 @@ namespace MxfPlayer.Services
                 Som = som,
                 Eom = eom,
                 DurationTc = durationTc,
-                BitRate = FormatBitRate(Get(general, "OverallBitRate")),
+                //BitRate = FormatBitRate(Get(video, "BitRate")),
+                VideoBitRate = FormatBitRate(Get(video, "BitRate")),
+                AudioBitRate = FormatBitRate(Get(audio, "BitRate")),
+                OverallBitRate = FormatBitRate(Get(general, "OverallBitRate")),
                 DisplayAspect = ConvertAspect(Get(video, "DisplayAspectRatio")),
                 SpecCheck = BuildSpecCheck(width, height)
             };
         }
+        private string FormatFrameRate(string frameRate, string fpsNum, string fpsDen)
+        {
+            if (string.IsNullOrWhiteSpace(frameRate))
+                return "";
 
+            if (!string.IsNullOrWhiteSpace(fpsNum) && !string.IsNullOrWhiteSpace(fpsDen))
+                return $"{frameRate} ({fpsNum}/{fpsDen})";
+
+            return frameRate;
+        }
+        private string DetectDropFrame(JsonElement video, JsonElement timecode)
+        {
+            string fromVideo = Get(video, "Delay_DropFrame");
+            if (!string.IsNullOrWhiteSpace(fromVideo))
+                return fromVideo;
+
+            string som = Get(timecode, "TimeCode_FirstFrame");
+            if (!string.IsNullOrWhiteSpace(som))
+                return som.Contains(';') ? "True" : "False";
+
+            string videoSom = Get(video, "TimeCode_FirstFrame");
+            if (!string.IsNullOrWhiteSpace(videoSom))
+                return videoSom.Contains(';') ? "True" : "False";
+
+            return "False";
+        }
         private string Get(JsonElement element, string propertyName)
         {
             if (element.ValueKind == JsonValueKind.Undefined)
@@ -148,7 +195,7 @@ namespace MxfPlayer.Services
             return $"{bitRate} b/s";
         }
 
-        private string BuildDurationTc(string frameCountText, string fpsNumText, string fpsDenText)
+        private string BuildDurationTc(string frameCountText, string fpsNumText, string fpsDenText, string dropFrame)
         {
             if (!int.TryParse(frameCountText, out int frameCount))
                 return "";
@@ -173,7 +220,10 @@ namespace MxfPlayer.Services
             int minutes = totalMinutes % 60;
             int hours = totalMinutes / 60;
 
-            string separator = Math.Abs(fps - 29.97) < 0.01 ? ";" : ":";
+            string separator =
+                string.Equals(dropFrame, "True", StringComparison.OrdinalIgnoreCase)
+                    ? ";"
+                    : ":";
 
             return $"{hours:00}:{minutes:00}:{seconds:00}{separator}{frames:00}";
         }

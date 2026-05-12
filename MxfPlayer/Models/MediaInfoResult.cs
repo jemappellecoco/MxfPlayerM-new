@@ -15,8 +15,19 @@
         public string Som { get; set; } = "";
         public string Eom { get; set; } = "";
         public string DurationTc { get; set; } = "";
+
         public string BitRate { get; set; } = "";
+        public string VideoBitRate { get; set; } = "";
+        public string OverallBitRate { get; set; } = "";
+        public string AudioBitRate { get; set; } = "";
+
         public string DisplayAspect { get; set; } = "";
         public string SpecCheck { get; set; } = "";
+
+        public string FrameRateDisplay { get; set; } = "";
+        public string FrameRateValue { get; set; } = "";
+        public string FrameRateNum { get; set; } = "";
+        public string FrameRateDen { get; set; } = "";
+        public string DropFrame { get; set; } = "";
     }
 }
