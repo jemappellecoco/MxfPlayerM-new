@@ -18,7 +18,8 @@ namespace MxfPlayer
         private readonly FolderService _folder = new();
         private readonly MediaInfoService _mediaInfo = new();
         private readonly MediaSpecService _mediaSpec = new();
-        private readonly Dictionary<string, MediaInfoResult> _mediaCache = new();
+        private readonly MediaAnalysisCacheService _analysisCache = new();
+        private readonly Dictionary<string, MediaInfoResult> _mediaCache = new(StringComparer.OrdinalIgnoreCase);
         private readonly AudioMixerService _audioMixer = new();
         private readonly PlaybackController _playbackController;
         private Panel _timelineLabelsPanel = null!;
@@ -50,6 +51,8 @@ namespace MxfPlayer
         private int _timelineUpdateElapsedMs = 0;
         private const int MeterUpdateIntervalMs = 100;
         private const int TimelineUpdateIntervalMs = 100;
+        private const int PlaybackPrebufferFrames = 120;
+        private const int PlaybackPrebufferTimeoutMs = 3000;
         public MainForm()
         {
             Text = "Offline xPlayer";
@@ -90,7 +93,7 @@ namespace MxfPlayer
             };
         }
 
-        private void ShowMediaInfo(MediaInfoResult info)
+        private void ShowMediaInfo(MediaInfoResult info, CachedMediaAnalysis? analysis = null)
         {
             _currentMediaInfo = info;
 
@@ -100,10 +103,12 @@ namespace MxfPlayer
             {
                 RefreshTimelineTicks(info);
             }));
-            var check = _mediaSpec.CheckWeiLaiSpec(info);
-            string specType = _mediaSpec.GetSpecType(info);
-            string errorText = check.Errors.Count > 0
-                ? string.Join(Environment.NewLine + "                    ", check.Errors)
+            string specType = analysis?.SpecType ?? "Unknown";
+            string specStatus = analysis == null
+                ? "未檢查"
+                : analysis.SpecIsPass ? specType : "Error";
+            string errorText = analysis?.SpecErrors.Count > 0
+                ? string.Join(Environment.NewLine + "                    ", analysis.SpecErrors)
                 : "無";
 
 
@@ -124,6 +129,8 @@ namespace MxfPlayer
                 $"音訊單軌位元率:     {info.AudioBitRate}{Environment.NewLine}" +
                 $"整體位元率:         {info.OverallBitRate}{Environment.NewLine}" +
                 $"顯示比例:           {info.DisplayAspect}{Environment.NewLine}" +
+                $"格式檢查:           {specStatus}{Environment.NewLine}" +
+                $"錯誤原因:           {errorText}{Environment.NewLine}" +
                 $"檔案名稱: {info.FileName}{Environment.NewLine}" +
                 $"完整路徑: {info.FullPath}";
         }
@@ -140,13 +147,37 @@ namespace MxfPlayer
 
         private void LoadAndShowMedia(string filePath)
         {
-            if (!_mediaCache.TryGetValue(filePath, out var info))
+            var analysis = GetOrAnalyzeMedia(filePath);
+
+            ShowMediaInfo(analysis.Info, analysis);
+        }
+
+        private CachedMediaAnalysis GetOrAnalyzeMedia(string filePath)
+        {
+            if (_analysisCache.TryGetValid(filePath, out var cached))
             {
-                info = _mediaInfo.GetInfo(filePath);
-                _mediaCache[filePath] = info;
+                _mediaCache[filePath] = cached.Info;
+                return cached;
             }
 
-            ShowMediaInfo(info);
+            var info = _mediaInfo.GetInfo(filePath);
+            var check = _mediaSpec.CheckWeiLaiSpec(info);
+            var fileInfo = new FileInfo(filePath);
+
+            var analysis = new CachedMediaAnalysis
+            {
+                FullPath = filePath,
+                FileLength = fileInfo.Length,
+                LastWriteTimeUtc = fileInfo.LastWriteTimeUtc,
+                Info = info,
+                SpecType = _mediaSpec.GetSpecType(info),
+                SpecIsPass = check.IsPass,
+                SpecErrors = check.Errors
+            };
+
+            _mediaCache[filePath] = info;
+            _analysisCache.Save(analysis);
+            return analysis;
         }
 
         private async Task<bool> StartPlaybackForFile(MediaFile file, long startTimeMs = 0)
@@ -160,7 +191,7 @@ namespace MxfPlayer
                 double fps = 0;
 
                 if (!_mediaCache.ContainsKey(file.FullPath))
-                    LoadAndShowMedia(file.FullPath);
+                    GetOrAnalyzeMedia(file.FullPath);
 
                 if (_mediaCache.TryGetValue(file.FullPath, out var info))
                 {
@@ -192,6 +223,10 @@ namespace MxfPlayer
                     {
                         _displayedVideoFrameIndex = -1;
                         await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
+                        await _player.WaitForVideoBufferAheadAsync(
+                            _player.CurrentFrameIndex,
+                            PlaybackPrebufferFrames,
+                            PlaybackPrebufferTimeoutMs);
                         UpdateVideoFrame();
                     }
                     finally
@@ -325,28 +360,22 @@ namespace MxfPlayer
 
                 try
                 {
-                    if (!_mediaCache.TryGetValue(file.FullPath, out var info))
-                    {
-                        info = _mediaInfo.GetInfo(file.FullPath);
-                        _mediaCache[file.FullPath] = info;
-                    }
+                    var analysis = GetOrAnalyzeMedia(file.FullPath);
+                    var info = analysis.Info;
 
                     som = string.IsNullOrWhiteSpace(info.Som) ? "00:00:00;00" : info.Som;
                     eom = string.IsNullOrWhiteSpace(info.Eom) ? "00:00:00;00" : info.Eom;
                     duration = string.IsNullOrWhiteSpace(info.DurationTc) ? "00:00:00;00" : info.DurationTc;
 
-                    var check = _mediaSpec.CheckWeiLaiSpec(info);
-                    string specType = _mediaSpec.GetSpecType(info);
-
-                    if (check.IsPass)
+                    if (analysis.SpecIsPass)
                     {
-                        specCheck = specType; // HD 或 SD
+                        specCheck = analysis.SpecType; // HD 或 SD
                         specErrorText = "";
                     }
                     else
                     {
                         specCheck = "Error";
-                        specErrorText = string.Join(Environment.NewLine, check.Errors);
+                        specErrorText = string.Join(Environment.NewLine, analysis.SpecErrors);
 
                         // 先印到 Output 視窗，方便你 debug
                         System.Diagnostics.Debug.WriteLine($"[Spec Error] {file.FileName}");
@@ -454,18 +483,24 @@ namespace MxfPlayer
 
         private void UpdateVideoFrame()
         {
-            var nextFrame = _player.CreateDisplayVideoFrameSnapshot(out var frameIndex);
-            if (nextFrame == null) return;
-            if (frameIndex == _displayedVideoFrameIndex)
-            {
-                nextFrame.Dispose();
+            long frameIndex = _player.GetDisplayFrameIndex();
+
+            if (frameIndex < 0)
                 return;
-            }
+
+            if (frameIndex == _displayedVideoFrameIndex)
+                return;
+
+            var nextFrame = _player.CreateDisplayVideoFrameSnapshot(out var snapshotFrameIndex);
+            if (nextFrame == null)
+                return;
 
             var previousFrame = _displayedVideoFrame;
+
             _displayedVideoFrame = nextFrame;
-            _displayedVideoFrameIndex = frameIndex;
+            _displayedVideoFrameIndex = snapshotFrameIndex;
             _videoView.Image = nextFrame;
+
             previousFrame?.Dispose();
         }
 

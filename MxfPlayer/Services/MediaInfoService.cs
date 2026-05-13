@@ -21,13 +21,14 @@ namespace MxfPlayer.Services
             var psi = new ProcessStartInfo
             {
                 FileName = _mediaInfoPath,
-                Arguments = $"--Output=JSON \"{filePath}\"",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true
             };
 
+            psi.ArgumentList.Add("--Output=JSON");
+            psi.ArgumentList.Add(filePath);
             using var process = Process.Start(psi);
             if (process == null)
                 throw new Exception("MediaInfo 啟動失敗");
@@ -211,53 +212,20 @@ namespace MxfPlayer.Services
             if (nominalFps <= 0)
                 return "";
 
-            bool isDropFrame = string.Equals(dropFrame, "True", StringComparison.OrdinalIgnoreCase);
-            return FrameToTimecode(frameCount, fps, isDropFrame);
-        }
+            int totalFrames = frameCount;
+            int frames = totalFrames % nominalFps;
+            int totalSeconds = totalFrames / nominalFps;
+            int seconds = totalSeconds % 60;
+            int totalMinutes = totalSeconds / 60;
+            int minutes = totalMinutes % 60;
+            int hours = totalMinutes / 60;
 
-        private string FrameToTimecode(long frameNumber, double fps, bool dropFrame)
-        {
-            if (frameNumber < 0) frameNumber = 0;
-
-            int nominalFps = GetNominalFps(fps);
-            long timecodeFrameNumber = frameNumber;
-
-            if (dropFrame)
-            {
-                int dropFrames = GetDropFrameCount(fps);
-                long framesPerMinute = (nominalFps * 60L) - dropFrames;
-                long framesPer10Minutes = (nominalFps * 600L) - (dropFrames * 9L);
-
-                long tenMinuteBlocks = frameNumber / framesPer10Minutes;
-                long remainingFrames = frameNumber % framesPer10Minutes;
-                long droppedFrames = dropFrames * 9L * tenMinuteBlocks;
-
-                if (remainingFrames >= dropFrames)
-                    droppedFrames += dropFrames * ((remainingFrames - dropFrames) / framesPerMinute);
-
-                timecodeFrameNumber += droppedFrames;
-            }
-
-            long hours = timecodeFrameNumber / (nominalFps * 3600L);
-            timecodeFrameNumber %= nominalFps * 3600L;
-            long minutes = timecodeFrameNumber / (nominalFps * 60L);
-            timecodeFrameNumber %= nominalFps * 60L;
-            long seconds = timecodeFrameNumber / nominalFps;
-            long frames = timecodeFrameNumber % nominalFps;
-            string separator = dropFrame ? ";" : ":";
+            string separator =
+                string.Equals(dropFrame, "True", StringComparison.OrdinalIgnoreCase)
+                    ? ";"
+                    : ":";
 
             return $"{hours:00}:{minutes:00}:{seconds:00}{separator}{frames:00}";
-        }
-
-        private int GetNominalFps(double fps)
-        {
-            if (fps <= 0) fps = 29.97;
-            return Math.Max(1, (int)Math.Round(fps));
-        }
-
-        private int GetDropFrameCount(double fps)
-        {
-            return Math.Max(0, (int)Math.Round(GetNominalFps(fps) * 0.0666666667));
         }
     }
 }

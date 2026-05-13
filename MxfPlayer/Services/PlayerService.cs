@@ -62,6 +62,7 @@ namespace MxfPlayer.Services
         private bool _isVideoPlaying;
         private float _videoRate = 1.0f;
         private readonly Stopwatch _playbackClock = new();
+        private readonly Stopwatch _videoStatusLogClock = Stopwatch.StartNew();
         private long _playbackStartFrame;
         private const int AudioOutputLatencyMs = 0;
         private const int ReverseAudioCacheWindowMs = 15000;
@@ -138,7 +139,38 @@ namespace MxfPlayer.Services
                     : null;
             }
         }
+        public long GetDisplayFrameIndex()
+        {
+            lock (_lock)
+            {
+                if (_videoFrameCache.TryGetValue(_currentFrameIndex, out _))
+                    return _currentFrameIndex;
 
+                if (_videoFrameCache.Count == 0)
+                    return -1;
+
+                long bestFrameIndex = _videoRate >= 0
+                    ? _videoFrameCache.Keys.Where(index => index <= _currentFrameIndex).DefaultIfEmpty(-1).Max()
+                    : _videoFrameCache.Keys.Where(index => index >= _currentFrameIndex).DefaultIfEmpty(-1).Min();
+
+                if (bestFrameIndex < 0 || !_videoFrameCache.ContainsKey(bestFrameIndex))
+                {
+                    bestFrameIndex = _videoFrameCache.Keys
+                        .OrderBy(index => Math.Abs(index - _currentFrameIndex))
+                        .First();
+                }
+
+                long maxStaleFrames = Math.Max(
+                    MaxStaleDisplayFrames,
+                    (long)Math.Ceiling(Math.Abs(_videoRate) * _audioFps)
+                );
+
+                if (Math.Abs(bestFrameIndex - _currentFrameIndex) > maxStaleFrames)
+                    return -1;
+
+                return bestFrameIndex;
+            }
+        }
         public Image? CreateDisplayVideoFrameSnapshot(out long frameIndex)
         {
             lock (_lock)
@@ -488,6 +520,37 @@ namespace MxfPlayer.Services
             });
         }
 
+        public Task WaitForVideoBufferAheadAsync(long frameIndex, int requiredAheadFrames, int timeoutMs = 3000)
+        {
+            return Task.Run(() =>
+            {
+                if (requiredAheadFrames <= 0)
+                    return;
+
+                var sw = Stopwatch.StartNew();
+                long clampedFrame = Math.Max(0, frameIndex);
+                long targetFrame = _totalVideoFrames > 0
+                    ? Math.Min(_totalVideoFrames - 1, clampedFrame + requiredAheadFrames)
+                    : clampedFrame + requiredAheadFrames;
+
+                while (sw.ElapsedMilliseconds < timeoutMs)
+                {
+                    lock (_lock)
+                    {
+                        if (_videoFrameCache.ContainsKey(clampedFrame) &&
+                            _videoFrameCache.Count > 0 &&
+                            _videoFrameCache.Keys.Max() >= targetFrame)
+                        {
+                            return;
+                        }
+                    }
+
+                    EnsureVideoDecoderNearCurrentFrame();
+                    Thread.Sleep(25);
+                }
+            });
+        }
+
         private long ProbeVideoFrameCount(string path, double fps)
         {
             AVFormatContext* formatContext = null;
@@ -663,11 +726,9 @@ namespace MxfPlayer.Services
 
                 for (int y = 0; y < height; y++)
                 {
-                    IntPtr source = (IntPtr)(rgbFrame->data[0] + (y * sourceStride));
-                    IntPtr target = data.Scan0 + (y * targetStride);
-                    byte[] row = new byte[rowBytes];
-                    Marshal.Copy(source, row, 0, rowBytes);
-                    Marshal.Copy(row, 0, target, rowBytes);
+                    byte* source = rgbFrame->data[0] + (y * sourceStride);
+                    byte* target = (byte*)data.Scan0 + (y * targetStride);
+                    Buffer.MemoryCopy(source, target, targetStride, rowBytes);
                 }
             }
             finally
@@ -1451,10 +1512,45 @@ namespace MxfPlayer.Services
 
             EnsureVideoDecoderNearCurrentFrame();
             EnsureAudioCacheForCurrentFrame();
+            LogVideoBufferStatus();
 
             if ((_videoRate < 0 && _currentFrameIndex == 0) ||
                 (_videoRate > 0 && _currentFrameIndex == _totalVideoFrames - 1))
                 Pause();
+        }
+
+        private void LogVideoBufferStatus()
+        {
+            if (_videoStatusLogClock.ElapsedMilliseconds < 1000)
+                return;
+
+            _videoStatusLogClock.Restart();
+
+            long currentFrame;
+            long minCachedFrame = -1;
+            long maxCachedFrame = -1;
+            int cacheCount;
+            long displayFrame;
+            lock (_lock)
+            {
+                currentFrame = _currentFrameIndex;
+                cacheCount = _videoFrameCache.Count;
+                if (cacheCount > 0)
+                {
+                    minCachedFrame = _videoFrameCache.Keys.Min();
+                    maxCachedFrame = _videoFrameCache.Keys.Max();
+                }
+            }
+
+            displayFrame = GetDisplayFrameIndex();
+            long cacheAhead = maxCachedFrame >= 0 ? maxCachedFrame - currentFrame : -1;
+            string taskStatus = _videoDecodeTask?.Status.ToString() ?? "null";
+            bool taskCompleted = _videoDecodeTask?.IsCompleted ?? true;
+
+            Debug.WriteLine(
+                $"[VideoBuffer] current={currentFrame} display={displayFrame} " +
+                $"cache={minCachedFrame}-{maxCachedFrame} ahead={cacheAhead} count={cacheCount} " +
+                $"decodeTask={taskStatus} completed={taskCompleted} rate={_videoRate:0.###}");
         }
 
         public void SeekVideoByFrame(long frameIndex)
