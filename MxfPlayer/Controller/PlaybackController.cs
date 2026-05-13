@@ -38,7 +38,7 @@ namespace MxfPlayer.Controllers
             long length = _player.LengthMs;
             if (length <= 0) return;
 
-            long frame = PlayerService.FrameFromTimeMs(length, fps);
+            long frame = PlayerService.FrameFromTimeMs(length, fps)-1;
 
             _player.SeekVideoByFrame(frame);
             _player.SeekAudioByFrame(frame, fps);
@@ -62,9 +62,7 @@ namespace MxfPlayer.Controllers
         {
             if (fps <= 0) return;
             long targetFrame = Math.Max(0, _player.CurrentFrameIndex - 1);
-            long target = PlayerService.TimeMsFromFrame(targetFrame, fps);
-
-            _player.Seek(target);
+            _player.SeekVideoByFrame(targetFrame);
             _player.SeekAudioByFrame(targetFrame, fps);
             // 逐幀後退通常建議暫停音訊
             _player.Pause();
@@ -86,23 +84,23 @@ namespace MxfPlayer.Controllers
             _resetMeters?.Invoke();
         }
 
-       
+
 
         public void SeekByTimelineValue(int value, int maxValue, double fps)
         {
             if (maxValue <= 0) return;
+            if (fps <= 0) fps = _player.CurrentFps;
 
             long length = _player.LengthMs;
             if (length <= 0) return;
 
             long totalFrames = PlayerService.FrameFromTimeMs(length, fps);
             long targetFrame = value * totalFrames / maxValue;
-            long target = PlayerService.TimeMsFromFrame(targetFrame, fps);
 
-            if (target < 0) target = 0;
-            if (target > length) target = length;
+            if (targetFrame < 0) targetFrame = 0;
+            if (targetFrame > totalFrames) targetFrame = totalFrames;
 
-            _player.Seek(target);
+            _player.SeekVideoByFrame(targetFrame);
             _player.SeekAudioByFrame(targetFrame, fps);
         }
 
@@ -119,9 +117,7 @@ namespace MxfPlayer.Controllers
             if (length > 0 && targetFrame > totalFrames)
                 targetFrame = totalFrames;
 
-            long target = PlayerService.TimeMsFromFrame(targetFrame, fps);
-
-            _player.Seek(target);
+            _player.SeekVideoByFrame(targetFrame);
             _player.SeekAudioByFrame(targetFrame, fps);
 
             await Task.CompletedTask;
@@ -150,7 +146,7 @@ namespace MxfPlayer.Controllers
         {
             if (fps <= 0) fps = _player.CurrentFps;
             long targetFrame = _player.CurrentFrameIndex + 1;
-            _player.Seek(PlayerService.TimeMsFromFrame(targetFrame, fps));
+            _player.SeekVideoByFrame(targetFrame);
             _player.SeekAudioByFrame(targetFrame, fps);
             _player.Pause();
             await Task.CompletedTask;

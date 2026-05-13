@@ -8,6 +8,7 @@ namespace MxfPlayer.Services
     {
         private readonly FileStream _fileStream;
         private readonly int _channels;
+        private readonly int _sampleRate;
         private readonly long _baseTimeMs; // 此快取檔的起始影片毫秒
         private float _playbackRate = 1.0f;
 
@@ -19,19 +20,19 @@ namespace MxfPlayer.Services
             set => _playbackRate = Math.Abs(value) < 0.001f ? 0 : value;
         }
 
-        // ⭐ 修正點：建構子必須包含 baseTimeMs
-        public MxfAudioProvider(string pcmPath, int channels, long baseTimeMs)
+        public MxfAudioProvider(string pcmPath, int channels, long baseTimeMs, int sampleRate)
         {
             _fileStream = new FileStream(pcmPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             _channels = channels;
+            _sampleRate = sampleRate > 0 ? sampleRate : 48000;
             _baseTimeMs = baseTimeMs;
-            WaveFormat = new WaveFormat(48000, 16, 2);
+            WaveFormat = new WaveFormat(_sampleRate, 16, 2);
         }
 
         public bool IsDataAvailable(long timeMs)
         {
             if (timeMs < _baseTimeMs) return false;
-            long targetOffsetBytes = (48000 * _channels * 2 * (timeMs - _baseTimeMs)) / 1000;
+            long targetOffsetBytes = (_sampleRate * _channels * 2 * (timeMs - _baseTimeMs)) / 1000;
             return _fileStream.Length >= targetOffsetBytes;
         }
 
@@ -48,8 +49,8 @@ namespace MxfPlayer.Services
             if (timeMs < _baseTimeMs) return false;
 
             long relativeMs = timeMs - _baseTimeMs;
-            long targetOffsetBytes = (48000 * _channels * 2 * relativeMs) / 1000;
-            long requiredAheadBytes = (48000 * _channels * 2 * requiredAheadMs) / 1000;
+            long targetOffsetBytes = (_sampleRate * _channels * 2 * relativeMs) / 1000;
+            long requiredAheadBytes = (_sampleRate * _channels * 2 * requiredAheadMs) / 1000;
             return _fileStream.Length > targetOffsetBytes + requiredAheadBytes;
         }
 
@@ -61,8 +62,8 @@ namespace MxfPlayer.Services
             if (timeMs < _baseTimeMs) return false;
 
             long relativeMs = timeMs - _baseTimeMs;
-            long targetOffsetBytes = (48000 * _channels * 2 * relativeMs) / 1000;
-            long requiredBehindBytes = (48000 * _channels * 2 * requiredBehindMs) / 1000;
+            long targetOffsetBytes = (_sampleRate * _channels * 2 * relativeMs) / 1000;
+            long requiredBehindBytes = (_sampleRate * _channels * 2 * requiredBehindMs) / 1000;
             return targetOffsetBytes >= requiredBehindBytes &&
                    _fileStream.Length > targetOffsetBytes + (_channels * 2);
         }
@@ -72,7 +73,7 @@ namespace MxfPlayer.Services
             long relativeMs = timeMs - _baseTimeMs;
             if (relativeMs < 0) relativeMs = 0;
 
-            long pos = (48000 * _channels * 2 * relativeMs) / 1000;
+            long pos = (_sampleRate * _channels * 2 * relativeMs) / 1000;
             pos = (pos / (_channels * 2)) * (_channels * 2);
 
             _fileStream.Position = pos;
@@ -83,8 +84,8 @@ namespace MxfPlayer.Services
             if (frameIndex < 0) frameIndex = 0;
             if (fps <= 0) fps = 29.97;
 
-            long sampleIndex = (long)Math.Round(frameIndex * 48000.0 / fps);
-            long baseSampleIndex = (long)Math.Round(_baseTimeMs * 48000.0 / 1000.0);
+            long sampleIndex = (long)Math.Round(frameIndex * _sampleRate / fps);
+            long baseSampleIndex = (long)Math.Round(_baseTimeMs * _sampleRate / 1000.0);
             sampleIndex = Math.Max(0, sampleIndex - baseSampleIndex);
             long pos = sampleIndex * _channels * 2;
             pos = (pos / (_channels * 2)) * (_channels * 2);

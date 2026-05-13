@@ -10,11 +10,11 @@ namespace MxfPlayer.Services
         public WaveFormat WaveFormat { get; private set; }
         public bool[] Mask { get; set; } = new bool[8] { true, true, true, true, true, true, true, true };
 
-        public DirectStreamAudioProvider(Stream inputStream, int channels)
+        public DirectStreamAudioProvider(Stream inputStream, int channels, int sampleRate)
         {
             _inputStream = inputStream;
             // FFmpeg 輸出的是 s16le (16-bit PCM)，不是 Float
-            WaveFormat = new WaveFormat(48000, 16, channels);
+            WaveFormat = new WaveFormat(sampleRate > 0 ? sampleRate : 48000, 16, channels);
         }
 
         public int Read(byte[] buffer, int offset, int count)

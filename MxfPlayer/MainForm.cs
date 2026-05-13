@@ -7,6 +7,7 @@ using MxfPlayer.Services;
 using MxfPlayer.Controllers;
 using System.IO;
 using System.Threading.Tasks;
+using System.Globalization;
 namespace MxfPlayer
 {
     public class MainForm : Form
@@ -45,6 +46,10 @@ namespace MxfPlayer
         private MediaInfoResult? _currentMediaInfo;
         private readonly AudioMeterScaleService _meterScale = new();
         private int _meterAreaHeight = 0;
+        private int _meterUpdateElapsedMs = 0;
+        private int _timelineUpdateElapsedMs = 0;
+        private const int MeterUpdateIntervalMs = 100;
+        private const int TimelineUpdateIntervalMs = 100;
         public MainForm()
         {
             Text = "Offline xPlayer";
@@ -159,7 +164,8 @@ namespace MxfPlayer
 
                 if (_mediaCache.TryGetValue(file.FullPath, out var info))
                 {
-                    int.TryParse(info.AudioCount, out audioCount);
+                    if (int.TryParse(info.AudioCount, out int parsedAudioCount) && parsedAudioCount > 0)
+                        audioCount = parsedAudioCount;
                 }
 
                 fps = GetSelectedFps();
@@ -174,6 +180,8 @@ namespace MxfPlayer
                     _player.ChannelMask[i] = _channelChecks[i].Checked;
                 }
 
+                int sampleRate = GetAudioSamplingRate(file.FullPath);
+
                 using (var loading = new LoadingForm(this, file.FileName))
                 {
                     loading.TopMost = true;
@@ -183,7 +191,7 @@ namespace MxfPlayer
                     try
                     {
                         _displayedVideoFrameIndex = -1;
-                        await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps);
+                        await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
                         UpdateVideoFrame();
                     }
                     finally
@@ -192,6 +200,7 @@ namespace MxfPlayer
                     }
                 }
 
+                ResetUiUpdateThrottle();
                 _meterTimer.Start();
                 return true;
             }
@@ -214,6 +223,7 @@ namespace MxfPlayer
                 if (!started) return;
             }
 
+            ResetUiUpdateThrottle();
             await _playbackController.Play();
             _lblNow.ForeColor = Color.Orange;
         }
@@ -226,23 +236,7 @@ namespace MxfPlayer
                 return 0;
             }
 
-            string frameRateText = info.FrameRateValue;
-
-            if (string.IsNullOrWhiteSpace(frameRateText))
-                frameRateText = info.FrameRate;
-
-            if (string.IsNullOrWhiteSpace(frameRateText))
-                frameRateText = info.FrameRateDisplay;
-
-            
-            int spaceIndex = frameRateText.IndexOf(' ');
-            if (spaceIndex > 0)
-                frameRateText = frameRateText.Substring(0, spaceIndex);
-
-            if (double.TryParse(frameRateText, out double fps) && fps > 0)
-                return fps;
-
-            return 0;
+            return GetRealFpsFromInfo(info);
         }
    
         private void UpdateTimelineUI()
@@ -434,13 +428,28 @@ namespace MxfPlayer
 
                 _player.AdvanceVideo(_meterTimer.Interval);
 
-                float rate = _playbackController.CurrentRate;
-
-               
                 UpdateVideoFrame();
-                UpdateMetersFromAudioLevel();
-                UpdateTimelineFromPlayer();
+
+                _meterUpdateElapsedMs += _meterTimer.Interval;
+                if (_meterUpdateElapsedMs >= MeterUpdateIntervalMs)
+                {
+                    _meterUpdateElapsedMs = 0;
+                    UpdateMetersFromAudioLevel();
+                }
+
+                _timelineUpdateElapsedMs += _meterTimer.Interval;
+                if (_timelineUpdateElapsedMs >= TimelineUpdateIntervalMs)
+                {
+                    _timelineUpdateElapsedMs = 0;
+                    UpdateTimelineFromPlayer();
+                }
             };
+        }
+
+        private void ResetUiUpdateThrottle()
+        {
+            _meterUpdateElapsedMs = 0;
+            _timelineUpdateElapsedMs = 0;
         }
 
         private void UpdateVideoFrame()
@@ -991,7 +1000,7 @@ namespace MxfPlayer
                 Margin = new Padding(0),
                 BackColor = Color.FromArgb(58, 62, 67)
             };
-           
+
             var btnMoveFirst = CreatePlaybackButton("⏮", 36);
             var btnMoveBackForward = CreatePlaybackButton("⏪", 36);
             var btnNegativeLog = CreatePlaybackButton("|◂", 36);
@@ -1104,12 +1113,13 @@ namespace MxfPlayer
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"æ’­æ”¾å¤±æ•—: {ex.Message}");
+                MessageBox.Show($"a’-a”?a?±a‧—: {ex.Message}");
             }
         }
         private void HandlePause()
         {
             _playbackController.Pause();
+            ResetUiUpdateThrottle();
         }
 
         private async void HandleMoveFirst() 
@@ -1194,6 +1204,32 @@ namespace MxfPlayer
         }
         private double GetFpsFromInfo(MediaInfoResult info)
         {
+            return GetRealFpsFromInfo(info);
+        }
+
+        private int GetAudioSamplingRate(string fullPath)
+        {
+            if (_mediaCache.TryGetValue(fullPath, out var info) &&
+                int.TryParse(info.AudioSamplingRate, NumberStyles.Integer, CultureInfo.InvariantCulture, out int sampleRate) &&
+                sampleRate > 0)
+            {
+                return sampleRate;
+            }
+
+            return 48000;
+        }
+
+        private double GetRealFpsFromInfo(MediaInfoResult info)
+        {
+            if (double.TryParse(info.FrameRateNum, NumberStyles.Float, CultureInfo.InvariantCulture, out double fpsNum) &&
+                double.TryParse(info.FrameRateDen, NumberStyles.Float, CultureInfo.InvariantCulture, out double fpsDen) &&
+                fpsDen > 0)
+            {
+                double realFps = fpsNum / fpsDen;
+                if (realFps > 0)
+                    return realFps;
+            }
+
             string frameRateText = info.FrameRateValue;
 
             if (string.IsNullOrWhiteSpace(frameRateText))
@@ -1206,7 +1242,7 @@ namespace MxfPlayer
             if (spaceIndex > 0)
                 frameRateText = frameRateText.Substring(0, spaceIndex);
 
-            if (double.TryParse(frameRateText, out double fps) && fps > 0)
+            if (double.TryParse(frameRateText, NumberStyles.Float, CultureInfo.InvariantCulture, out double fps) && fps > 0)
                 return fps;
 
             return 0;
@@ -1536,7 +1572,7 @@ namespace MxfPlayer
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"æ’­æ”¾å¤±æ•—: {ex.Message}");
+                MessageBox.Show($"a’-a”?a?±a‧—: {ex.Message}");
             }
         }
 
@@ -1676,28 +1712,6 @@ namespace MxfPlayer
                 _isUpdatingTimeline = false;
             }
         }
-        private bool TryGetMsFromTimecode(string tc, double fps, out long ms)
-        {
-            ms = 0;
-            string[] parts = tc.Split(':', ';');
-            if (parts.Length < 4) return false;
-
-            if (!int.TryParse(parts[0], out int h) ||
-                !int.TryParse(parts[1], out int m) ||
-                !int.TryParse(parts[2], out int s) ||
-                !int.TryParse(parts[3], out int f))
-            {
-                return false;
-            }
-
-            if (h < 0 || m < 0 || m > 59 || s < 0 || s > 59 || f < 0 || f >= Math.Ceiling(fps))
-                return false;
-
-            double totalSeconds = (h * 3600) + (m * 60) + s + (f / fps);
-            ms = (long)(totalSeconds * 1000);
-            return true;
-        }
-
         private void ZeroNowTimecodeDigit(bool backspace)
         {
             _isEditingNowTimecode = true;
@@ -1785,36 +1799,6 @@ namespace MxfPlayer
             return normalized;
         }
 
-        private long GetMsFromTimecode(string tc, double fps)
-        {
-            try
-            {
-                // ?舀??(Drop frame)????
-                string[] parts = tc.Split(':', ';');
-                if (parts.Length < 4) return 0;
-
-                int h = int.Parse(parts[0]);
-                int m = int.Parse(parts[1]);
-                int s = int.Parse(parts[2]);
-                int f = int.Parse(parts[3]);
-
-                double totalSeconds = (h * 3600) + (m * 60) + s + (f / fps);
-                return (long)(totalSeconds * 1000);
-            }
-            catch { return 0; }
-        }
-
-        private string FormatTimecodeFromMilliseconds(long ms, double fps)
-        {
-            if (ms < 0) ms = 0;
-            if (fps <= 0) fps = 29.97;
-
-            TimeSpan ts = TimeSpan.FromMilliseconds(ms);
-            int frame = (int)((ms % 1000) * fps / 1000.0);
-            string separator = IsSelectedDropFrame() ? ";" : ":";
-
-            return $"{((int)ts.TotalHours):00}:{ts.Minutes:00}:{ts.Seconds:00}{separator}{frame:00}";
-        }
         private bool IsSelectedDropFrame()
         {
             if (TryGetSelectedMediaFile(out var file) &&

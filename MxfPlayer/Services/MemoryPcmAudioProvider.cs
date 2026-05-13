@@ -7,10 +7,11 @@ namespace MxfPlayer.Services
     {
         private readonly byte[] _pcmData;
         private readonly int _channels;
+        private readonly int _sampleRate;
         private long _position;
         private float _playbackRate = 1.0f;
 
-        public WaveFormat WaveFormat { get; } = new WaveFormat(48000, 16, 2);
+        public WaveFormat WaveFormat { get; }
 
         public float PlaybackRate
         {
@@ -18,10 +19,12 @@ namespace MxfPlayer.Services
             set => _playbackRate = Math.Abs(value) < 0.001f ? 0 : value;
         }
 
-        public MemoryPcmAudioProvider(byte[] pcmData, int channels)
+        public MemoryPcmAudioProvider(byte[] pcmData, int channels, int sampleRate)
         {
             _pcmData = pcmData;
             _channels = Math.Max(1, channels);
+            _sampleRate = sampleRate > 0 ? sampleRate : 48000;
+            WaveFormat = new WaveFormat(_sampleRate, 16, 2);
         }
 
         public void SeekFrame(long frameIndex, double fps)
@@ -29,7 +32,7 @@ namespace MxfPlayer.Services
             if (frameIndex < 0) frameIndex = 0;
             if (fps <= 0) fps = 29.97;
 
-            long sampleIndex = (long)Math.Round(frameIndex * 48000.0 / fps);
+            long sampleIndex = (long)Math.Round(frameIndex * _sampleRate / fps);
             long pos = sampleIndex * _channels * 2;
             pos = (pos / (_channels * 2)) * (_channels * 2);
             _position = Math.Min(pos, _pcmData.Length);

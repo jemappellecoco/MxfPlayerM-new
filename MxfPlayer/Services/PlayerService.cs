@@ -41,6 +41,7 @@ namespace MxfPlayer.Services
         private MxfAudioProvider? _fileAudioProvider;
         private MemoryPcmAudioProvider? _memoryAudioProvider;
         private double _audioFps = 29.97;
+        private int _audioSampleRate = 48000;
         public double CurrentFps => _audioFps > 0 ? _audioFps : 29.97;
         private readonly Dictionary<long, Bitmap> _videoFrameCache = new();
         private readonly Queue<long> _videoFrameCacheOrder = new();
@@ -177,11 +178,32 @@ namespace MxfPlayer.Services
         {
             LoadFFmpegFromConfig();
 
-            _waveProvider = new BufferedWaveProvider(new WaveFormat(48000, 16, 2))
+            _waveProvider = CreateWaveProvider(_audioSampleRate);
+        }
+
+        private static int NormalizeSampleRate(int sampleRate)
+        {
+            return sampleRate > 0 ? sampleRate : 48000;
+        }
+
+        private static BufferedWaveProvider CreateWaveProvider(int sampleRate)
+        {
+            return new BufferedWaveProvider(new WaveFormat(NormalizeSampleRate(sampleRate), 16, 2))
             {
                 BufferDuration = TimeSpan.FromMilliseconds(8000),
                 DiscardOnBufferOverflow = true
             };
+        }
+
+        private void ResetWaveProvider()
+        {
+            if (_waveProvider.WaveFormat.SampleRate == _audioSampleRate)
+            {
+                _waveProvider.ClearBuffer();
+                return;
+            }
+
+            _waveProvider = CreateWaveProvider(_audioSampleRate);
         }
 
         private void LoadFFmpegFromConfig()
@@ -200,27 +222,29 @@ namespace MxfPlayer.Services
             catch { }
         }
 
-        public Task StartAudioBridge(string path, int audioCount, long startTimeMs = 0, float rate = 1.0f, double fps = 0)
+        public Task StartAudioBridge(string path, int audioCount, long startTimeMs = 0, float rate = 1.0f, double fps = 0, int sampleRate = 48000)
         {
             fps = fps > 0 ? fps : CurrentFps;
 
-            LoadForBufferedPlayback(path, audioCount, startTimeMs, rate, fps);
+            LoadForBufferedPlayback(path, audioCount, startTimeMs, rate, fps, sampleRate);
             return WaitForFrameBufferAsync(FrameFromTimeMs(startTimeMs, fps), 3000);
         }
 
-        private void LoadFullFile(string path, int audioCount, long startTimeMs, float rate, double fps)
+        private void LoadFullFile(string path, int audioCount, long startTimeMs, float rate, double fps, int sampleRate)
         {
-            LoadForBufferedPlayback(path, audioCount, startTimeMs, rate, fps);
+            LoadForBufferedPlayback(path, audioCount, startTimeMs, rate, fps, sampleRate);
             return;
 
             StopAudioBridge();
             CurrentPath = path;
             CurrentAudioCount = audioCount;
             _audioFps = fps > 0 ? fps : 29.97;
+            _audioSampleRate = NormalizeSampleRate(sampleRate);
+            ResetWaveProvider();
             DecodeVideoFrames(path);
             byte[] pcmData = CreatePcmCacheData(path);
 
-            _memoryAudioProvider = new MemoryPcmAudioProvider(pcmData, 2);
+            _memoryAudioProvider = new MemoryPcmAudioProvider(pcmData, 2, _audioSampleRate);
             _memoryAudioProvider.PlaybackRate = Math.Abs(rate) > 0 ? Math.Abs(rate) : 1.0f;
             _waveOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, 30);
             _waveOut.Init(_memoryAudioProvider);
@@ -250,12 +274,14 @@ namespace MxfPlayer.Services
             }
         }
 
-        private void LoadForBufferedPlayback(string path, int audioCount, long startTimeMs, float rate, double fps)
+        private void LoadForBufferedPlayback(string path, int audioCount, long startTimeMs, float rate, double fps, int sampleRate)
         {
             StopAudioBridge();
             CurrentPath = path;
             CurrentAudioCount = audioCount;
             _audioFps = fps > 0 ? fps : CurrentFps;
+            _audioSampleRate = NormalizeSampleRate(sampleRate);
+            ResetWaveProvider();
 
             long startFrame = FrameFromTimeMs(startTimeMs, _audioFps);
             _totalVideoFrames = ProbeVideoFrameCount(path, _audioFps);
@@ -318,7 +344,7 @@ namespace MxfPlayer.Services
 
                 long baseTimeMs = TimeMsFromFrame(cacheStartFrame, fps);
 
-                _fileAudioProvider = new MxfAudioProvider(_pcmCachePath, 2, baseTimeMs)
+                _fileAudioProvider = new MxfAudioProvider(_pcmCachePath, 2, baseTimeMs, _audioSampleRate)
                 {
                     PlaybackRate = effectiveRate
                 };
@@ -1033,7 +1059,7 @@ namespace MxfPlayer.Services
                 tempoFilters = string.Join(",", filters);
             }
 
-            return $"{amerge};{pan};[panned]{tempoFilters},aresample=48000,aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo";
+            return $"{amerge};{pan};[panned]{tempoFilters},aresample={_audioSampleRate},aformat=sample_fmts=s16:sample_rates={_audioSampleRate}:channel_layouts=stereo";
         }
         public float GetChannelLevelAtTime(int channel, long currentTimeMs)
         {
@@ -1416,6 +1442,7 @@ namespace MxfPlayer.Services
             if (!_isVideoPlaying || _totalVideoFrames <= 0) return;
 
             double clockElapsedMs = Math.Max(0, _playbackClock.Elapsed.TotalMilliseconds - AudioOutputLatencyMs);
+            //framesToMove = floor(經過毫秒 × fps × 播放倍率 ÷ 1000)
             long framesToMove = (long)Math.Floor(clockElapsedMs * _audioFps * Math.Abs(_videoRate) / 1000.0);
             if (_videoRate >= 0)
                 _currentFrameIndex = Math.Min(_totalVideoFrames - 1, _playbackStartFrame + framesToMove);
@@ -1557,14 +1584,14 @@ namespace MxfPlayer.Services
             if (!_fileAudioProvider.IsReverseFrameDataAvailable(_currentFrameIndex, _audioFps, ReverseAudioCacheRefreshBehindMs))
                 StartAudioCacheFromFrame(_currentFrameIndex, _audioFps, _videoRate, true);
         }
-
+        //frameIndex = round(timeMs × fps ÷ 1000)
         public static long FrameFromTimeMs(long timeMs, double fps)
         {
             if (timeMs < 0) timeMs = 0;
             if (fps <= 0) fps = 29.97;
             return (long)Math.Round(timeMs * fps / 1000.0);
         }
-
+        //timeMs = round(frameIndex × 1000 ÷ fps)
         public static long TimeMsFromFrame(long frameIndex, double fps)
         {
             if (frameIndex < 0) frameIndex = 0;
