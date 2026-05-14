@@ -256,7 +256,7 @@ namespace MxfPlayer
             return analysis;
         }
 
-        private async Task<bool> StartPlaybackForFile(MediaFile file, long startTimeMs = 0)
+        private async Task<bool> StartPlaybackForFile(MediaFile file, long startTimeMs = 0, bool showLoading = true)
         {
             if (_isStartingPlayback) return false;
             _isStartingPlayback = true;
@@ -289,26 +289,39 @@ namespace MxfPlayer
 
                 int sampleRate = GetAudioSamplingRate(file.FullPath);
 
-                using (var loading = new LoadingForm(this, file.FileName))
+                if (showLoading)
                 {
-                    loading.TopMost = true;
-                    loading.Show();
-                    loading.Refresh();
+                    using (var loading = new LoadingForm(this, file.FileName))
+                    {
+                        loading.TopMost = true;
+                        loading.Show();
+                        loading.Refresh();
 
-                    try
-                    {
-                        _displayedVideoFrameIndex = -1;
-                        await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
-                        await _player.WaitForVideoBufferAheadAsync(
-                            _player.CurrentFrameIndex,
-                            PlaybackPrebufferFrames,
-                            PlaybackPrebufferTimeoutMs);
-                        UpdateVideoFrame();
+                        try
+                        {
+                            _displayedVideoFrameIndex = -1;
+                            await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
+                            await _player.WaitForVideoBufferAheadAsync(
+                                _player.CurrentFrameIndex,
+                                PlaybackPrebufferFrames,
+                                PlaybackPrebufferTimeoutMs);
+                            UpdateVideoFrame();
+                        }
+                        finally
+                        {
+                            loading.Close();
+                        }
                     }
-                    finally
-                    {
-                        loading.Close();
-                    }
+                }
+                else
+                {
+                    _displayedVideoFrameIndex = -1;
+                    await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
+                    await _player.WaitForVideoBufferAheadAsync(
+                        _player.CurrentFrameIndex,
+                        PlaybackPrebufferFrames,
+                        PlaybackPrebufferTimeoutMs);
+                    UpdateVideoFrame();
                 }
 
                 ResetUiUpdateThrottle();
@@ -1090,16 +1103,15 @@ namespace MxfPlayer
             _player.ChannelMask[channelIndex] = isChecked;
             _audioMixer.SetChannelEnabled(channelIndex, isChecked);
 
-            // 2. 潃??芸??怠?嚗?蔣?唾???
-            // ?澆?批?冽?????迫 Timer 銝阡?閮?Meter
-            HandlePause();
-
-            // 3. 蝡?遣瞈暸
-            // ?喳?桀???蝣箔??怠????瞈暸?銋甇?Ⅱ??
             if (TryGetSelectedMediaFile(out var file) && file != null && _player.CurrentPath == file.FullPath)
             {
+                bool wasPlaying = _player.IsPlaying;
                 long currentTime = _playbackController.GetCurrentTime();
-                await StartPlaybackForFile(file, currentTime);
+                _playbackController.Pause();
+                await StartPlaybackForFile(file, currentTime, showLoading: false);
+
+                if (wasPlaying)
+                    await _playbackController.Play();
             }
 
             Console.WriteLine($"[Audio] Channel {channelIndex + 1} changed.");

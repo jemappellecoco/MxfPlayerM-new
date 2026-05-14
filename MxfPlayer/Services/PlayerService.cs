@@ -76,6 +76,7 @@ namespace MxfPlayer.Services
         public string CurrentPath { get; private set; } = string.Empty;
         public int CurrentAudioCount { get; private set; }
         public bool IsAudioReady => _waveOut != null && _fileAudioProvider != null;
+        public bool IsPlaying => _isVideoPlaying;
         public long CurrentFrameIndex => _currentFrameIndex;
 
         public bool HasVideoBufferForRate(float rate)
@@ -1102,8 +1103,7 @@ namespace MxfPlayer.Services
             }
             else if (selectedChannels.Count > 1)
             {
-                string gain = (1.0 / selectedChannels.Count).ToString("0.###", CultureInfo.InvariantCulture);
-                mixedMap = string.Join("+", selectedChannels.Select(ch => $"{gain}*{ch}"));
+                mixedMap = string.Join("+", selectedChannels);
             }
 
             string pan = $"[merged]pan=stereo|c0={mixedMap}|c1={mixedMap}[panned]";
