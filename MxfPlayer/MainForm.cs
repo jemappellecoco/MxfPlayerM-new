@@ -8,6 +8,8 @@ using MxfPlayer.Controllers;
 using System.IO;
 using System.Threading.Tasks;
 using System.Globalization;
+using System.Linq;
+using System.Threading;
 namespace MxfPlayer
 {
     public class MainForm : Form
@@ -20,14 +22,16 @@ namespace MxfPlayer
         private readonly MediaSpecService _mediaSpec = new();
         private readonly MediaAnalysisCacheService _analysisCache = new();
         private readonly Dictionary<string, MediaInfoResult> _mediaCache = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CachedMediaAnalysis> _analysisMemory = new(StringComparer.OrdinalIgnoreCase);
         private readonly AudioMixerService _audioMixer = new();
         private readonly PlaybackController _playbackController;
+        private CancellationTokenSource? _decodeCheckCts;
         private Panel _timelineLabelsPanel = null!;
         private readonly Random _rnd = new();
         private PictureBox _videoView = null!;
         private TextBox _txtPath = null!;
         private DataGridView _gridFiles = null!;
-        private TextBox _txtInfo = null!;
+        private RichTextBox _txtInfo = null!;
         private Label _lblCurrentFile = null!;
         private TextBox _lblNow = null!;
         private Label _lblStart = null!;
@@ -66,7 +70,12 @@ namespace MxfPlayer
             InitUI();
             InitTimer();
             _playbackController = new PlaybackController(_player, _meterTimer, ResetMeters);
-            this.FormClosing += (s, e) => _player.Dispose();
+            this.FormClosing += (s, e) =>
+            {
+                _decodeCheckCts?.Cancel();
+                _decodeCheckCts?.Dispose();
+                _player.Dispose();
+            };
         }
         private void InitUI()
         {
@@ -103,36 +112,98 @@ namespace MxfPlayer
             {
                 RefreshTimelineTicks(info);
             }));
-            string specType = analysis?.SpecType ?? "Unknown";
+            ShowColoredMediaInfo(info, analysis);
+        }
+
+        private void ShowColoredMediaInfo(MediaInfoResult info, CachedMediaAnalysis? analysis)
+        {
             string specStatus = analysis == null
                 ? "未檢查"
-                : analysis.SpecIsPass ? specType : "Error";
-            string errorText = analysis?.SpecErrors.Count > 0
-                ? string.Join(Environment.NewLine + "                    ", analysis.SpecErrors)
+                : GetDisplaySpecCheck(analysis);
+            var displayErrors = GetDisplayErrors(analysis);
+            string errorText = displayErrors.Count > 0
+                ? string.Join(Environment.NewLine + "                    ", displayErrors)
                 : "無";
 
+            _txtInfo.Clear();
+            AppendMediaInfoLine("寬度", $"{info.Width} pixels", HasSpecError(analysis, "寬度錯誤", "影格尺寸錯誤"));
+            AppendMediaInfoLine("高度", $"{info.Height} pixels", HasSpecError(analysis, "高度錯誤", "影格尺寸錯誤"));
+            AppendMediaInfoLine("影格率", $"{info.FrameRateDisplay} FPS", HasSpecError(analysis, "影格速率錯誤"));
+            AppendMediaInfoLine("Drop Frame", info.DropFrame, HasSpecError(analysis, "時間碼模式錯誤"));
+            AppendMediaInfoLine("音訊聲道", info.AudioCount, HasSpecError(analysis, "音頻通道錯誤"));
+            AppendMediaInfoLine("格式名稱", info.CommercialName, HasSpecError(analysis, "格式錯誤"));
+            AppendMediaInfoLine("掃描方式", info.ScanType, false);
+            AppendMediaInfoLine("掃描順序", info.ScanOrder, HasSpecError(analysis, "場次順序錯誤"));
+            AppendMediaInfoLine("SOM", info.Som, false);
+            AppendMediaInfoLine("EOM", info.Eom, false);
+            AppendMediaInfoLine("長度", info.DurationTc, false);
+            AppendMediaInfoLine("影片位元率", info.VideoBitRate, HasSpecError(analysis, "影片比特率錯誤"));
+            AppendMediaInfoLine("音訊單軌位元率", info.AudioBitRate, false);
+            AppendMediaInfoLine("整體位元率", info.OverallBitRate, false);
+            AppendMediaInfoLine("顯示比例", info.DisplayAspect, HasSpecError(analysis, "長寬比錯誤"));
+            AppendMediaInfoLine("格式檢查", specStatus, IsDisplaySpecError(analysis));
+            AppendMediaInfoLine("錯誤原因", errorText, displayErrors.Count > 0);
+            AppendMediaInfoLine("檔案名稱", info.FileName, false);
+            AppendMediaInfoLine("完整路徑", info.FullPath, false);
+        }
 
-            _txtInfo.Text =
-                $"寬度:               {info.Width} pixels{Environment.NewLine}" +
-                $"高度:               {info.Height} pixels{Environment.NewLine}" +
-                $"影格率:             {info.FrameRateDisplay} FPS{Environment.NewLine}" +
-                $"Drop Frame:         {info.DropFrame}{Environment.NewLine}" +
-                $"音訊聲道:           {info.AudioCount}{Environment.NewLine}" +
-                $"格式名稱:           {info.CommercialName}{Environment.NewLine}" +
-                $"掃描方式:           {info.ScanType}{Environment.NewLine}" +
-                $"掃描順序:           {info.ScanOrder}{Environment.NewLine}" +
-                $"SOM:                {info.Som}{Environment.NewLine}" +
-                $"EOM:                {info.Eom}{Environment.NewLine}" +
-                $"長度:               {info.DurationTc}{Environment.NewLine}" +
-             
-                $"影片位元率:         {info.VideoBitRate}{Environment.NewLine}" +
-                $"音訊單軌位元率:     {info.AudioBitRate}{Environment.NewLine}" +
-                $"整體位元率:         {info.OverallBitRate}{Environment.NewLine}" +
-                $"顯示比例:           {info.DisplayAspect}{Environment.NewLine}" +
-                $"格式檢查:           {specStatus}{Environment.NewLine}" +
-                $"錯誤原因:           {errorText}{Environment.NewLine}" +
-                $"檔案名稱: {info.FileName}{Environment.NewLine}" +
-                $"完整路徑: {info.FullPath}";
+        private string GetDisplaySpecCheck(CachedMediaAnalysis analysis)
+        {
+            if (!analysis.SpecIsPass)
+                return "Error";
+
+            if (analysis.DecodeCheckStatus == "Checking")
+                return "檢查中";
+
+            if (analysis.DecodeCheckStatus == "Failed")
+                return "Error";
+
+            return analysis.SpecType;
+        }
+
+        private bool IsDisplaySpecError(CachedMediaAnalysis? analysis)
+        {
+            return analysis != null &&
+                   (!analysis.SpecIsPass || analysis.DecodeCheckStatus == "Failed");
+        }
+
+        private List<string> GetDisplayErrors(CachedMediaAnalysis? analysis)
+        {
+            if (analysis == null)
+                return new List<string>();
+
+            var errors = new List<string>(analysis.SpecErrors);
+            if (analysis.DecodeCheckStatus == "Failed" && !string.IsNullOrWhiteSpace(analysis.DecodeCheckError))
+                errors.Add(analysis.DecodeCheckError);
+            else if (analysis.DecodeCheckStatus == "Checking")
+                errors.Add("影片完整性檢查中");
+
+            return errors;
+        }
+
+        private void AppendMediaInfoLine(string label, string value, bool isError)
+        {
+            _txtInfo.SelectionColor = isError ? Color.Red : Color.White;
+            _txtInfo.AppendText($"{label}:".PadRight(20) + value + Environment.NewLine);
+            _txtInfo.SelectionColor = Color.White;
+        }
+
+        private bool HasSpecError(CachedMediaAnalysis? analysis, params string[] keywords)
+        {
+            var errors = GetDisplayErrors(analysis);
+            if (errors.Count == 0)
+                return false;
+
+            foreach (string error in errors)
+            {
+                foreach (string keyword in keywords)
+                {
+                    if (error.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+
+            return false;
         }
         private bool TryGetSelectedMediaFile(out MediaFile? file)
         {
@@ -157,25 +228,30 @@ namespace MxfPlayer
             if (_analysisCache.TryGetValid(filePath, out var cached))
             {
                 _mediaCache[filePath] = cached.Info;
+                _analysisMemory[filePath] = cached;
                 return cached;
             }
 
             var info = _mediaInfo.GetInfo(filePath);
-            var check = _mediaSpec.CheckWeiLaiSpec(info);
+            var check = _mediaSpec.CheckWeiLaiSpec(info, includeDecodeCheck: false);
             var fileInfo = new FileInfo(filePath);
 
             var analysis = new CachedMediaAnalysis
             {
                 FullPath = filePath,
                 FileLength = fileInfo.Length,
+                CreationTimeUtc = fileInfo.CreationTimeUtc,
                 LastWriteTimeUtc = fileInfo.LastWriteTimeUtc,
                 Info = info,
                 SpecType = _mediaSpec.GetSpecType(info),
                 SpecIsPass = check.IsPass,
-                SpecErrors = check.Errors
+                SpecErrors = check.Errors,
+                DecodeCheckStatus = "NotChecked",
+                DecodeCheckError = ""
             };
 
             _mediaCache[filePath] = info;
+            _analysisMemory[filePath] = analysis;
             _analysisCache.Save(analysis);
             return analysis;
         }
@@ -325,6 +401,7 @@ namespace MxfPlayer
      
         private void LoadFolderToGrid(string folderPath)
         {
+            _decodeCheckCts?.Cancel();
             _txtPath.Text = folderPath;
 
             var files = _folder.LoadFolder(folderPath);
@@ -335,6 +412,7 @@ namespace MxfPlayer
             double totalGB = CalculateTotalSizeGB(files);
             UpdateRightSummary(files.Count, totalGB);
             ClearSelectedMediaInfo();
+            StartBackgroundDecodeChecks(files);
         }
 
         private void ClearSelectedMediaInfo()
@@ -367,16 +445,11 @@ namespace MxfPlayer
                     eom = string.IsNullOrWhiteSpace(info.Eom) ? "00:00:00;00" : info.Eom;
                     duration = string.IsNullOrWhiteSpace(info.DurationTc) ? "00:00:00;00" : info.DurationTc;
 
-                    if (analysis.SpecIsPass)
-                    {
-                        specCheck = analysis.SpecType; // HD 或 SD
-                        specErrorText = "";
-                    }
-                    else
-                    {
-                        specCheck = "Error";
-                        specErrorText = string.Join(Environment.NewLine, analysis.SpecErrors);
+                    specCheck = GetDisplaySpecCheck(analysis);
+                    specErrorText = string.Join(Environment.NewLine, GetDisplayErrors(analysis));
 
+                    if (IsDisplaySpecError(analysis))
+                    {
                         // 先印到 Output 視窗，方便你 debug
                         System.Diagnostics.Debug.WriteLine($"[Spec Error] {file.FileName}");
                         System.Diagnostics.Debug.WriteLine(specErrorText);
@@ -406,9 +479,15 @@ namespace MxfPlayer
                 // 把錯誤原因放在格式檢查欄的 Tooltip
                 row.Cells[5].ToolTipText = specErrorText;
 
-                if (specCheck == "Error")
+                if (_analysisMemory.TryGetValue(file.FullPath, out var rowAnalysis) && IsDisplaySpecError(rowAnalysis))
                 {
                     row.Cells[5].Style.ForeColor = Color.Red;
+                    row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
+                }
+                else if (_analysisMemory.TryGetValue(file.FullPath, out rowAnalysis) &&
+                         rowAnalysis.DecodeCheckStatus == "Checking")
+                {
+                    row.Cells[5].Style.ForeColor = Color.Orange;
                     row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
                 }
                 else
@@ -416,6 +495,136 @@ namespace MxfPlayer
                     row.Cells[5].Style.ForeColor = Color.White;
                     row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Regular);
                 }
+            }
+        }
+
+        private void StartBackgroundDecodeChecks(List<MediaFile> files)
+        {
+            _decodeCheckCts?.Dispose();
+            _decodeCheckCts = new CancellationTokenSource();
+            var token = _decodeCheckCts.Token;
+
+            var pendingFiles = new List<MediaFile>();
+
+            foreach (var file in files)
+            {
+                if (!_analysisMemory.TryGetValue(file.FullPath, out var analysis))
+                    continue;
+
+                if (analysis.DecodeCheckStatus == "Checking")
+                    analysis.DecodeCheckStatus = "NotChecked";
+
+                if (analysis.DecodeCheckStatus != "NotChecked")
+                    continue;
+
+                analysis.DecodeCheckStatus = "Checking";
+                analysis.DecodeCheckError = "";
+                UpdateGridRowAnalysis(file.FullPath, analysis);
+                pendingFiles.Add(file);
+            }
+
+            if (pendingFiles.Count == 0)
+                return;
+
+            _ = Task.Run(async () =>
+            {
+                foreach (var file in pendingFiles)
+                {
+                    if (token.IsCancellationRequested)
+                        break;
+
+                    await DecodeCheckFileAsync(file.FullPath, token);
+                }
+            }, token);
+        }
+
+        private async Task DecodeCheckFileAsync(string fullPath, CancellationToken token)
+        {
+            try
+            {
+                var check = await Task.Run(() => _mediaSpec.CheckDecodeIntegrity(fullPath, token), token);
+                if (token.IsCancellationRequested)
+                    return;
+
+                if (!_analysisMemory.TryGetValue(fullPath, out var analysis))
+                    return;
+
+                analysis.DecodeCheckStatus = check.IsPass ? "Passed" : "Failed";
+                analysis.DecodeCheckError = check.Errors.Count > 0
+                    ? string.Join(Environment.NewLine, check.Errors)
+                    : "";
+
+                _analysisCache.Save(analysis);
+                if (!IsDisposed && IsHandleCreated)
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        UpdateGridRowAnalysis(fullPath, analysis);
+
+                        if (TryGetSelectedMediaFile(out var selected) &&
+                            selected != null &&
+                            string.Equals(selected.FullPath, fullPath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            ShowMediaInfo(analysis.Info, analysis);
+                        }
+                    }));
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                if (!_analysisMemory.TryGetValue(fullPath, out var analysis))
+                    return;
+
+                analysis.DecodeCheckStatus = "Failed";
+                analysis.DecodeCheckError = "檢查影片完整性時發生錯誤：" + ex.Message;
+                _analysisCache.Save(analysis);
+
+                if (!IsDisposed && IsHandleCreated)
+                {
+                    BeginInvoke(new Action(() => UpdateGridRowAnalysis(fullPath, analysis)));
+                }
+            }
+        }
+
+        private void UpdateGridRowAnalysis(string fullPath, CachedMediaAnalysis analysis)
+        {
+            foreach (DataGridViewRow row in _gridFiles.Rows)
+            {
+                if (row.Tag is not MediaFile file ||
+                    !string.Equals(file.FullPath, fullPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                string specCheck = GetDisplaySpecCheck(analysis);
+                var errors = GetDisplayErrors(analysis);
+                string specErrorText = errors.Count > 0
+                    ? string.Join(Environment.NewLine, errors)
+                    : "";
+
+                row.Cells[5].Value = specCheck;
+                row.Cells[5].ToolTipText = specErrorText;
+
+                if (IsDisplaySpecError(analysis))
+                {
+                    row.Cells[5].Style.ForeColor = Color.Red;
+                    row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
+                }
+                else if (analysis.DecodeCheckStatus == "Checking")
+                {
+                    row.Cells[5].Style.ForeColor = Color.Orange;
+                    row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
+                }
+                else
+                {
+                    row.Cells[5].Style.ForeColor = Color.White;
+                    row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Regular);
+                }
+
+                return;
             }
         }
 
@@ -1544,16 +1753,16 @@ namespace MxfPlayer
                 BackColor = Color.FromArgb(72, 76, 82)
             };
 
-            _txtInfo = new TextBox
+            _txtInfo = new RichTextBox
             {
                 Dock = DockStyle.Fill,
-                Multiline = true,
                 ReadOnly = true,
-                ScrollBars = ScrollBars.Vertical,
+                ScrollBars = RichTextBoxScrollBars.Vertical,
                 BackColor = Color.FromArgb(70, 74, 79),
                 ForeColor = Color.White,
                 Font = new Font("Consolas", 11),
-                BorderStyle = BorderStyle.None
+                BorderStyle = BorderStyle.None,
+                DetectUrls = false
             };
 
             bottomPanel.Controls.Add(_txtInfo);

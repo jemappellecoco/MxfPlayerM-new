@@ -40,6 +40,12 @@ namespace MxfPlayer.Services
             if (cached.FileLength != fileInfo.Length)
                 return false;
 
+            if (cached.CreationTimeUtc != default &&
+                cached.CreationTimeUtc != fileInfo.CreationTimeUtc)
+            {
+                return false;
+            }
+
             if (cached.LastWriteTimeUtc != fileInfo.LastWriteTimeUtc)
                 return false;
 

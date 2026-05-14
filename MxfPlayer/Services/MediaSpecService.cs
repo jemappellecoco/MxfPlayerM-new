@@ -1,13 +1,14 @@
 ﻿using System;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 using MxfPlayer.Models;
 
 namespace MxfPlayer.Services
 {
     public class MediaSpecService
     {
-        public MediaSpecCheckResult CheckWeiLaiSpec(MediaInfoResult info)
+        public MediaSpecCheckResult CheckWeiLaiSpec(MediaInfoResult info, bool includeDecodeCheck = false)
         {
             var result = new MediaSpecCheckResult();
 
@@ -33,8 +34,8 @@ namespace MxfPlayer.Services
                 result.Errors.Add($"影格尺寸錯誤：目前是 {info.Width} x {info.Height}，不符合 HD 或 SD 入庫規格");
             }
 
-            // 不管規格有沒有錯，都繼續檢查檔案本身能不能完整解碼
-            CheckDecodeIntegrity(info.FullPath, result);
+            if (includeDecodeCheck)
+                AddDecodeIntegrityErrors(info.FullPath, result);
 
             // 最後統一判斷：只要有任何錯誤，就不通過
             result.IsPass = result.Errors.Count == 0;
@@ -172,7 +173,15 @@ namespace MxfPlayer.Services
                 result.Errors.Add($"時間碼模式錯誤：目前是 {DisplayValue(info.TimeCodeMode)}，應為 Drop Frame");
         }
 
-        private void CheckDecodeIntegrity(string filePath, MediaSpecCheckResult result)
+        public MediaSpecCheckResult CheckDecodeIntegrity(string filePath, CancellationToken token = default)
+        {
+            var result = new MediaSpecCheckResult();
+            AddDecodeIntegrityErrors(filePath, result, token);
+            result.IsPass = result.Errors.Count == 0;
+            return result;
+        }
+
+        private void AddDecodeIntegrityErrors(string filePath, MediaSpecCheckResult result, CancellationToken token = default)
         {
             string ffmpegPath = @"C:\ffmpeg-7.1.1-essentials_build\bin\ffmpeg.exe";
 
@@ -205,13 +214,19 @@ namespace MxfPlayer.Services
                     // -v error：只顯示錯誤
                     // -xerror：遇到 decode error 就直接失敗
                     // -f null -：不輸出檔案，只檢查能不能完整解碼
-                    Arguments = $"-v error -xerror -i \"{filePath}\" -f null -",
-
                     RedirectStandardError = true,
                     RedirectStandardOutput = true,
                     UseShellExecute = false,
                     CreateNoWindow = true
                 };
+                psi.ArgumentList.Add("-v");
+                psi.ArgumentList.Add("error");
+                psi.ArgumentList.Add("-xerror");
+                psi.ArgumentList.Add("-i");
+                psi.ArgumentList.Add(filePath);
+                psi.ArgumentList.Add("-f");
+                psi.ArgumentList.Add("null");
+                psi.ArgumentList.Add("-");
 
                 using var process = Process.Start(psi);
 
@@ -221,10 +236,20 @@ namespace MxfPlayer.Services
                     return;
                 }
 
-                string output = process.StandardOutput.ReadToEnd();
-                string error = process.StandardError.ReadToEnd();
+                var outputTask = process.StandardOutput.ReadToEndAsync();
+                var errorTask = process.StandardError.ReadToEndAsync();
 
-                process.WaitForExit();
+                while (!process.WaitForExit(200))
+                {
+                    if (!token.IsCancellationRequested)
+                        continue;
+
+                    try { process.Kill(entireProcessTree: true); } catch { }
+                    throw new OperationCanceledException(token);
+                }
+
+                outputTask.GetAwaiter().GetResult();
+                string error = errorTask.GetAwaiter().GetResult();
 
                 Debug.WriteLine("[DecodeCheck] exit code: " + process.ExitCode);
 

@@ -278,7 +278,10 @@ namespace MxfPlayer.Services
 
             _memoryAudioProvider = new MemoryPcmAudioProvider(pcmData, 2, _audioSampleRate);
             _memoryAudioProvider.PlaybackRate = Math.Abs(rate) > 0 ? Math.Abs(rate) : 1.0f;
-            _waveOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, 30);
+            _waveOut = new WaveOutEvent
+            {
+                DesiredLatency = 100
+            };
             _waveOut.Init(_memoryAudioProvider);
 
          
@@ -383,7 +386,10 @@ namespace MxfPlayer.Services
 
                 _fileAudioProvider.SeekFrame(frameIndex, fps);
 
-                _waveOut = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, 30);
+                _waveOut = new WaveOutEvent
+                {
+                    DesiredLatency = 100
+                };
                 _waveOut.Init(_fileAudioProvider);
                 var waveOut = _waveOut;
                 int generation = _audioCacheGeneration;
