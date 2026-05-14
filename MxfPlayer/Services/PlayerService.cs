@@ -380,9 +380,11 @@ namespace MxfPlayer.Services
 
                 long baseTimeMs = TimeMsFromFrame(cacheStartFrame, fps);
 
-                _fileAudioProvider = new MxfAudioProvider(_pcmCachePath, 2, baseTimeMs, _audioSampleRate)
+                int cacheChannelCount = Math.Clamp(CurrentAudioCount, 1, ChannelMask.Length);
+                _fileAudioProvider = new MxfAudioProvider(_pcmCachePath, cacheChannelCount, baseTimeMs, _audioSampleRate)
                 {
-                    PlaybackRate = effectiveRate
+                    PlaybackRate = effectiveRate,
+                    Mask = ChannelMask
                 };
 
                 _fileAudioProvider.SeekFrame(frameIndex, fps);
@@ -1083,30 +1085,19 @@ namespace MxfPlayer.Services
 
         private string BuildFilterDesc(float rate)
         {
-            // 1. 撱箇??箇?瘛琿
-            string amerge = "";
-            for (int i = 0; i < _activeAudioTrackCount; i++) amerge += $"[in{i}]";
-            amerge += $"amerge=inputs={_activeAudioTrackCount}[merged]";
-
-            // 2. ?脤?頝舐 (pan)
-            List<string> selectedChannels = new List<string>();
-            for (int i = 0; i < _activeAudioTrackCount; i++)
+            string merge;
+            if (_activeAudioTrackCount == 1)
             {
-                if (i < ChannelMask.Length && ChannelMask[i])
-                    selectedChannels.Add($"c{i}");
+                merge = "[in0]anull[merged]";
             }
-
-            string mixedMap = "0";
-            if (selectedChannels.Count == 1)
+            else
             {
-                mixedMap = selectedChannels[0];
-            }
-            else if (selectedChannels.Count > 1)
-            {
-                mixedMap = string.Join("+", selectedChannels);
-            }
+                merge = "";
+                for (int i = 0; i < _activeAudioTrackCount; i++)
+                    merge += $"[in{i}]";
 
-            string pan = $"[merged]pan=stereo|c0={mixedMap}|c1={mixedMap}[panned]";
+                merge += $"amerge=inputs={_activeAudioTrackCount}[merged]";
+            }
 
             // 3. ??霈???
             string tempoFilters = "";
@@ -1126,7 +1117,7 @@ namespace MxfPlayer.Services
                 tempoFilters = string.Join(",", filters);
             }
 
-            return $"{amerge};{pan};[panned]{tempoFilters},aresample={_audioSampleRate},aformat=sample_fmts=s16:sample_rates={_audioSampleRate}:channel_layouts=stereo";
+            return $"{merge};[merged]{tempoFilters},aresample={_audioSampleRate},aformat=sample_fmts=s16:sample_rates={_audioSampleRate}";
         }
         public float GetChannelLevelAtTime(int channel, long currentTimeMs)
         {

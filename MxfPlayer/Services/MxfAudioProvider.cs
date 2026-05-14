@@ -105,14 +105,6 @@ namespace MxfPlayer.Services
             int framesRequested = count / 4;
             if (framesRequested <= 0) return 0;
 
-            if (_playbackRate > 0 && Math.Abs(_playbackRate - 1.0f) < 0.001f && _channels == 2)
-            {
-                int directBytesRead = _fileStream.Read(buffer, offset, count);
-                if (directBytesRead < count)
-                    Array.Clear(buffer, offset + directBytesRead, count - directBytesRead);
-                return count;
-            }
-
             long startFrame = _fileStream.Position / bytesPerFrameIn;
             float rate = Math.Abs(_playbackRate);
             int sourceFramesNeeded = Math.Max(1, (int)Math.Ceiling(framesRequested * rate) + 2);
@@ -161,7 +153,7 @@ namespace MxfPlayer.Services
                         if (Mask[ch]) { mixed += inPtr[ch]; active++; }
                     }
 
-                    short final = (active > 0) ? (short)Math.Clamp(mixed / active, short.MinValue, short.MaxValue) : (short)0;
+                    short final = (active > 0) ? (short)Math.Clamp(mixed, short.MinValue, short.MaxValue) : (short)0;
                     outPtr[i * 2] = final;
                     outPtr[i * 2 + 1] = final;
                     framesWritten++;

@@ -1103,18 +1103,8 @@ namespace MxfPlayer
             _player.ChannelMask[channelIndex] = isChecked;
             _audioMixer.SetChannelEnabled(channelIndex, isChecked);
 
-            if (TryGetSelectedMediaFile(out var file) && file != null && _player.CurrentPath == file.FullPath)
-            {
-                bool wasPlaying = _player.IsPlaying;
-                long currentTime = _playbackController.GetCurrentTime();
-                _playbackController.Pause();
-                await StartPlaybackForFile(file, currentTime, showLoading: false);
-
-                if (wasPlaying)
-                    await _playbackController.Play();
-            }
-
             Console.WriteLine($"[Audio] Channel {channelIndex + 1} changed.");
+            await Task.CompletedTask;
         }
    
         private Button CreatePlaybackButton(string text, int width, bool highlight = false)
