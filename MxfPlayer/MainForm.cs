@@ -52,6 +52,7 @@ namespace MxfPlayer
         private int _meterAreaHeight = 0;
         private int _meterUpdateElapsedMs = 0;
         private int _timelineUpdateElapsedMs = 0;
+        private bool _isFrameStepping = false;
         private const int MeterUpdateIntervalMs = 100;
         private const int TimelineUpdateIntervalMs = 100;
         private const int PlaybackPrebufferFrames = 120;
@@ -99,6 +100,27 @@ namespace MxfPlayer
                 int safeDistance = ClientSize.Width - mainSplit.Panel2MinSize - 20;
                 mainSplit.SplitterDistance = Math.Max(mainSplit.Panel1MinSize, Math.Min(880, safeDistance));
             };
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (_lblNow != null && _lblNow.Focused)
+                return base.ProcessCmdKey(ref msg, keyData);
+
+            Keys keyCode = keyData & Keys.KeyCode;
+            if (keyCode == Keys.Left)
+            {
+                StepFrameByKeyboard(-1);
+                return true;
+            }
+
+            if (keyCode == Keys.Right)
+            {
+                StepFrameByKeyboard(1);
+                return true;
+            }
+
+            return base.ProcessCmdKey(ref msg, keyData);
         }
 
         private void ShowMediaInfo(MediaInfoResult info, CachedMediaAnalysis? analysis = null)
@@ -1419,17 +1441,42 @@ namespace MxfPlayer
         }
         private async void HandleNegativeLog()
         {
-            double fps = GetSelectedFps();
-
-            _playbackController.NegativeLog(fps);
-            await RefreshAfterFrameStepAsync(fps);
+            await StepFrameAsync(-1);
         }
 
         private async void HandlePositiveLog()
         {
+            await StepFrameAsync(1);
+        }
+
+        private async void StepFrameByKeyboard(int direction)
+        {
+            await StepFrameAsync(direction);
+        }
+
+        private async Task StepFrameAsync(int direction)
+        {
+            if (_isFrameStepping)
+                return;
+
             double fps = GetSelectedFps();
-            await _playbackController.PositiveLog(fps);
-            await RefreshAfterFrameStepAsync(fps);
+            if (fps <= 0)
+                return;
+
+            _isFrameStepping = true;
+            try
+            {
+                if (direction < 0)
+                    _playbackController.NegativeLog(fps);
+                else
+                    await _playbackController.PositiveLog(fps);
+
+                await RefreshAfterFrameStepAsync(fps);
+            }
+            finally
+            {
+                _isFrameStepping = false;
+            }
         }
 
         private async Task RefreshAfterFrameStepAsync(double fps)
@@ -1674,6 +1721,9 @@ namespace MxfPlayer
             btnDown.Dock = DockStyle.Right;
 
             btnFolder.Click += OnSelectFolder;
+            btnRefresh.Click += OnRefreshFolder;
+            btnUp.Click += (_, _) => SelectRelativeGridFile(-1);
+            btnDown.Click += (_, _) => SelectRelativeGridFile(1);
 
             pathBar.Controls.Add(_txtPath);
             pathBar.Controls.Add(btnDown);
@@ -1820,6 +1870,76 @@ namespace MxfPlayer
 
             LoadFolderToGrid(dialog.SelectedPath);
         }
+
+        private void OnRefreshFolder(object? sender, EventArgs e)
+        {
+            string folderPath = _txtPath.Text.Trim();
+            if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
+                return;
+
+            string? selectedPath = TryGetSelectedMediaFile(out var selectedFile) && selectedFile != null
+                ? selectedFile.FullPath
+                : null;
+
+            try
+            {
+                _decodeCheckCts?.Cancel();
+
+                var files = _folder.LoadFolder(folderPath);
+                PopulateGrid(files);
+
+                double totalGB = CalculateTotalSizeGB(files);
+                UpdateRightSummary(files.Count, totalGB);
+                ClearSelectedMediaInfo();
+
+                if (!string.IsNullOrWhiteSpace(selectedPath))
+                    SelectFileInGrid(selectedPath);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"更新資料夾失敗：{ex.Message}");
+            }
+        }
+
+        private void SelectRelativeGridFile(int offset)
+        {
+            if (_gridFiles.Rows.Count == 0)
+                return;
+
+            int currentIndex = _gridFiles.CurrentRow?.Index ?? (offset > 0 ? -1 : _gridFiles.Rows.Count);
+            int nextIndex = Math.Clamp(currentIndex + offset, 0, _gridFiles.Rows.Count - 1);
+            SelectGridRow(nextIndex);
+        }
+
+        private bool SelectFileInGrid(string fullPath)
+        {
+            for (int i = 0; i < _gridFiles.Rows.Count; i++)
+            {
+                if (_gridFiles.Rows[i].Tag is MediaFile file &&
+                    string.Equals(file.FullPath, fullPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    SelectGridRow(i);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void SelectGridRow(int rowIndex)
+        {
+            if (rowIndex < 0 || rowIndex >= _gridFiles.Rows.Count)
+                return;
+
+            var row = _gridFiles.Rows[rowIndex];
+            _gridFiles.ClearSelection();
+            row.Selected = true;
+            _gridFiles.CurrentCell = row.Cells[0];
+
+            if (row.Tag is MediaFile file)
+                LoadAndShowMedia(file.FullPath);
+        }
+
         private void UpdateRightSummary(int count, double totalGB)
         {
             _lblFileCount.Text = $"檔案數: {count}";
