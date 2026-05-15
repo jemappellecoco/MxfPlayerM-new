@@ -417,7 +417,7 @@ namespace MxfPlayer
 
 
                     if (!_isEditingNowTimecode)
-                        SetNowTimecodeText(FrameToTimecode(somFrame + _player.CurrentFrameIndex, fps, dropFrame));
+                        SetNowTimecodeText(FrameToTimecode(somFrame + _player.CurrentFrameIndex, fps, dropFrame), dropFrame);
 
                     long lastFrame = PlayerService.FrameFromTimeMs(length, fps);
                     long remainFrames = Math.Max(0, lastFrame - _player.CurrentFrameIndex);
@@ -679,9 +679,10 @@ namespace MxfPlayer
 
         private void UpdateTimeLabels(MediaInfoResult info)
         {
+            bool dropFrame = IsDropFrame(info);
             _lblCurrentFile.Text = info.FileName;
             _lblStart.Text = $"START {info.Som}";
-            SetNowTimecodeText(info.Som);
+            SetNowTimecodeText(info.Som, dropFrame);
             _lblDur.Text = $"DUR {info.DurationTc}";
             _lblRemain.Text = $"REM {info.Eom}";
         }
@@ -866,7 +867,7 @@ namespace MxfPlayer
 
             _lblNow = new TextBox
             {
-                Text = "00:00:00;00",
+                Text = "00:00:00:00",
                 Dock = DockStyle.Fill,
                 BorderStyle = BorderStyle.None,
                 BackColor = Color.FromArgb(58, 62, 67),
@@ -1923,7 +1924,7 @@ namespace MxfPlayer
                     catch { /* 敹賜摨惜???啣虜 */ }
                     finally
                     {
-                        // ?嚗??? MediaPlayer 蝣箏祕??摰?隞歹??銵?銝甈∟歲頧?
+                    
                         _isSeeking = false;
                     }
                 });
@@ -1934,7 +1935,7 @@ namespace MxfPlayer
                 UpdateTimelineUI(-1);
             }
         }
-        // 憓?銝??亙???overrideTime
+       
         private void UpdateTimelineUI(long overrideTime = -1)
         {
             if (_isDraggingTimeline) return;
@@ -1942,14 +1943,12 @@ namespace MxfPlayer
 
             try
             {
-                // ?詨?靽格迤嚗???????(?璅∪?)嚗停?冽?摰????血???曉
                 long current = (overrideTime != -1) ? overrideTime : _playbackController.GetCurrentTime();
                 long length = _playbackController.GetLength();
 
                 if (length > 0)
                 {
-                    // ?ㄐ?雿輻 _playbackController.GetTimelineValue 
-                    // 撱箄降?寧??閮?隞仿???overrideTime
+                   
                     int timelineValue = Math.Clamp((int)(current * _timeline.Maximum / length), _timeline.Minimum, _timeline.Maximum);
                     if (_timeline.Value != timelineValue)
                         _timeline.Value = timelineValue;
@@ -1971,7 +1970,7 @@ namespace MxfPlayer
                     }
 
                     if (!_isEditingNowTimecode)
-                        SetNowTimecodeText(FrameToTimecode(somFrame + currentFrame, fps, dropFrame));
+                        SetNowTimecodeText(FrameToTimecode(somFrame + currentFrame, fps, dropFrame), dropFrame);
 
                     long lastFrame = PlayerService.FrameFromTimeMs(length, fps);
                     long remainFrames = Math.Max(0, lastFrame - currentFrame);
@@ -2031,7 +2030,7 @@ namespace MxfPlayer
             if (!IsNowTimecodeDigitPosition(position))
                 return;
 
-            char[] chars = NormalizeNowTimecodeText(_lblNow.Text).ToCharArray();
+            char[] chars = NormalizeNowTimecodeText(_lblNow.Text, IsSelectedDropFrame()).ToCharArray();
             chars[position] = digit;
             _lblNow.Text = new string(chars);
         }
@@ -2055,17 +2054,24 @@ namespace MxfPlayer
 
         private void SetNowTimecodeText(string timecode)
         {
-            _lblNow.Text = NormalizeNowTimecodeText(timecode);
+            SetNowTimecodeText(timecode, IsSelectedDropFrame());
         }
 
-        private string NormalizeNowTimecodeText(string timecode)
+        private void SetNowTimecodeText(string timecode, bool dropFrame)
         {
+            _lblNow.Text = NormalizeNowTimecodeText(timecode, dropFrame);
+        }
+
+        private string NormalizeNowTimecodeText(string timecode, bool dropFrame)
+        {
+            string separator = dropFrame ? ";" : ":";
+
             if (string.IsNullOrWhiteSpace(timecode))
-                return "00:00:00;00";
+                return $"00:00:00{separator}00";
 
             string normalized = timecode.Trim();
             if (normalized.Length == 11 && (normalized[8] == ':' || normalized[8] == ';'))
-                normalized = normalized[..8] + ";" + normalized[9..];
+                normalized = normalized[..8] + separator + normalized[9..];
 
             return normalized;
         }
@@ -2226,7 +2232,7 @@ namespace MxfPlayer
                 }
 
                 if (!_isEditingNowTimecode)
-                    SetNowTimecodeText(FrameToTimecode(somFrame + _player.CurrentFrameIndex, fps, dropFrame));
+                    SetNowTimecodeText(FrameToTimecode(somFrame + _player.CurrentFrameIndex, fps, dropFrame), dropFrame);
 
                 long lastFrame = PlayerService.FrameFromTimeMs(lengthMs, fps);
                 long remainFrames = Math.Max(0, lastFrame - _player.CurrentFrameIndex);
