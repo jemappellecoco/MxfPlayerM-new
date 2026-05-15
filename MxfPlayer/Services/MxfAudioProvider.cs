@@ -152,8 +152,10 @@ namespace MxfPlayer.Services
                     {
                         if (Mask[ch]) { mixed += inPtr[ch]; active++; }
                     }
-
-                    short final = (active > 0) ? (short)Math.Clamp(mixed, short.MinValue, short.MaxValue) : (short)0;
+                    short final = (active > 0)
+                    ? (short)Math.Clamp(mixed, short.MinValue, short.MaxValue)
+                    : (short)0;
+                    //short final = (active > 0) ? unchecked((short)mixed) : (short)0;
                     outPtr[i * 2] = final;
                     outPtr[i * 2 + 1] = final;
                     framesWritten++;

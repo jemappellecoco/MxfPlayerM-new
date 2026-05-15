@@ -64,7 +64,7 @@ namespace MxfPlayer.Services
         private readonly Stopwatch _playbackClock = new();
         private readonly Stopwatch _videoStatusLogClock = Stopwatch.StartNew();
         private long _playbackStartFrame;
-        private const int AudioOutputLatencyMs = 0;
+        private const int AudioOutputLatencyMs = 100;
         private const int ReverseAudioCacheWindowMs = 15000;
         private const int ReverseAudioCacheRefreshBehindMs = 1200;
 
@@ -442,23 +442,30 @@ namespace MxfPlayer.Services
             }
         }
 
-        private void WaitForAudioBuffer(long frameIndex, double fps, float rate, int timeoutMs)
+        private bool WaitForAudioBuffer(long frameIndex, double fps, float rate, int timeoutMs)
         {
             var sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < timeoutMs)
             {
                 if (_fileAudioProvider == null)
-                    return;
+                    return false;
 
                 bool available = rate < 0
                     ? _fileAudioProvider.IsReverseFrameDataAvailable(frameIndex, fps, 500)
                     : _fileAudioProvider.IsFrameDataAvailable(frameIndex, fps, 250);
 
                 if (available)
-                    return;
+                    return true;
 
                 Thread.Sleep(20);
             }
+
+            return false;
+        }
+
+        public Task<bool> WaitForAudioBufferAsync(long frameIndex, double fps, float rate, int timeoutMs)
+        {
+            return Task.Run(() => WaitForAudioBuffer(frameIndex, fps, rate, timeoutMs));
         }
 
         private void CreatePcmCacheFile(string path, string pcmPath, long startFrame, double fps, CancellationToken token)
@@ -1023,7 +1030,7 @@ namespace MxfPlayer.Services
 
                     byte[] layoutName = new byte[64];
                     fixed (byte* pLayout = layoutName)
-                        // 撠?(int) ?寧 (nuint) 隞亦泵??size_t ??瘙?
+                    
                         ffmpeg.av_channel_layout_describe(&ctx->ch_layout, pLayout, (ulong)layoutName.Length);
 
                     string args = $"sample_rate={ctx->sample_rate}:sample_fmt={ffmpeg.av_get_sample_fmt_name(ctx->sample_fmt)}:channel_layout={System.Text.Encoding.UTF8.GetString(layoutName).TrimEnd('\0')}";
@@ -1056,26 +1063,26 @@ namespace MxfPlayer.Services
                 inputs->pad_idx = 0;
                 inputs->next = null;
 
-                // B. 雿輻靽格迤敺? BuildFilterDesc
+              
                 string filterDesc = BuildFilterDesc(rate);
 
                 int ret = ffmpeg.avfilter_graph_parse_ptr(_filterGraph, filterDesc, &inputs, &outputs, null);
                 
                 if (ret < 0)
                 {
-                    // ?? FFmpeg ?航炊閮
+                 
                     byte* errBuff = (byte*)Marshal.AllocHGlobal(256);
                     ffmpeg.av_strerror(ret, errBuff, 256);
                     string errMsg = Marshal.PtrToStringAnsi((IntPtr)errBuff);
                     Marshal.FreeHGlobal((IntPtr)errBuff);
 
                     System.Diagnostics.Debug.WriteLine($"[FFmpeg Filter Error] {errMsg}");
-                    return; // ?ㄐ憭望?鈭?DecodeLoop 撠曹???雿?撠?∟
+                    return; 
                 }
                 if (ret >= 0)
                 {
                     ffmpeg.avfilter_graph_config(_filterGraph, null);
-                    _filterReady = true; // ?遣摰?嚗銵?DecodeLoop
+                    _filterReady = true; 
                 }
 
                 ffmpeg.avfilter_inout_free(&inputs);
@@ -1099,16 +1106,15 @@ namespace MxfPlayer.Services
                 merge += $"amerge=inputs={_activeAudioTrackCount}[merged]";
             }
 
-            // 3. ??霈???
             string tempoFilters = "";
-            // ?詨?靽格迤嚗ate < 0 ?身??volume=0
+        
             if (rate <= 0)
             {
                 tempoFilters = "volume=0";
             }
             else
             {
-                // 甇??霈?頛?(atempo ??
+                
                 List<string> filters = new List<string>();
                 float tempRate = rate;
                 while (tempRate > 2.0f) { filters.Add("atempo=2.0"); tempRate /= 2.0f; }
@@ -1154,7 +1160,6 @@ namespace MxfPlayer.Services
 
             try
             {
-                // startTimeMs = 0 銝? seek嚗??MXF ?∩?
                 if (startTimeMs > 0)
                 {
                     System.Diagnostics.Debug.WriteLine("[Decode] seek start");
@@ -1194,8 +1199,7 @@ namespace MxfPlayer.Services
                     {
                         if (readRet == ffmpeg.AVERROR_EOF)
                         {
-                            //System.Diagnostics.Debug.WriteLine("[Decode] EOF");
-                            //break;
+                        
                         }
 
                         Thread.Sleep(1);
@@ -1289,16 +1293,7 @@ namespace MxfPlayer.Services
                         ffmpeg.av_frame_unref(frame);
                     }
 
-                    //float currentRate = Math.Abs(_mp.Rate);
-                    //if (currentRate <= 0) currentRate = 1;
-
-                    //int bufferLimit = currentRate > 2.0f ? 2000 : 500;
-
-                    //if (_waveProvider.BufferedDuration.TotalMilliseconds > bufferLimit)
-                    //    Thread.Sleep(currentRate > 4.0f ? 5 : 15);
-                    //else
-                    //    Thread.Sleep(0);
-                    // 潃?摰銝?撟脫?唾? pipeline
+                   
                     if (_waveProvider.BufferedDuration.TotalMilliseconds > 4000)
                     {
                         Thread.Sleep(1); // ?芸??頛凝靽風
@@ -1454,7 +1449,7 @@ namespace MxfPlayer.Services
             _playbackClock.Stop();
             try { _waveOut?.Pause(); } catch { }
 
-            // ???歇蝬??圾憟賜??脤嚗??resume ???buffer
+          
             _waveProvider?.ClearBuffer();
         }
 
@@ -1462,10 +1457,11 @@ namespace MxfPlayer.Services
         {
             SeekAudioByFrame(_currentFrameIndex, _audioFps);
             _playbackStartFrame = _currentFrameIndex;
-            WaitForAudioBuffer(_currentFrameIndex, _audioFps, _videoRate, 1000);
+            WaitForAudioBuffer(_currentFrameIndex, _audioFps, _videoRate, 3000);
+            PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
+            Thread.Sleep(AudioOutputLatencyMs);
             _playbackClock.Restart();
             _isVideoPlaying = true;
-            PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
         }
 
         public void SetAudioRate(float rate)
@@ -1745,6 +1741,8 @@ namespace MxfPlayer.Services
         }
         public void StopAudioBridge()
         {
+            _isVideoPlaying = false;
+            _playbackClock.Stop();
             _isDecoding = false;
 
             _cts?.Cancel();

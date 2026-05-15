@@ -305,6 +305,11 @@ namespace MxfPlayer
                                 _player.CurrentFrameIndex,
                                 PlaybackPrebufferFrames,
                                 PlaybackPrebufferTimeoutMs);
+                            await _player.WaitForAudioBufferAsync(
+                                _player.CurrentFrameIndex,
+                                fps,
+                                1.0f,
+                                PlaybackPrebufferTimeoutMs);
                             UpdateVideoFrame();
                         }
                         finally
@@ -321,11 +326,15 @@ namespace MxfPlayer
                         _player.CurrentFrameIndex,
                         PlaybackPrebufferFrames,
                         PlaybackPrebufferTimeoutMs);
+                    await _player.WaitForAudioBufferAsync(
+                        _player.CurrentFrameIndex,
+                        fps,
+                        1.0f,
+                        PlaybackPrebufferTimeoutMs);
                     UpdateVideoFrame();
                 }
 
                 ResetUiUpdateThrottle();
-                _meterTimer.Start();
                 return true;
             }
             finally
@@ -343,6 +352,8 @@ namespace MxfPlayer
             bool needsStart = _player.CurrentPath != file.FullPath || !_player.IsAudioReady;
             if (needsStart)
             {
+                _playbackController.Pause();
+                ResetUiUpdateThrottle();
                 bool started = await StartPlaybackForFile(file, startTimeMs);
                 if (!started) return;
             }
@@ -378,7 +389,9 @@ namespace MxfPlayer
                 if (length > 0)
                 {
                
-                    _timeline.Value = Math.Clamp(_playbackController.GetTimelineValue(_timeline.Maximum), _timeline.Minimum, _timeline.Maximum);
+                    int timelineValue = Math.Clamp(_playbackController.GetTimelineValue(_timeline.Maximum), _timeline.Minimum, _timeline.Maximum);
+                    if (_timeline.Value != timelineValue)
+                        _timeline.Value = timelineValue;
 
 
                     double fps = GetSelectedFps();
@@ -1131,7 +1144,7 @@ namespace MxfPlayer
         }
         private Control BuildPlaybackTimeRow()
         {
-            _timelineLabelsPanel = new Panel
+            _timelineLabelsPanel = new DoubleBufferedPanel
             {
                 Dock = DockStyle.Fill,
                 Height = 22,
@@ -1148,8 +1161,6 @@ namespace MxfPlayer
         }
         private void RefreshTimelineTicks(MediaInfoResult info)
         {
-            _timelineLabelsPanel.Controls.Clear();
-
             if (_timelineLabelsPanel.ClientSize.Width <= 80)
                 return;
 
@@ -1168,6 +1179,9 @@ namespace MxfPlayer
 
             int tickCount = 8;
             int panelWidth = _timelineLabelsPanel.ClientSize.Width;
+
+            _timelineLabelsPanel.SuspendLayout();
+            _timelineLabelsPanel.Controls.Clear();
 
             for (int i = 0; i < tickCount; i++)
             {
@@ -1194,6 +1208,8 @@ namespace MxfPlayer
                 else
                     lbl.Left = Math.Max(0, x - lbl.Width / 2);
             }
+
+            _timelineLabelsPanel.ResumeLayout();
         }
         private Label _lblRate = null!;
         private Control BuildPlaybackBar()
@@ -1571,6 +1587,8 @@ namespace MxfPlayer
 
             UpdateVideoFrame();
             UpdateTimelineUI(-1);
+            if (_currentMediaInfo != null)
+                RefreshTimelineTicks(_currentMediaInfo);
             UpdateMetersFromAudioLevel();
 
             if (wasPlaying)
@@ -1927,7 +1945,9 @@ namespace MxfPlayer
                 {
                     // ?ㄐ?雿輻 _playbackController.GetTimelineValue 
                     // 撱箄降?寧??閮?隞仿???overrideTime
-                    _timeline.Value = Math.Clamp((int)(current * _timeline.Maximum / length), _timeline.Minimum, _timeline.Maximum);
+                    int timelineValue = Math.Clamp((int)(current * _timeline.Maximum / length), _timeline.Minimum, _timeline.Maximum);
+                    if (_timeline.Value != timelineValue)
+                        _timeline.Value = timelineValue;
 
                     double fps = GetSelectedFps();
                     if (fps <= 0) return;
@@ -2226,6 +2246,15 @@ namespace MxfPlayer
             public override Color ImageMarginGradientBegin => Color.FromArgb(58, 62, 67);
             public override Color ImageMarginGradientMiddle => Color.FromArgb(58, 62, 67);
             public override Color ImageMarginGradientEnd => Color.FromArgb(58, 62, 67);
+        }
+
+        private class DoubleBufferedPanel : Panel
+        {
+            public DoubleBufferedPanel()
+            {
+                DoubleBuffered = true;
+                ResizeRedraw = true;
+            }
         }
     }
 }
