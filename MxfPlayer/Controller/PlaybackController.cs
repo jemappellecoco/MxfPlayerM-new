@@ -8,7 +8,6 @@ namespace MxfPlayer.Controllers
     {
         private readonly PlayerService _player;
         private readonly System.Windows.Forms.Timer _meterTimer;
-        private readonly Action _resetMeters;
 
   
     
@@ -17,7 +16,6 @@ namespace MxfPlayer.Controllers
         {
             _player = player;
             _meterTimer = meterTimer;
-            _resetMeters = resetMeters;
         }
 
 
@@ -81,7 +79,6 @@ namespace MxfPlayer.Controllers
         {
             _player.Pause();
             _meterTimer.Stop();
-            _resetMeters?.Invoke();
         }
 
 

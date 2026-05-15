@@ -1983,12 +1983,6 @@ namespace MxfPlayer
                 var bar = _meterBars[i];
                 if (bar.Parent == null) continue;
 
-                if (i < _channelChecks.Count && !_channelChecks[i].Checked)
-                {
-                    bar.Height = AudioMeterScaleService.MinBarHeight;
-                    continue;
-                }
-
                 float level = _player.GetChannelLevelAtTime(i, currentMs);
                 bar.Height = _meterScale.LevelToBarHeight(level, meterHeight);
             }
