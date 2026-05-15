@@ -33,6 +33,7 @@
         public string AudioSamplingRate { get; set; } = "";
         public string AudioBitDepth { get; set; } = "";
         public string TimeCodeMode { get; set; } = "";
+        public System.Collections.Generic.List<string> ConformanceErrors { get; set; } = new();
 
     }
 }

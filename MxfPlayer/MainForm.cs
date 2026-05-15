@@ -20,7 +20,6 @@ namespace MxfPlayer
         private readonly FolderService _folder = new();
         private readonly MediaInfoService _mediaInfo = new();
         private readonly MediaSpecService _mediaSpec = new();
-        private readonly MediaAnalysisCacheService _analysisCache = new();
         private readonly Dictionary<string, MediaInfoResult> _mediaCache = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CachedMediaAnalysis> _analysisMemory = new(StringComparer.OrdinalIgnoreCase);
         private readonly AudioMixerService _audioMixer = new();
@@ -225,11 +224,11 @@ namespace MxfPlayer
 
         private CachedMediaAnalysis GetOrAnalyzeMedia(string filePath)
         {
-            if (_analysisCache.TryGetValid(filePath, out var cached))
+            if (_analysisMemory.TryGetValue(filePath, out var memoryCached) &&
+                IsAnalysisValid(filePath, memoryCached))
             {
-                _mediaCache[filePath] = cached.Info;
-                _analysisMemory[filePath] = cached;
-                return cached;
+                _mediaCache[filePath] = memoryCached.Info;
+                return memoryCached;
             }
 
             var info = _mediaInfo.GetInfo(filePath);
@@ -252,8 +251,18 @@ namespace MxfPlayer
 
             _mediaCache[filePath] = info;
             _analysisMemory[filePath] = analysis;
-            _analysisCache.Save(analysis);
             return analysis;
+        }
+
+        private bool IsAnalysisValid(string filePath, CachedMediaAnalysis analysis)
+        {
+            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+                return false;
+
+            var fileInfo = new FileInfo(filePath);
+            return analysis.FileLength == fileInfo.Length &&
+                   analysis.CreationTimeUtc == fileInfo.CreationTimeUtc &&
+                   analysis.LastWriteTimeUtc == fileInfo.LastWriteTimeUtc;
         }
 
         private async Task<bool> StartPlaybackForFile(MediaFile file, long startTimeMs = 0, bool showLoading = true)
@@ -438,7 +447,6 @@ namespace MxfPlayer
             double totalGB = CalculateTotalSizeGB(files);
             UpdateRightSummary(files.Count, totalGB);
             ClearSelectedMediaInfo();
-            StartBackgroundDecodeChecks(files);
         }
 
         private void ClearSelectedMediaInfo()
@@ -580,7 +588,6 @@ namespace MxfPlayer
                     ? string.Join(Environment.NewLine, check.Errors)
                     : "";
 
-                _analysisCache.Save(analysis);
                 if (!IsDisposed && IsHandleCreated)
                 {
                     BeginInvoke(new Action(() =>
@@ -606,8 +613,6 @@ namespace MxfPlayer
 
                 analysis.DecodeCheckStatus = "Failed";
                 analysis.DecodeCheckError = "檢查影片完整性時發生錯誤：" + ex.Message;
-                _analysisCache.Save(analysis);
-
                 if (!IsDisposed && IsHandleCreated)
                 {
                     BeginInvoke(new Action(() => UpdateGridRowAnalysis(fullPath, analysis)));

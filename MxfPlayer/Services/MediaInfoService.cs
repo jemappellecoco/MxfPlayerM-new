@@ -88,6 +88,7 @@ namespace MxfPlayer.Services
             string dropFrame = DetectDropFrame(video, timecode);
             string durationTc = BuildDurationTc(frameCount, fpsNum, fpsDen, dropFrame);
             string frameRateDisplay = FormatFrameRate(frameRate, fpsNum, fpsDen);
+            var conformanceErrors = ExtractConformanceErrors(general);
 
             if (string.IsNullOrWhiteSpace(durationTc))
                 durationTc = Get(general, "Duration");
@@ -122,6 +123,7 @@ namespace MxfPlayer.Services
                 ? "Drop Frame"
                 : "Non Drop Frame",
                 DisplayAspect = ConvertAspect(Get(video, "DisplayAspectRatio")),
+                ConformanceErrors = conformanceErrors,
               
             };
         }
@@ -156,6 +158,58 @@ namespace MxfPlayer.Services
                 return "";
 
             return value.GetString() ?? "";
+        }
+
+        private System.Collections.Generic.List<string> ExtractConformanceErrors(JsonElement general)
+        {
+            var errors = new System.Collections.Generic.List<string>();
+
+            if (general.ValueKind == JsonValueKind.Undefined ||
+                !general.TryGetProperty("extra", out var extra))
+            {
+                return errors;
+            }
+
+            bool isTruncated = string.Equals(Get(extra, "IsTruncated"), "Yes", StringComparison.OrdinalIgnoreCase);
+
+            if (extra.TryGetProperty("ConformanceErrors", out var conformanceErrors))
+                AddConformanceErrorValues(conformanceErrors, errors);
+
+            if (isTruncated && errors.Count == 0)
+                errors.Add("MediaInfo 回報檔案不完整：IsTruncated=Yes");
+
+            return errors;
+        }
+
+        private void AddConformanceErrorValues(JsonElement element, System.Collections.Generic.List<string> errors, string path = "")
+        {
+            switch (element.ValueKind)
+            {
+                case JsonValueKind.Object:
+                    foreach (var property in element.EnumerateObject())
+                    {
+                        string nextPath = string.IsNullOrWhiteSpace(path)
+                            ? property.Name
+                            : $"{path}.{property.Name}";
+                        AddConformanceErrorValues(property.Value, errors, nextPath);
+                    }
+                    break;
+
+                case JsonValueKind.Array:
+                    foreach (var item in element.EnumerateArray())
+                        AddConformanceErrorValues(item, errors, path);
+                    break;
+
+                case JsonValueKind.String:
+                    string? message = element.GetString();
+                    if (!string.IsNullOrWhiteSpace(message))
+                    {
+                        errors.Add(string.IsNullOrWhiteSpace(path)
+                            ? message
+                            : $"{path}: {message}");
+                    }
+                    break;
+            }
         }
 
        

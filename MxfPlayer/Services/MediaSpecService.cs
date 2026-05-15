@@ -34,6 +34,8 @@ namespace MxfPlayer.Services
                 result.Errors.Add($"影格尺寸錯誤：目前是 {info.Width} x {info.Height}，不符合 HD 或 SD 入庫規格");
             }
 
+            AddConformanceErrors(info, result);
+
             if (includeDecodeCheck)
                 AddDecodeIntegrityErrors(info.FullPath, result);
 
@@ -171,6 +173,15 @@ namespace MxfPlayer.Services
 
             if (!EqualsText(info.TimeCodeMode, "Drop Frame"))
                 result.Errors.Add($"時間碼模式錯誤：目前是 {DisplayValue(info.TimeCodeMode)}，應為 Drop Frame");
+        }
+
+        private void AddConformanceErrors(MediaInfoResult info, MediaSpecCheckResult result)
+        {
+            foreach (var error in info.ConformanceErrors)
+            {
+                if (!string.IsNullOrWhiteSpace(error))
+                    result.Errors.Add("MXF 檔案完整性錯誤：" + error);
+            }
         }
 
         public MediaSpecCheckResult CheckDecodeIntegrity(string filePath, CancellationToken token = default)
