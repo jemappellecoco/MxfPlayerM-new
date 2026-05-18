@@ -1272,7 +1272,17 @@ namespace MxfPlayer
                 BackColor = Color.FromArgb(58, 62, 67),
                 Margin = new Padding(0)
             };
-            _timeline.MouseDown += (_, _) => _isDraggingTimeline = true;
+            _timeline.MouseDown += (_, e) =>
+            {
+                _isDraggingTimeline = true;
+                SetTimelineValueFromMouse(e.X);
+            };
+
+            _timeline.MouseMove += (_, e) =>
+            {
+                if (_isDraggingTimeline)
+                    SetTimelineValueFromMouse(e.X);
+            };
 
             _timeline.MouseUp += async (_, _) =>
             {
@@ -2241,6 +2251,13 @@ namespace MxfPlayer
         private long TimecodePartsToFrame(int hours, int minutes, int seconds, int frames, double fps, bool dropFrame)
         {
             int nominalFps = GetNominalFps(fps);
+            if (dropFrame)
+            {
+                int dropFrames = GetDropFrameCount(fps);
+                if (IsDroppedFrameLabel(minutes, seconds, frames, dropFrames))
+                    frames = dropFrames;
+            }
+
             long totalMinutes = (hours * 60L) + minutes;
             long frameNumber = (((hours * 3600L) + (minutes * 60L) + seconds) * nominalFps) + frames;
 
@@ -2251,6 +2268,14 @@ namespace MxfPlayer
             }
 
             return Math.Max(0, frameNumber);
+        }
+
+        private bool IsDroppedFrameLabel(int minutes, int seconds, int frames, int dropFrames)
+        {
+            return dropFrames > 0
+                && seconds == 0
+                && minutes % 10 != 0
+                && frames < dropFrames;
         }
 
         private string FrameToTimecode(long frameNumber, double fps, bool dropFrame)
@@ -2357,6 +2382,15 @@ namespace MxfPlayer
                 _isSeeking = false;
                 _meterTimer.Start();
             }
+        }
+
+        private void SetTimelineValueFromMouse(int mouseX)
+        {
+            int width = Math.Max(1, _timeline.ClientSize.Width);
+            int clampedX = Math.Clamp(mouseX, 0, width);
+            int range = _timeline.Maximum - _timeline.Minimum;
+            int value = _timeline.Minimum + (int)Math.Round(clampedX * range / (double)width);
+            _timeline.Value = Math.Clamp(value, _timeline.Minimum, _timeline.Maximum);
         }
         
         private class DarkColorTable : ProfessionalColorTable
