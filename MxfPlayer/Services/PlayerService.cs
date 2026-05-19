@@ -49,6 +49,7 @@ namespace MxfPlayer.Services
         private const int MaxCachedVideoFrames = 1800; //MaxCachedVideoFrames = 最多保留多少張畫面
         private const int VideoPreloadLowWaterFrames = 360;//VideoPreloadLowWaterFrames = 前方剩多少 frame 時開始補 buffe
         private const int VideoDecoderRestartGapFrames = 30; //VideoDecoderRestartGapFrames = 落後多少 frame 才重啟 decoder
+        private const int VideoBufferDangerWaterFrames = 30;
         private const int MaxStaleDisplayFrames = 180;
         private long _currentFrameIndex;
         private long _totalVideoFrames;
@@ -263,52 +264,8 @@ namespace MxfPlayer.Services
             return WaitForFrameBufferAsync(FrameFromTimeMs(startTimeMs, fps), 3000);
         }
 
-        private void LoadFullFile(string path, int audioCount, long startTimeMs, float rate, double fps, int sampleRate)
-        {
-            LoadForBufferedPlayback(path, audioCount, startTimeMs, rate, fps, sampleRate);
-            return;
 
-            StopAudioBridge();
-            CurrentPath = path;
-            CurrentAudioCount = audioCount;
-            _audioFps = fps > 0 ? fps : 29.97;
-            _audioSampleRate = NormalizeSampleRate(sampleRate);
-            ResetWaveProvider();
-            DecodeVideoFrames(path);
-            byte[] pcmData = CreatePcmCacheData(path);
 
-            _memoryAudioProvider = new MemoryPcmAudioProvider(pcmData, 2, _audioSampleRate);
-            _memoryAudioProvider.PlaybackRate = Math.Abs(rate) > 0 ? Math.Abs(rate) : 1.0f;
-            _waveOut = new WaveOutEvent
-            {
-                DesiredLatency = 100
-            };
-            _waveOut.Init(_memoryAudioProvider);
-
-         
-
-            SetVideoRate(rate);
-            long startFrame = FrameFromTimeMs(startTimeMs, _audioFps);
-            SeekAudioByFrame(startFrame, _audioFps);
-            SeekVideoByFrame(startFrame);
-        }
-
-        private byte[] CreatePcmCacheData(string path)
-        {
-            lock (_meterSamplesLock)
-            {
-                _meterSamples.Clear();
-            }
-
-            InitFFmpeg(path, 1.0f);
-
-            using (var output = new MemoryStream())
-            {
-                DecodeToFile(output, CancellationToken.None);
-                CloseDecodeResources();
-                return output.ToArray();
-            }
-        }
 
         private void LoadForBufferedPlayback(string path, int audioCount, long startTimeMs, float rate, double fps, int sampleRate)
         {
@@ -1459,7 +1416,6 @@ namespace MxfPlayer.Services
             _playbackStartFrame = _currentFrameIndex;
             WaitForAudioBuffer(_currentFrameIndex, _audioFps, _videoRate, 3000);
             PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
-            Thread.Sleep(AudioOutputLatencyMs);
             _playbackClock.Restart();
             _isVideoPlaying = true;
         }
@@ -1495,13 +1451,28 @@ namespace MxfPlayer.Services
         {
             if (!_isVideoPlaying || _totalVideoFrames <= 0) return;
 
+            long previousFrameIndex = _currentFrameIndex;
             double clockElapsedMs = Math.Max(0, _playbackClock.Elapsed.TotalMilliseconds - AudioOutputLatencyMs);
             //framesToMove = floor(經過毫秒 × fps × 播放倍率 ÷ 1000)
             long framesToMove = (long)Math.Floor(clockElapsedMs * _audioFps * Math.Abs(_videoRate) / 1000.0);
-            if (_videoRate >= 0)
-                _currentFrameIndex = Math.Min(_totalVideoFrames - 1, _playbackStartFrame + framesToMove);
+            long targetFrameIndex = _videoRate >= 0
+                ? Math.Min(_totalVideoFrames - 1, _playbackStartFrame + framesToMove)
+                : Math.Max(0, _playbackStartFrame - framesToMove);
+
+            if (TryLimitFrameToVideoBuffer(targetFrameIndex, previousFrameIndex, out long bufferedFrameIndex))
+            {
+                _currentFrameIndex = bufferedFrameIndex;
+
+                if (bufferedFrameIndex != targetFrameIndex)
+                {
+                    _playbackStartFrame = _currentFrameIndex;
+                    _playbackClock.Restart();
+                }
+            }
             else
-                _currentFrameIndex = Math.Max(0, _playbackStartFrame - framesToMove);
+            {
+                _currentFrameIndex = targetFrameIndex;
+            }
 
             EnsureVideoDecoderNearCurrentFrame();
             EnsureAudioCacheForCurrentFrame();
@@ -1510,6 +1481,49 @@ namespace MxfPlayer.Services
             if ((_videoRate < 0 && _currentFrameIndex == 0) ||
                 (_videoRate > 0 && _currentFrameIndex == _totalVideoFrames - 1))
                 Pause();
+        }
+
+        private bool TryLimitFrameToVideoBuffer(long targetFrameIndex, long previousFrameIndex, out long bufferedFrameIndex)
+        {
+            bufferedFrameIndex = targetFrameIndex;
+
+            lock (_lock)
+            {
+                if (_videoFrameCache.Count == 0)
+                    return false;
+
+                if (_videoFrameCache.ContainsKey(targetFrameIndex))
+                    return true;
+
+                int dangerWaterFrames = GetVideoBufferDangerWaterFrames();
+
+                if (_videoRate >= 0)
+                {
+                    long maxCachedFrame = _videoFrameCache.Keys.Max();
+
+                    if (targetFrameIndex <= maxCachedFrame - dangerWaterFrames)
+                        return true;
+
+                    long safeFrame = Math.Max(previousFrameIndex, maxCachedFrame - dangerWaterFrames);
+                    bufferedFrameIndex = Math.Clamp(safeFrame, 0, Math.Max(0, _totalVideoFrames - 1));
+                    return true;
+                }
+
+                long minCachedFrame = _videoFrameCache.Keys.Min();
+
+                if (targetFrameIndex >= minCachedFrame + dangerWaterFrames)
+                    return true;
+
+                long reverseSafeFrame = Math.Min(previousFrameIndex, minCachedFrame + dangerWaterFrames);
+                bufferedFrameIndex = Math.Clamp(reverseSafeFrame, 0, Math.Max(0, _totalVideoFrames - 1));
+                return true;
+            }
+        }
+
+        private int GetVideoBufferDangerWaterFrames()
+        {
+            int halfSecondAtRate = (int)Math.Ceiling(Math.Abs(_videoRate) * _audioFps * 0.5);
+            return Math.Max(VideoBufferDangerWaterFrames, halfSecondAtRate);
         }
 
         private void LogVideoBufferStatus()

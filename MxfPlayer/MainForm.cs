@@ -2350,7 +2350,15 @@ namespace MxfPlayer
                     loading.Show();
                     loading.Refresh();
 
-                    await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 3000);
+                    await _player.WaitForVideoBufferAheadAsync(
+                        _player.CurrentFrameIndex,
+                        PlaybackPrebufferFrames,
+                        PlaybackPrebufferTimeoutMs);
+                    await _player.WaitForAudioBufferAsync(
+                        _player.CurrentFrameIndex,
+                        GetSelectedFps(),
+                        1.0f,
+                        PlaybackPrebufferTimeoutMs);
                 }
 
                 UpdateVideoFrame();
