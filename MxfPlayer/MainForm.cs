@@ -55,7 +55,7 @@ namespace MxfPlayer
         private bool _isFrameStepping = false;
         private const int MeterUpdateIntervalMs = 100;
         private const int TimelineUpdateIntervalMs = 100;
-        private const int PlaybackPrebufferFrames = 120;
+        private const int PlaybackPrebufferFrames = 300;
         private const int PlaybackPrebufferTimeoutMs = 3000;
         public MainForm()
         {
