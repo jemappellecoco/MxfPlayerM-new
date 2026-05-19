@@ -10,6 +10,8 @@ namespace MxfPlayer.Services
         private readonly int _channels;
         private readonly int _sampleRate;
         private readonly long _baseTimeMs; // 此快取檔的起始影片毫秒
+        private readonly object _streamLock = new();
+        private bool _disposed;
         private float _playbackRate = 1.0f;
 
         public WaveFormat WaveFormat { get; }
@@ -95,88 +97,109 @@ namespace MxfPlayer.Services
 
         public unsafe int Read(byte[] buffer, int offset, int count)
         {
-            if (Math.Abs(_playbackRate) < 0.001f)
+            try
             {
-                Array.Clear(buffer, offset, count);
-                return count;
-            }
-
-            int bytesPerFrameIn = _channels * 2;
-            int framesRequested = count / 4;
-            if (framesRequested <= 0) return 0;
-
-            long startFrame = _fileStream.Position / bytesPerFrameIn;
-            float rate = Math.Abs(_playbackRate);
-            int sourceFramesNeeded = Math.Max(1, (int)Math.Ceiling(framesRequested * rate) + 2);
-            long rawStartFrame = _playbackRate < 0
-                ? Math.Max(0, startFrame - sourceFramesNeeded + 1)
-                : startFrame;
-
-            _fileStream.Position = rawStartFrame * bytesPerFrameIn;
-            byte[] rawBuffer = new byte[sourceFramesNeeded * bytesPerFrameIn];
-            int bytesRead = _fileStream.Read(rawBuffer, 0, rawBuffer.Length);
-            int framesRead = bytesRead / bytesPerFrameIn;
-
-            if (framesRead == 0)
-            {
-                Array.Clear(buffer, offset, count);
-                return count;
-            }
-
-            fixed (byte* pRaw = rawBuffer, pBuf = buffer)
-            {
-                short* outPtr = (short*)(pBuf + offset);
-                int framesWritten = 0;
-
-                for (int i = 0; i < framesRequested; i++)
+                lock (_streamLock)
                 {
-                    int sourceFrame = _playbackRate < 0
-                        ? (int)(startFrame - rawStartFrame - (long)Math.Round(i * rate))
-                        : (int)Math.Round(i * rate);
-
-                    if (sourceFrame < 0 || sourceFrame >= framesRead) break;
-
-                    short* inPtr = (short*)(pRaw + (sourceFrame * bytesPerFrameIn));
-                    long mixed = 0;
-                    int active = 0;
-
-                    if (_channels == 2)
+                    if (_disposed || Math.Abs(_playbackRate) < 0.001f)
                     {
-                        outPtr[i * 2] = inPtr[0];
-                        outPtr[i * 2 + 1] = inPtr[1];
-                        framesWritten++;
-                        continue;
+                        Array.Clear(buffer, offset, count);
+                        return count;
                     }
 
-                    for (int ch = 0; ch < Math.Min(Mask.Length, _channels); ch++)
+                    int bytesPerFrameIn = _channels * 2;
+                    int framesRequested = count / 4;
+                    if (framesRequested <= 0) return 0;
+
+                    long startFrame = _fileStream.Position / bytesPerFrameIn;
+                    float rate = Math.Abs(_playbackRate);
+                    int sourceFramesNeeded = Math.Max(1, (int)Math.Ceiling(framesRequested * rate) + 2);
+                    long rawStartFrame = _playbackRate < 0
+                        ? Math.Max(0, startFrame - sourceFramesNeeded + 1)
+                        : startFrame;
+
+                    _fileStream.Position = rawStartFrame * bytesPerFrameIn;
+                    byte[] rawBuffer = new byte[sourceFramesNeeded * bytesPerFrameIn];
+                    int bytesRead = _fileStream.Read(rawBuffer, 0, rawBuffer.Length);
+                    int framesRead = bytesRead / bytesPerFrameIn;
+
+                    if (framesRead == 0)
                     {
-                        if (Mask[ch]) { mixed += inPtr[ch]; active++; }
+                        Array.Clear(buffer, offset, count);
+                        return count;
                     }
-                    short final = (active > 0)
-                    ? (short)Math.Clamp(mixed, short.MinValue, short.MaxValue)
-                    : (short)0;
-                    //short final = (active > 0) ? unchecked((short)mixed) : (short)0;
-                    outPtr[i * 2] = final;
-                    outPtr[i * 2 + 1] = final;
-                    framesWritten++;
+
+                    fixed (byte* pRaw = rawBuffer, pBuf = buffer)
+                    {
+                        short* outPtr = (short*)(pBuf + offset);
+                        int framesWritten = 0;
+
+                        for (int i = 0; i < framesRequested; i++)
+                        {
+                            int sourceFrame = _playbackRate < 0
+                                ? (int)(startFrame - rawStartFrame - (long)Math.Round(i * rate))
+                                : (int)Math.Round(i * rate);
+
+                            if (sourceFrame < 0 || sourceFrame >= framesRead) break;
+
+                            short* inPtr = (short*)(pRaw + (sourceFrame * bytesPerFrameIn));
+                            long mixed = 0;
+                            int active = 0;
+
+                            if (_channels == 2)
+                            {
+                                outPtr[i * 2] = inPtr[0];
+                                outPtr[i * 2 + 1] = inPtr[1];
+                                framesWritten++;
+                                continue;
+                            }
+
+                            for (int ch = 0; ch < Math.Min(Mask.Length, _channels); ch++)
+                            {
+                                if (Mask[ch]) { mixed += inPtr[ch]; active++; }
+                            }
+                            short final = (active > 0)
+                            ? (short)Math.Clamp(mixed, short.MinValue, short.MaxValue)
+                            : (short)0;
+                            //short final = (active > 0) ? unchecked((short)mixed) : (short)0;
+                            outPtr[i * 2] = final;
+                            outPtr[i * 2 + 1] = final;
+                            framesWritten++;
+                        }
+
+                        long frameDelta = (long)Math.Round(framesWritten * rate);
+                        long nextFrame = _playbackRate < 0
+                            ? Math.Max(0, startFrame - frameDelta)
+                            : startFrame + frameDelta;
+                        _fileStream.Position = Math.Min(nextFrame * bytesPerFrameIn, _fileStream.Length);
+                        int bytesWritten = framesWritten * 4;
+                        if (bytesWritten < count)
+                            Array.Clear(buffer, offset + bytesWritten, count - bytesWritten);
+                        return count;
+                    }
                 }
-
-                long frameDelta = (long)Math.Round(framesWritten * rate);
-                long nextFrame = _playbackRate < 0
-                    ? Math.Max(0, startFrame - frameDelta)
-                    : startFrame + frameDelta;
-                _fileStream.Position = Math.Min(nextFrame * bytesPerFrameIn, _fileStream.Length);
-                int bytesWritten = framesWritten * 4;
-                if (bytesWritten < count)
-                    Array.Clear(buffer, offset + bytesWritten, count - bytesWritten);
+            }
+            catch (ObjectDisposedException)
+            {
+                Array.Clear(buffer, offset, count);
+                return count;
+            }
+            catch (IOException)
+            {
+                Array.Clear(buffer, offset, count);
                 return count;
             }
         }
 
         public void Dispose()
         {
-            _fileStream?.Close();
-            _fileStream?.Dispose();
+            lock (_streamLock)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                _fileStream?.Close();
+                _fileStream?.Dispose();
+            }
         }
     }
 }

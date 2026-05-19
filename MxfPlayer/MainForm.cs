@@ -334,7 +334,7 @@ namespace MxfPlayer
                             await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
                             await _player.WaitForVideoBufferAheadAsync(
                                 _player.CurrentFrameIndex,
-                                PlaybackPrebufferFrames,
+                                GetPlaybackPrebufferFrames(1.0f),
                                 PlaybackPrebufferTimeoutMs);
                             await _player.WaitForAudioBufferAsync(
                                 _player.CurrentFrameIndex,
@@ -355,7 +355,7 @@ namespace MxfPlayer
                     await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
                     await _player.WaitForVideoBufferAheadAsync(
                         _player.CurrentFrameIndex,
-                        PlaybackPrebufferFrames,
+                        GetPlaybackPrebufferFrames(1.0f),
                         PlaybackPrebufferTimeoutMs);
                     await _player.WaitForAudioBufferAsync(
                         _player.CurrentFrameIndex,
@@ -1434,6 +1434,7 @@ namespace MxfPlayer
         private void ApplyPlaybackRate(float rate)
         {
             _lblRate.Text = $"{rate:0}x";
+            _player.SetVideoRate(rate);
 
             if (Math.Abs(rate - 1.0f) > 0.001f)
                 _player.PrepareVideoBuffer();
@@ -1503,29 +1504,30 @@ namespace MxfPlayer
             if (Math.Abs(rate - 1.0f) < 0.001f)
                 return;
 
-            if (!TryGetSelectedMediaFile(out var file) || file == null)
-                return;
-
             if (_player.HasVideoBufferForRate(rate))
                 return;
 
-            using var loading = new LoadingForm(this, file.FileName);
-            loading.TopMost = true;
-            loading.Show();
-            loading.Refresh();
-
+            _player.PrepareVideoBuffer();
             var start = DateTime.Now;
+            double timeoutMs = PlaybackPrebufferTimeoutMs * Math.Max(1.0, Math.Abs(rate));
 
-            while ((DateTime.Now - start).TotalMilliseconds < 3000)
+            while ((DateTime.Now - start).TotalMilliseconds < timeoutMs)
             {
                 if (_player.HasVideoBufferForRate(rate))
                     break;
 
+                _player.PrepareVideoBuffer();
                 await Task.Delay(50);
             }
 
             _displayedVideoFrameIndex = -1;
             UpdateVideoFrame();
+        }
+
+        private int GetPlaybackPrebufferFrames(float rate)
+        {
+            double multiplier = Math.Max(1.0, Math.Abs(rate));
+            return (int)Math.Ceiling(PlaybackPrebufferFrames * multiplier);
         }
         private double GetFpsFromInfo(MediaInfoResult info)
         {
@@ -2352,7 +2354,7 @@ namespace MxfPlayer
 
                     await _player.WaitForVideoBufferAheadAsync(
                         _player.CurrentFrameIndex,
-                        PlaybackPrebufferFrames,
+                        GetPlaybackPrebufferFrames(_playbackController.CurrentRate),
                         PlaybackPrebufferTimeoutMs);
                     await _player.WaitForAudioBufferAsync(
                         _player.CurrentFrameIndex,

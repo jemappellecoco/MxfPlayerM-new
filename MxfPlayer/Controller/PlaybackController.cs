@@ -50,7 +50,6 @@ namespace MxfPlayer.Controllers
             else CurrentRate *= 2;
             if (CurrentRate < -16f) CurrentRate = -1.0f;
 
-            _player.SetVideoRate(CurrentRate);
             //_meterTimer.Start();
 
             return CurrentRate;
@@ -126,7 +125,6 @@ namespace MxfPlayer.Controllers
             else CurrentRate *= 2;
             if (CurrentRate > 16.0f) CurrentRate = 1.0f;
 
-            _player.SetVideoRate(CurrentRate);
             return CurrentRate;
         }
 
