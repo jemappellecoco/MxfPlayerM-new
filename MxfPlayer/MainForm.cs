@@ -24,7 +24,6 @@ namespace MxfPlayer
         private readonly Dictionary<string, CachedMediaAnalysis> _analysisMemory = new(StringComparer.OrdinalIgnoreCase);
         private readonly AudioMixerService _audioMixer = new();
         private readonly PlaybackController _playbackController;
-        private CancellationTokenSource? _decodeCheckCts;
         private Panel _timelineLabelsPanel = null!;
         private readonly Random _rnd = new();
         private PictureBox _videoView = null!;
@@ -55,8 +54,8 @@ namespace MxfPlayer
         private bool _isFrameStepping = false;
         private const int MeterUpdateIntervalMs = 100;
         private const int TimelineUpdateIntervalMs = 100;
-        private const int PlaybackPrebufferFrames = 300;
-        private const int PlaybackPrebufferTimeoutMs = 3000;
+        private const int PlaybackPrebufferFrames = 1800;
+        private const int PlaybackPrebufferTimeoutMs = 30000;
         public MainForm()
         {
             Text = "Offline xPlayer";
@@ -72,8 +71,6 @@ namespace MxfPlayer
             _playbackController = new PlaybackController(_player, _meterTimer, ResetMeters);
             this.FormClosing += (s, e) =>
             {
-                _decodeCheckCts?.Cancel();
-                _decodeCheckCts?.Dispose();
                 _player.Dispose();
             };
         }
@@ -458,7 +455,6 @@ namespace MxfPlayer
      
         private void LoadFolderToGrid(string folderPath)
         {
-            _decodeCheckCts?.Cancel();
             _txtPath.Text = folderPath;
 
             var files = _folder.LoadFolder(folderPath);
@@ -551,133 +547,6 @@ namespace MxfPlayer
                     row.Cells[5].Style.ForeColor = Color.White;
                     row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Regular);
                 }
-            }
-        }
-
-        private void StartBackgroundDecodeChecks(List<MediaFile> files)
-        {
-            _decodeCheckCts?.Dispose();
-            _decodeCheckCts = new CancellationTokenSource();
-            var token = _decodeCheckCts.Token;
-
-            var pendingFiles = new List<MediaFile>();
-
-            foreach (var file in files)
-            {
-                if (!_analysisMemory.TryGetValue(file.FullPath, out var analysis))
-                    continue;
-
-                if (analysis.DecodeCheckStatus == "Checking")
-                    analysis.DecodeCheckStatus = "NotChecked";
-
-                if (analysis.DecodeCheckStatus != "NotChecked")
-                    continue;
-
-                analysis.DecodeCheckStatus = "Checking";
-                analysis.DecodeCheckError = "";
-                UpdateGridRowAnalysis(file.FullPath, analysis);
-                pendingFiles.Add(file);
-            }
-
-            if (pendingFiles.Count == 0)
-                return;
-
-            _ = Task.Run(async () =>
-            {
-                foreach (var file in pendingFiles)
-                {
-                    if (token.IsCancellationRequested)
-                        break;
-
-                    await DecodeCheckFileAsync(file.FullPath, token);
-                }
-            }, token);
-        }
-
-        private async Task DecodeCheckFileAsync(string fullPath, CancellationToken token)
-        {
-            try
-            {
-                var check = await Task.Run(() => _mediaSpec.CheckDecodeIntegrity(fullPath, token), token);
-                if (token.IsCancellationRequested)
-                    return;
-
-                if (!_analysisMemory.TryGetValue(fullPath, out var analysis))
-                    return;
-
-                analysis.DecodeCheckStatus = check.IsPass ? "Passed" : "Failed";
-                analysis.DecodeCheckError = check.Errors.Count > 0
-                    ? string.Join(Environment.NewLine, check.Errors)
-                    : "";
-
-                if (!IsDisposed && IsHandleCreated)
-                {
-                    BeginInvoke(new Action(() =>
-                    {
-                        UpdateGridRowAnalysis(fullPath, analysis);
-
-                        if (TryGetSelectedMediaFile(out var selected) &&
-                            selected != null &&
-                            string.Equals(selected.FullPath, fullPath, StringComparison.OrdinalIgnoreCase))
-                        {
-                            ShowMediaInfo(analysis.Info, analysis);
-                        }
-                    }));
-                }
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (Exception ex)
-            {
-                if (!_analysisMemory.TryGetValue(fullPath, out var analysis))
-                    return;
-
-                analysis.DecodeCheckStatus = "Failed";
-                analysis.DecodeCheckError = "檢查影片完整性時發生錯誤：" + ex.Message;
-                if (!IsDisposed && IsHandleCreated)
-                {
-                    BeginInvoke(new Action(() => UpdateGridRowAnalysis(fullPath, analysis)));
-                }
-            }
-        }
-
-        private void UpdateGridRowAnalysis(string fullPath, CachedMediaAnalysis analysis)
-        {
-            foreach (DataGridViewRow row in _gridFiles.Rows)
-            {
-                if (row.Tag is not MediaFile file ||
-                    !string.Equals(file.FullPath, fullPath, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                string specCheck = GetDisplaySpecCheck(analysis);
-                var errors = GetDisplayErrors(analysis);
-                string specErrorText = errors.Count > 0
-                    ? string.Join(Environment.NewLine, errors)
-                    : "";
-
-                row.Cells[5].Value = specCheck;
-                row.Cells[5].ToolTipText = specErrorText;
-
-                if (IsDisplaySpecError(analysis))
-                {
-                    row.Cells[5].Style.ForeColor = Color.Red;
-                    row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
-                }
-                else if (analysis.DecodeCheckStatus == "Checking")
-                {
-                    row.Cells[5].Style.ForeColor = Color.Orange;
-                    row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
-                }
-                else
-                {
-                    row.Cells[5].Style.ForeColor = Color.White;
-                    row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Regular);
-                }
-
-                return;
             }
         }
 
@@ -1499,31 +1368,6 @@ namespace MxfPlayer
             await _player.PlayFrameAudioAsync(_player.CurrentFrameIndex, fps);
             UpdateMetersFromAudioLevel();
         }
-        private async Task CheckBufferForRateAsync(float rate)
-        {
-            if (Math.Abs(rate - 1.0f) < 0.001f)
-                return;
-
-            if (_player.HasVideoBufferForRate(rate))
-                return;
-
-            _player.PrepareVideoBuffer();
-            var start = DateTime.Now;
-            double timeoutMs = PlaybackPrebufferTimeoutMs * Math.Max(1.0, Math.Abs(rate));
-
-            while ((DateTime.Now - start).TotalMilliseconds < timeoutMs)
-            {
-                if (_player.HasVideoBufferForRate(rate))
-                    break;
-
-                _player.PrepareVideoBuffer();
-                await Task.Delay(50);
-            }
-
-            _displayedVideoFrameIndex = -1;
-            UpdateVideoFrame();
-        }
-
         private int GetPlaybackPrebufferFrames(float rate)
         {
             double multiplier = Math.Max(1.0, Math.Abs(rate));
@@ -1658,18 +1502,6 @@ namespace MxfPlayer
 
             if (wasPlaying)
                 await _playbackController.Play();
-        }
-        private void HandleFullScreen()
-        {
-            if (WindowState == FormWindowState.Maximized)
-                WindowState = FormWindowState.Normal;
-            else
-                WindowState = FormWindowState.Maximized;
-        }
-
-        private void HandleAutoPlayChanged(bool isChecked)
-        {
-            // TODO
         }
         private Button CreateControlButton(string text, int width)
         {
@@ -1895,8 +1727,6 @@ namespace MxfPlayer
 
             try
             {
-                _decodeCheckCts?.Cancel();
-
                 var files = _folder.LoadFolder(folderPath);
                 PopulateGrid(files);
 
