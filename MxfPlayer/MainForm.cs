@@ -43,6 +43,9 @@ namespace MxfPlayer
         private long _displayedVideoFrameIndex = -1;
         private readonly List<Panel> _meterBars = new();
         private readonly List<CheckBox> _channelChecks = new();
+        private TableLayoutPanel _videoAndMetersLayout = null!;
+        private Control _metersPanel = null!;
+        private Form? _metersWindow;
         private bool _isStartingPlayback = false;
         private bool _isEditingNowTimecode = false;
         private bool _isBuffering = false;
@@ -54,7 +57,8 @@ namespace MxfPlayer
         private bool _isFrameStepping = false;
         private const int MeterUpdateIntervalMs = 100;
         private const int TimelineUpdateIntervalMs = 100;
-        private const int PlaybackPrebufferFrames = 1800;
+        private const int MainMetersWidth = 170;
+        private const int PlaybackPrebufferFrames = 120;
         private const int PlaybackPrebufferTimeoutMs = 30000;
         public MainForm()
         {
@@ -679,16 +683,16 @@ namespace MxfPlayer
             };
             outer.Controls.Add(videoWrap, 0, 1);
 
-            var videoAndMeters = new TableLayoutPanel
+            _videoAndMetersLayout = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 2,
                 RowCount = 1,
                 BackColor = Color.FromArgb(58, 62, 67)
             };
-            videoAndMeters.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            videoAndMeters.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 170));
-            videoWrap.Controls.Add(videoAndMeters);
+            _videoAndMetersLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            _videoAndMetersLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, MainMetersWidth));
+            videoWrap.Controls.Add(_videoAndMetersLayout);
 
             _videoView = new PictureBox
             {
@@ -697,9 +701,10 @@ namespace MxfPlayer
                 Margin = new Padding(0),
                 SizeMode = PictureBoxSizeMode.Zoom
             };
-            videoAndMeters.Controls.Add(_videoView, 0, 0);
+            _videoAndMetersLayout.Controls.Add(_videoView, 0, 0);
 
-            videoAndMeters.Controls.Add(BuildMetersPanel(), 1, 0);
+            _metersPanel = BuildMetersPanel();
+            _videoAndMetersLayout.Controls.Add(_metersPanel, 1, 0);
 
             outer.Controls.Add(BuildPlaybackBar(), 0, 2);
         }
@@ -1180,6 +1185,7 @@ namespace MxfPlayer
             var btnMoveLast = CreatePlaybackButton("⏭", 36);
             var btnMinus10 = CreatePlaybackButton("-10", 60);
             var btnPlus10 = CreatePlaybackButton("+10", 60);
+            var btnMeters = CreatePlaybackButton("8 CH", 54);
 
             BindPlaybackEvents(
                 btnPlay,
@@ -1204,6 +1210,8 @@ namespace MxfPlayer
             btnRow.Controls.Add(btnMoveLast);
             btnRow.Controls.Add(btnMinus10);
             btnRow.Controls.Add(btnPlus10);
+            btnRow.Controls.Add(btnMeters);
+            btnMeters.Click += (_, _) => ToggleMetersWindow();
 
             var buttonHost = new TableLayoutPanel
             {
@@ -1271,6 +1279,69 @@ namespace MxfPlayer
             btnMinus10.Click += async (_, _) => await HandleJump(-10);
             btnPlus10.Click += async (_, _) => await HandleJump(10);
         }
+
+        private void ToggleMetersWindow()
+        {
+            if (_metersWindow != null)
+            {
+                _metersWindow.Close();
+                return;
+            }
+
+            DetachMetersPanel();
+
+            _metersWindow = new Form
+            {
+                Text = "8 CH",
+                Size = new Size(210, 420),
+                MinimumSize = new Size(180, 280),
+                StartPosition = FormStartPosition.Manual,
+                FormBorderStyle = FormBorderStyle.SizableToolWindow,
+                BackColor = Color.FromArgb(58, 62, 67),
+                Owner = this
+            };
+
+            var screenPoint = PointToScreen(new Point(ClientSize.Width - 240, 80));
+            _metersWindow.Location = new Point(
+                Math.Max(0, screenPoint.X),
+                Math.Max(0, screenPoint.Y)
+            );
+
+            _metersPanel.Dock = DockStyle.Fill;
+            _metersWindow.Controls.Add(_metersPanel);
+            _metersWindow.FormClosing += (_, _) => RestoreMetersPanel();
+            _metersWindow.Show(this);
+        }
+
+        private void DetachMetersPanel()
+        {
+            if (_metersPanel.Parent != null)
+                _metersPanel.Parent.Controls.Remove(_metersPanel);
+
+            if (_videoAndMetersLayout.ColumnStyles.Count > 1)
+                _videoAndMetersLayout.ColumnStyles[1].Width = 0;
+        }
+
+        private void RestoreMetersPanel()
+        {
+            if (_metersWindow != null)
+            {
+                _metersWindow.Controls.Remove(_metersPanel);
+                _metersWindow = null;
+            }
+
+            if (_metersPanel.Parent != null)
+                _metersPanel.Parent.Controls.Remove(_metersPanel);
+
+            if (_videoAndMetersLayout.ColumnStyles.Count > 1)
+                _videoAndMetersLayout.ColumnStyles[1].Width = MainMetersWidth;
+
+            if (!_videoAndMetersLayout.Controls.Contains(_metersPanel))
+                _videoAndMetersLayout.Controls.Add(_metersPanel, 1, 0);
+
+            _metersPanel.Dock = DockStyle.Fill;
+        }
+
         private async void HandlePlay()
         {
             if (!TryGetSelectedMediaFile(out var file) || file == null)
@@ -2175,52 +2246,15 @@ namespace MxfPlayer
 
                 _displayedVideoFrameIndex = -1;
 
-                if (TryGetSelectedMediaFile(out var loadingFile) && loadingFile != null)
-                {
-                    using var loading = new LoadingForm(this, loadingFile.FileName);
-                    loading.TopMost = true;
-                    loading.Show();
-                    loading.Refresh();
-
-                    await _player.WaitForVideoBufferAheadAsync(
-                        _player.CurrentFrameIndex,
-                        GetPlaybackPrebufferFrames(_playbackController.CurrentRate),
-                        PlaybackPrebufferTimeoutMs);
-                    await _player.WaitForAudioBufferAsync(
-                        _player.CurrentFrameIndex,
-                        GetSelectedFps(),
-                        1.0f,
-                        PlaybackPrebufferTimeoutMs);
-                }
-
+                await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 250);
                 UpdateVideoFrame();
-
-                long lengthMs = _playbackController.GetLength();
-
-                double fps = GetSelectedFps();
-                if (fps <= 0) return;
-
-                bool dropFrame = IsSelectedDropFrame();
-                long somFrame = 0;
-
-                if (TryGetSelectedMediaFile(out var file) &&
-                    file != null &&
-                    _mediaCache.TryGetValue(file.FullPath, out var info))
-                {
-                    somFrame = TimecodeToFrame(info.Som, fps, dropFrame);
-                }
-
-                if (!_isEditingNowTimecode)
-                    SetNowTimecodeText(FrameToTimecode(somFrame + _player.CurrentFrameIndex, fps, dropFrame), dropFrame);
-
-                long lastFrame = PlayerService.FrameFromTimeMs(lengthMs, fps);
-                long remainFrames = Math.Max(0, lastFrame - _player.CurrentFrameIndex);
-                _lblRemain.Text = $"REM {FrameToTimecode(remainFrames, fps, dropFrame)}";
+                UpdateTimelineUI(-1);
+                UpdateMetersFromAudioLevel();
+                await _playbackController.Play(0);
             }
             finally
             {
                 _isSeeking = false;
-                _meterTimer.Start();
             }
         }
 

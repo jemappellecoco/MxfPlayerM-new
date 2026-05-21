@@ -51,7 +51,7 @@ namespace MxfPlayer.Services
         private const int ReverseVideoPreloadLowWaterFrames = 360; // Refill reverse cache before the continuous window runs dry.
         private const int VideoDecoderRestartGapFrames = 30; // Restart decoder if playback has outrun the cached window.
         private const int VideoDecoderRestartCooldownMs = 1500;
-        private const double VideoStallResumeBufferSeconds = 0.75;
+        private const double VideoStallResumeBufferSeconds = 0.75;//播放中卡住後：等 0.75 秒
         private long _currentFrameIndex;
         private long _totalVideoFrames;
         private CancellationTokenSource? _videoCts;
@@ -1179,12 +1179,31 @@ namespace MxfPlayer.Services
             _waveProvider?.ClearBuffer();
         }
 
-        public void ResumeAudio()
+        public void ResumeAudio(int audioBufferTimeoutMs = 3000)
         {
             SeekAudioByFrame(_currentFrameIndex, _audioFps);
             _playbackStartFrame = _currentFrameIndex;
-            WaitForAudioBuffer(_currentFrameIndex, _audioFps, _videoRate, 3000);
-            PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
+            var waveOut = _waveOut;
+            int generation = _audioCacheGeneration;
+
+            if (audioBufferTimeoutMs > 0)
+            {
+                WaitForAudioBuffer(_currentFrameIndex, _audioFps, _videoRate, audioBufferTimeoutMs);
+                PlayWaveOutIfCurrent(waveOut, generation);
+            }
+            else
+            {
+                long frameIndex = _currentFrameIndex;
+                double fps = _audioFps;
+                float rate = _videoRate;
+
+                Task.Run(() =>
+                {
+                    WaitForAudioBuffer(frameIndex, fps, rate, 1000);
+                    PlayWaveOutIfCurrent(waveOut, generation);
+                });
+            }
+
             _playbackClock.Restart();
             _isVideoPlaying = true;
             _isPlaybackStalledForVideo = false;

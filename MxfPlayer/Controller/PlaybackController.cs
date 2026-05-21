@@ -64,10 +64,10 @@ namespace MxfPlayer.Controllers
             // 逐幀後退通常建議暫停音訊
             _player.Pause();
         }
-        public async Task Play()
+        public async Task Play(int audioBufferTimeoutMs = 3000)
         {
             _player.SetVideoRate(CurrentRate);
-            _player.ResumeAudio();
+            _player.ResumeAudio(audioBufferTimeoutMs);
 
             _meterTimer.Start();
 
