@@ -55,6 +55,7 @@ namespace MxfPlayer
         private int _meterUpdateElapsedMs = 0;
         private int _timelineUpdateElapsedMs = 0;
         private bool _isFrameStepping = false;
+        private bool _isBoundarySeeking = false;
         private const int MeterUpdateIntervalMs = 100;
         private const int TimelineUpdateIntervalMs = 100;
         private const int MainMetersWidth = 170;
@@ -106,7 +107,28 @@ namespace MxfPlayer
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
             if (_lblNow != null && _lblNow.Focused)
+            {
+                Keys focusedKeyCode = keyData & Keys.KeyCode;
+                if (focusedKeyCode == Keys.Enter || focusedKeyCode == Keys.Return)
+                {
+                    _ = SeekFromNowInputAsync();
+                    return true;
+                }
+
+                if (!_isEditingNowTimecode && focusedKeyCode == Keys.Left)
+                {
+                    StepFrameByKeyboard(-1);
+                    return true;
+                }
+
+                if (!_isEditingNowTimecode && focusedKeyCode == Keys.Right)
+                {
+                    StepFrameByKeyboard(1);
+                    return true;
+                }
+
                 return base.ProcessCmdKey(ref msg, keyData);
+            }
 
             Keys keyCode = keyData & Keys.KeyCode;
             if (keyCode == Keys.Left)
@@ -1364,17 +1386,50 @@ namespace MxfPlayer
 
         private async void HandleMoveFirst() 
         {
-            await _playbackController.MoveFirst(GetSelectedFps()); 
+            await SeekToBoundaryAsync(moveLast: false); 
         }
 
         private async void HandleMoveLast()
         {
-            await _playbackController.MoveLast(GetSelectedFps());
+            await SeekToBoundaryAsync(moveLast: true);
+        }
+
+        private async Task SeekToBoundaryAsync(bool moveLast)
+        {
+            if (_isBoundarySeeking)
+                return;
+
+            double fps = GetSelectedFps();
+            if (fps <= 0)
+                return;
+
+            _isBoundarySeeking = true;
+            try
+            {
+                if (moveLast)
+                    await _playbackController.MoveLast(fps);
+                else
+                    await _playbackController.MoveFirst(fps);
+
+                ResetUiUpdateThrottle();
+                _displayedVideoFrameIndex = -1;
+                UpdateTimelineUI(-1);
+
+                await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 1000);
+                UpdateVideoFrame();
+                UpdateTimelineUI(-1);
+                UpdateMetersFromAudioLevel();
+            }
+            finally
+            {
+                _isBoundarySeeking = false;
+            }
         }
         private void ApplyPlaybackRate(float rate)
         {
             _lblRate.Text = $"{rate:0}x";
             _player.SetVideoRate(rate);
+            _player.PrepareAudioForRate(rate);
 
             if (Math.Abs(rate - 1.0f) > 0.001f)
                 _player.PrepareVideoBuffer();
@@ -1527,19 +1582,19 @@ namespace MxfPlayer
             long targetFrame = inputFrame >= somFrame ? inputFrame - somFrame : inputFrame;
             long lastFrame = PlayerService.FrameFromTimeMs(_player.LengthMs, fps);
             targetFrame = Math.Clamp(targetFrame, 0, Math.Max(0, lastFrame));
-            long targetMs = PlayerService.TimeMsFromFrame(targetFrame, fps);
-
             _isSeeking = true;
             try
             {
                 bool wasPlaying = _meterTimer.Enabled;
                 _playbackController.Pause();
-                _player.Seek(targetMs);
+                _player.SeekVideoByFrame(targetFrame);
+                _player.SeekAudioByFrame(targetFrame, fps);
                 _displayedVideoFrameIndex = -1;
                 await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 3000);
                 UpdateVideoFrame();
                 _isEditingNowTimecode = false;
                 UpdateTimelineUI(-1);
+                ReleaseNowTimecodeInputFocus();
 
                 if (wasPlaying)
                     await _playbackController.Play();
@@ -1549,6 +1604,15 @@ namespace MxfPlayer
                 _isEditingNowTimecode = false;
                 _isSeeking = false;
             }
+        }
+
+        private void ReleaseNowTimecodeInputFocus()
+        {
+            if (_lblNow == null || !_lblNow.Focused)
+                return;
+
+            ActiveControl = null;
+            Focus();
         }
 
         private async Task HandleJump(int seconds)
@@ -2250,7 +2314,7 @@ namespace MxfPlayer
                 UpdateVideoFrame();
                 UpdateTimelineUI(-1);
                 UpdateMetersFromAudioLevel();
-                await _playbackController.Play(0);
+                await _playbackController.Play(250);
             }
             finally
             {

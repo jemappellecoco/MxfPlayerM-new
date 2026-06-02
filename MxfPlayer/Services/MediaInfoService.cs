@@ -251,7 +251,7 @@ namespace MxfPlayer.Services
 
         private string BuildDurationTc(string frameCountText, string fpsNumText, string fpsDenText, string dropFrame)
         {
-            if (!int.TryParse(frameCountText, out int frameCount))
+            if (!long.TryParse(frameCountText, out long frameCount))
                 return "";
 
             if (!int.TryParse(fpsNumText, out int fpsNum))
@@ -266,16 +266,37 @@ namespace MxfPlayer.Services
             if (nominalFps <= 0)
                 return "";
 
-            int totalFrames = frameCount;
-            int frames = totalFrames % nominalFps;
-            int totalSeconds = totalFrames / nominalFps;
-            int seconds = totalSeconds % 60;
-            int totalMinutes = totalSeconds / 60;
-            int minutes = totalMinutes % 60;
-            int hours = totalMinutes / 60;
+            bool isDropFrame = string.Equals(dropFrame, "True", StringComparison.OrdinalIgnoreCase);
+            long timecodeFrameNumber = frameCount;
+
+            if (isDropFrame)
+            {
+                int droppedLabelsPerMinute = Math.Max(0, (int)Math.Round(nominalFps * 0.0666666667));
+                long framesPerMinute = (nominalFps * 60L) - droppedLabelsPerMinute;
+                long framesPer10Minutes = (nominalFps * 600L) - (droppedLabelsPerMinute * 9L);
+
+                if (droppedLabelsPerMinute > 0 && framesPer10Minutes > 0)
+                {
+                    long tenMinuteBlocks = frameCount / framesPer10Minutes;
+                    long remainingFrames = frameCount % framesPer10Minutes;
+                    long droppedLabels = droppedLabelsPerMinute * 9L * tenMinuteBlocks;
+
+                    if (remainingFrames >= droppedLabelsPerMinute)
+                        droppedLabels += droppedLabelsPerMinute * ((remainingFrames - droppedLabelsPerMinute) / framesPerMinute);
+
+                    timecodeFrameNumber += droppedLabels;
+                }
+            }
+
+            long hours = timecodeFrameNumber / (nominalFps * 3600L);
+            timecodeFrameNumber %= nominalFps * 3600L;
+            long minutes = timecodeFrameNumber / (nominalFps * 60L);
+            timecodeFrameNumber %= nominalFps * 60L;
+            long seconds = timecodeFrameNumber / nominalFps;
+            long frames = timecodeFrameNumber % nominalFps;
 
             string separator =
-                string.Equals(dropFrame, "True", StringComparison.OrdinalIgnoreCase)
+                isDropFrame
                     ? ";"
                     : ":";
 

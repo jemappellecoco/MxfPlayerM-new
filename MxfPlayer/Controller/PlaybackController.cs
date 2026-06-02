@@ -24,7 +24,7 @@ namespace MxfPlayer.Controllers
             if (fps <= 0) return;
 
             _player.SeekVideoByFrame(0);
-            _player.SeekAudioByFrame(0, fps);
+            _player.SeekAudioByFrame(0, fps, waitForPreviousCache: false);
             await Task.CompletedTask;
         }
 
@@ -39,7 +39,7 @@ namespace MxfPlayer.Controllers
             long frame = PlayerService.FrameFromTimeMs(length, fps)-1;
 
             _player.SeekVideoByFrame(frame);
-            _player.SeekAudioByFrame(frame, fps);
+            _player.SeekAudioByFrame(frame, fps, waitForPreviousCache: false);
 
             await Task.CompletedTask;
         }
