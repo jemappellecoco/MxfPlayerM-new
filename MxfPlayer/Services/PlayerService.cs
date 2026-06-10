@@ -46,14 +46,14 @@ namespace MxfPlayer.Services
         private int _pcmOutputChannels;
         public double CurrentFps => _audioFps > 0 ? _audioFps : 29.97;
         private readonly Dictionary<long, Bitmap> _videoFrameCache = new();
-        private const long VideoFrameCacheBudgetBytes = 512L * 1024L * 1024L;
-        private const int MinCachedVideoFrames = 48;
-        private const int MaxCachedVideoFrames = 300; // Hard cap for decoded bitmaps kept in memory.
-        private int _maxCachedVideoFrames = 120;
-        private const int VideoPreloadLowWaterFrames = 900; // Start refilling when forward buffer drops below this.
-        private const int VideoPreloadHighWaterFrames = 1500; // Pause background decode when this much is ready.
-        private const int ReverseVideoDecodeWindowFrames = 300; // Keep reverse decode close to the playhead.
-        private const int ReverseVideoPreloadLowWaterFrames = 360; // Refill reverse cache before the continuous window runs dry.
+        private const long VideoFrameCacheBudgetBytes = 256L * 1024L * 1024L;
+        private const int MinCachedVideoFrames = 12;
+        private const int MaxCachedVideoFrames = 80; // Hard cap for decoded bitmaps kept in memory.
+        private int _maxCachedVideoFrames = 40;
+        private const int VideoPreloadLowWaterFrames = 30; // Start refilling when forward buffer drops below this.
+        private const int VideoPreloadHighWaterFrames = 80; // Pause background decode when this much is ready.
+        private const int ReverseVideoDecodeWindowFrames = 80; // Keep reverse decode close to the playhead.
+        private const int ReverseVideoPreloadLowWaterFrames = 40; // Refill reverse cache before the continuous window runs dry.
         private const int VideoDecoderRestartGapFrames = 30; // Restart decoder if playback has outrun the cached window.
         private const int VideoDecoderRestartCooldownMs = 1500;
         private const double VideoStallResumeBufferSeconds = 0.75;//播放中卡住後：等 0.75 秒
