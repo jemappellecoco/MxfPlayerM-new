@@ -66,6 +66,26 @@ namespace MxfPlayer
             this.TopMost = true;
         }
 
+        public void SetProgressMode(int maximum)
+        {
+            _progressBar.Style = ProgressBarStyle.Continuous;
+            _progressBar.MarqueeAnimationSpeed = 0;
+            _progressBar.Minimum = 0;
+            _progressBar.Maximum = Math.Max(1, maximum);
+            _progressBar.Value = 0;
+        }
+
+        public void UpdateProgress(string title, string fileName, int current, int total)
+        {
+            total = Math.Max(1, total);
+            current = Math.Clamp(current, 0, total);
+
+            _lblInfo.Text = $"{title}\n{current}/{total}  {fileName}";
+            _progressBar.Maximum = total;
+            _progressBar.Value = current;
+            Refresh();
+        }
+
         // 解決「只有框框」的關鍵：在 Show 之後調用 Refresh
         protected override void OnShown(EventArgs e)
         {

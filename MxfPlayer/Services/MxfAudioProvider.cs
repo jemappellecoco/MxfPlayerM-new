@@ -53,7 +53,10 @@ namespace MxfPlayer.Services
             long relativeMs = timeMs - _baseTimeMs;
             long targetOffsetBytes = (_sampleRate * _channels * 2 * relativeMs) / 1000;
             long requiredAheadBytes = (_sampleRate * _channels * 2 * requiredAheadMs) / 1000;
-            return _fileStream.Length > targetOffsetBytes + requiredAheadBytes;
+            long requiredBytes = requiredAheadMs <= 0
+                ? _channels * 2L
+                : requiredAheadBytes;
+            return _fileStream.Length >= targetOffsetBytes + requiredBytes;
         }
 
         public bool IsReverseFrameDataAvailable(long frameIndex, double fps, int requiredBehindMs)
@@ -140,7 +143,7 @@ namespace MxfPlayer.Services
                     {
                         int offset = (i * _channels * 2) + (channel * 2);
                         short sample = BitConverter.ToInt16(rawBuffer, offset);
-                        peak = Math.Max(peak, Math.Abs(sample) / 32768f);
+                        peak = Math.Max(peak, GetInt16Peak(sample));
                     }
 
                     return Math.Min(1f, peak);
@@ -247,6 +250,12 @@ namespace MxfPlayer.Services
                 Array.Clear(buffer, offset, count);
                 return count;
             }
+        }
+
+        private static float GetInt16Peak(short sample)
+        {
+            int magnitude = sample == short.MinValue ? 32768 : Math.Abs(sample);
+            return magnitude / 32768f;
         }
 
         public void Dispose()

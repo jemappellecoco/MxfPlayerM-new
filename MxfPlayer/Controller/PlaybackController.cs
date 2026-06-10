@@ -33,10 +33,7 @@ namespace MxfPlayer.Controllers
         {
             if (fps <= 0) return;
 
-            long length = _player.LengthMs;
-            if (length <= 0) return;
-
-            long frame = PlayerService.FrameFromTimeMs(length, fps)-1;
+            long frame = _player.LastFrameIndex;
 
             _player.SeekVideoByFrame(frame);
             _player.SeekAudioByFrame(frame, fps, waitForPreviousCache: false);
@@ -140,7 +137,7 @@ namespace MxfPlayer.Controllers
         public async Task PositiveLog(double fps)
         {
             if (fps <= 0) fps = _player.CurrentFps;
-            long targetFrame = _player.CurrentFrameIndex + 1;
+            long targetFrame = Math.Min(_player.LastFrameIndex, _player.CurrentFrameIndex + 1);
             _player.SeekVideoByFrame(targetFrame);
             _player.SeekAudioByFrame(targetFrame, fps);
             _player.Pause();

@@ -141,7 +141,7 @@ namespace MxfPlayer.Services
                 {
                     int sourceOffset = (int)(sourceFrame * _bytesPerSourceFrame + (channel * 2));
                     short sample = ReadInt16(sourceOffset);
-                    peak = Math.Max(peak, Math.Abs(sample) / 32768f);
+                    peak = Math.Max(peak, GetInt16Peak(sample));
                 }
 
                 return Math.Min(1f, peak);
@@ -248,6 +248,12 @@ namespace MxfPlayer.Services
         private short ReadInt16(int offset)
         {
             return unchecked((short)(_pcmData[offset] | (_pcmData[offset + 1] << 8)));
+        }
+
+        private static float GetInt16Peak(short sample)
+        {
+            int magnitude = sample == short.MinValue ? 32768 : Math.Abs(sample);
+            return magnitude / 32768f;
         }
     }
 }

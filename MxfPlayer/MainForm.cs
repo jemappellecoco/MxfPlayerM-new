@@ -35,6 +35,7 @@ namespace MxfPlayer
         private Label _lblStart = null!;
         private Label _lblDur = null!;
         private Label _lblRemain = null!;
+        private Button _btnInlineMeters = null!;
         private Label _lblFileCount = null!;
         private Label _lblTotalSize = null!;
         private TrackBar _timeline = null!;
@@ -56,6 +57,7 @@ namespace MxfPlayer
         private int _timelineUpdateElapsedMs = 0;
         private bool _isFrameStepping = false;
         private bool _isBoundarySeeking = false;
+        private bool _areInlineMetersVisible = true;
         private const int MeterUpdateIntervalMs = 100;
         private const int TimelineUpdateIntervalMs = 100;
         private const int MainMetersWidth = 170;
@@ -72,12 +74,45 @@ namespace MxfPlayer
             ForeColor = Color.White;
 
             InitUI();
+            ConfigureFileDrop(this);
             InitTimer();
             _playbackController = new PlaybackController(_player, _meterTimer, ResetMeters);
             this.FormClosing += (s, e) =>
             {
                 _player.Dispose();
             };
+        }
+
+        private void ConfigureFileDrop(Control control)
+        {
+            control.AllowDrop = true;
+            control.DragEnter += OnFileDragEnter;
+            control.DragDrop += OnFileDragDrop;
+
+            foreach (Control child in control.Controls)
+                ConfigureFileDrop(child);
+        }
+
+        private void OnFileDragEnter(object? sender, DragEventArgs e)
+        {
+            e.Effect = e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop)
+                ? DragDropEffects.Copy
+                : DragDropEffects.None;
+        }
+
+        private async void OnFileDragDrop(object? sender, DragEventArgs e)
+        {
+            if (e.Data?.GetData(DataFormats.FileDrop) is not string[] paths || paths.Length == 0)
+                return;
+
+            try
+            {
+                await LoadDroppedFilesAsync(paths);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"拖放檔案失敗：{ex.Message}");
+            }
         }
         private void InitUI()
         {
@@ -399,6 +434,8 @@ namespace MxfPlayer
 
         private async Task PlaySelectedFileAsync(MediaFile file)
         {
+            ReleaseNowTimecodeInputFocus();
+
             long startTimeMs = _player.CurrentPath == file.FullPath
                 ? _playbackController.GetCurrentTime()
                 : 0;
@@ -415,6 +452,7 @@ namespace MxfPlayer
             ResetUiUpdateThrottle();
             await _playbackController.Play();
             _lblNow.ForeColor = Color.Orange;
+            UpdateTimelineUI(-1);
         }
         private double GetSelectedFps()
         {
@@ -484,9 +522,7 @@ namespace MxfPlayer
             _txtPath.Text = folderPath;
 
             var files = _folder.LoadFolder(folderPath);
-            MessageBox.Show($"找到 {files.Count} 個 MXF 檔案");
-
-            PopulateGrid(files);
+            PopulateGrid(files, "正在檢查資料夾影片");
 
             double totalGB = CalculateTotalSizeGB(files);
             UpdateRightSummary(files.Count, totalGB);
@@ -502,78 +538,101 @@ namespace MxfPlayer
             _timelineLabelsPanel.Controls.Clear();
         }
 
-        private void PopulateGrid(List<MediaFile> files)
+        private void PopulateGrid(List<MediaFile> files, string loadingTitle = "正在檢查影片")
         {
             _gridFiles.Rows.Clear();
 
-            foreach (var file in files)
+            AddMediaFilesWithProgress(files, loadingTitle);
+        }
+
+        private void AddMediaFilesWithProgress(List<MediaFile> files, string loadingTitle)
+        {
+            if (files.Count == 0)
+                return;
+
+            using var loading = new LoadingForm(this, "");
+            loading.SetProgressMode(files.Count);
+            loading.Show();
+            loading.Refresh();
+
+            for (int i = 0; i < files.Count; i++)
             {
-                string som = "00:00:00;00";
-                string eom = "00:00:00;00";
-                string duration = "00:00:00;00";
-                string specCheck = "Error";
-                string specErrorText = "";
+                var file = files[i];
+                loading.UpdateProgress(loadingTitle, file.FileName, i + 1, files.Count);
+                AddMediaFileRow(file);
+                Application.DoEvents();
+            }
+        }
 
-                try
+        private int AddMediaFileRow(MediaFile file)
+        {
+            string som = "00:00:00;00";
+            string eom = "00:00:00;00";
+            string duration = "00:00:00;00";
+            string specCheck = "Error";
+            string specErrorText = "";
+
+            try
+            {
+                var analysis = GetOrAnalyzeMedia(file.FullPath);
+                var info = analysis.Info;
+
+                som = string.IsNullOrWhiteSpace(info.Som) ? "00:00:00;00" : info.Som;
+                eom = string.IsNullOrWhiteSpace(info.Eom) ? "00:00:00;00" : info.Eom;
+                duration = string.IsNullOrWhiteSpace(info.DurationTc) ? "00:00:00;00" : info.DurationTc;
+
+                specCheck = GetDisplaySpecCheck(analysis);
+                specErrorText = string.Join(Environment.NewLine, GetDisplayErrors(analysis));
+
+                if (IsDisplaySpecError(analysis))
                 {
-                    var analysis = GetOrAnalyzeMedia(file.FullPath);
-                    var info = analysis.Info;
-
-                    som = string.IsNullOrWhiteSpace(info.Som) ? "00:00:00;00" : info.Som;
-                    eom = string.IsNullOrWhiteSpace(info.Eom) ? "00:00:00;00" : info.Eom;
-                    duration = string.IsNullOrWhiteSpace(info.DurationTc) ? "00:00:00;00" : info.DurationTc;
-
-                    specCheck = GetDisplaySpecCheck(analysis);
-                    specErrorText = string.Join(Environment.NewLine, GetDisplayErrors(analysis));
-
-                    if (IsDisplaySpecError(analysis))
-                    {
-                        // 先印到 Output 視窗，方便你 debug
-                        System.Diagnostics.Debug.WriteLine($"[Spec Error] {file.FileName}");
-                        System.Diagnostics.Debug.WriteLine(specErrorText);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    specCheck = "Error";
-                    specErrorText = $"讀取 MediaInfo 失敗：{ex.Message}";
-
-                    System.Diagnostics.Debug.WriteLine($"[MediaInfo Error] {file.FileName}");
-                    System.Diagnostics.Debug.WriteLine(ex.Message);
-                }
-
-                int rowIndex = _gridFiles.Rows.Add(
-                    file.FileName,
-                    som,
-                    eom,
-                    duration,
-                    Path.GetExtension(file.FileName),
-                    specCheck
-                );
-
-                var row = _gridFiles.Rows[rowIndex];
-                row.Tag = file;
-
-                // 把錯誤原因放在格式檢查欄的 Tooltip
-                row.Cells[5].ToolTipText = specErrorText;
-
-                if (_analysisMemory.TryGetValue(file.FullPath, out var rowAnalysis) && IsDisplaySpecError(rowAnalysis))
-                {
-                    row.Cells[5].Style.ForeColor = Color.Red;
-                    row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
-                }
-                else if (_analysisMemory.TryGetValue(file.FullPath, out rowAnalysis) &&
-                         rowAnalysis.DecodeCheckStatus == "Checking")
-                {
-                    row.Cells[5].Style.ForeColor = Color.Orange;
-                    row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
-                }
-                else
-                {
-                    row.Cells[5].Style.ForeColor = Color.White;
-                    row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Regular);
+                    // 先印到 Output 視窗，方便你 debug
+                    System.Diagnostics.Debug.WriteLine($"[Spec Error] {file.FileName}");
+                    System.Diagnostics.Debug.WriteLine(specErrorText);
                 }
             }
+            catch (Exception ex)
+            {
+                specCheck = "Error";
+                specErrorText = $"讀取 MediaInfo 失敗：{ex.Message}";
+
+                System.Diagnostics.Debug.WriteLine($"[MediaInfo Error] {file.FileName}");
+                System.Diagnostics.Debug.WriteLine(ex.Message);
+            }
+
+            int rowIndex = _gridFiles.Rows.Add(
+                file.FileName,
+                som,
+                eom,
+                duration,
+                Path.GetExtension(file.FileName),
+                specCheck
+            );
+
+            var row = _gridFiles.Rows[rowIndex];
+            row.Tag = file;
+
+            // 把錯誤原因放在格式檢查欄的 Tooltip
+            row.Cells[5].ToolTipText = specErrorText;
+
+            if (_analysisMemory.TryGetValue(file.FullPath, out var rowAnalysis) && IsDisplaySpecError(rowAnalysis))
+            {
+                row.Cells[5].Style.ForeColor = Color.Red;
+                row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
+            }
+            else if (_analysisMemory.TryGetValue(file.FullPath, out rowAnalysis) &&
+                     rowAnalysis.DecodeCheckStatus == "Checking")
+            {
+                row.Cells[5].Style.ForeColor = Color.Orange;
+                row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
+            }
+            else
+            {
+                row.Cells[5].Style.ForeColor = Color.White;
+                row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Regular);
+            }
+
+            return rowIndex;
         }
 
         private double CalculateTotalSizeGB(List<MediaFile> files)
@@ -592,6 +651,82 @@ namespace MxfPlayer
             }
 
             return totalBytes / 1024.0 / 1024.0 / 1024.0;
+        }
+
+        private async Task LoadDroppedFilesAsync(string[] paths)
+        {
+            var droppedFiles = GetDroppedMediaFiles(paths);
+            if (droppedFiles.Count == 0)
+                return;
+
+            string? firstPath = null;
+
+            var filesToAdd = new List<MediaFile>();
+
+            foreach (var file in droppedFiles)
+            {
+                if (firstPath == null)
+                    firstPath = file.FullPath;
+
+                if (SelectFileInGrid(file.FullPath))
+                    continue;
+
+                filesToAdd.Add(file);
+            }
+
+            AddMediaFilesWithProgress(filesToAdd, "正在檢查拖放影片");
+
+            var allFiles = GetGridMediaFiles();
+            UpdateRightSummary(allFiles.Count, CalculateTotalSizeGB(allFiles));
+
+            if (firstPath == null || !SelectFileInGrid(firstPath))
+                return;
+
+            await Task.CompletedTask;
+        }
+
+        private List<MediaFile> GetDroppedMediaFiles(string[] paths)
+        {
+            var files = new List<MediaFile>();
+
+            foreach (var path in paths)
+            {
+                if (string.IsNullOrWhiteSpace(path))
+                    continue;
+
+                if (Directory.Exists(path))
+                {
+                    files.AddRange(_folder.LoadFolder(path));
+                    continue;
+                }
+
+                if (!File.Exists(path))
+                    continue;
+
+                files.Add(new MediaFile
+                {
+                    FileName = Path.GetFileName(path),
+                    FullPath = path
+                });
+            }
+
+            return files
+                .GroupBy(file => file.FullPath, StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .ToList();
+        }
+
+        private List<MediaFile> GetGridMediaFiles()
+        {
+            var files = new List<MediaFile>();
+
+            foreach (DataGridViewRow row in _gridFiles.Rows)
+            {
+                if (row.Tag is MediaFile file)
+                    files.Add(file);
+            }
+
+            return files;
         }
 
         private void UpdateTimeLabels(MediaInfoResult info)
@@ -672,12 +807,127 @@ namespace MxfPlayer
                 Renderer = new ToolStripProfessionalRenderer(new DarkColorTable())
             };
 
-            menu.Items.Add("檔案");
-            menu.Items.Add("播放");
-            menu.Items.Add("Tools");
+            var fileMenu = CreateTopMenu("File");
+            fileMenu.DropDownItems.Add(CreateMenuItem("Open Files...", MenuIconKind.FileOpen, async (_, _) => await OpenFilesFromMenuAsync()));
+            fileMenu.DropDownItems.Add(CreateMenuItem("Open Folder...", MenuIconKind.FolderOpen, OnSelectFolder));
+            fileMenu.DropDownItems.Add(new ToolStripSeparator());
+            fileMenu.DropDownItems.Add(CreateMenuItem("Quit", MenuIconKind.Power, (_, _) => Close()));
 
+            var playbackMenu = CreateTopMenu("Playback");
+            playbackMenu.DropDownItems.Add(CreateMenuItem("Play", MenuIconKind.Play, (_, _) => HandlePlay()));
+            playbackMenu.DropDownItems.Add(CreateMenuItem("Pause", MenuIconKind.Pause, (_, _) => HandlePause()));
+            playbackMenu.DropDownItems.Add(CreateMenuItem("Negative Jog", MenuIconKind.NegativeJog, (_, _) => HandleNegativeLog()));
+            playbackMenu.DropDownItems.Add(CreateMenuItem("Positive Jog", MenuIconKind.PositiveJog, (_, _) => HandlePositiveLog()));
+            playbackMenu.DropDownItems.Add(CreateMenuItem("Rewind", MenuIconKind.Rewind, (_, _) => HandleMoveBackForward()));
+            playbackMenu.DropDownItems.Add(CreateMenuItem("Fast Forward", MenuIconKind.FastForward, (_, _) => HandleMoveFastForward()));
+            playbackMenu.DropDownItems.Add(CreateMenuItem("Move First", MenuIconKind.MoveFirst, (_, _) => HandleMoveFirst()));
+            playbackMenu.DropDownItems.Add(CreateMenuItem("Move Last", MenuIconKind.MoveLast, (_, _) => HandleMoveLast()));
+
+            var toolsMenu = CreateTopMenu("Tools");
+
+            menu.Items.Add(fileMenu);
+            menu.Items.Add(playbackMenu);
+            menu.Items.Add(toolsMenu);
             MainMenuStrip = menu;
             Controls.Add(menu);
+        }
+
+        private ToolStripMenuItem CreateTopMenu(string text)
+        {
+            return new ToolStripMenuItem(text)
+            {
+                ForeColor = Color.White
+            };
+        }
+
+        private ToolStripMenuItem CreateMenuItem(string text, MenuIconKind iconKind, EventHandler onClick)
+        {
+            var item = new ToolStripMenuItem(text)
+            {
+                ForeColor = Color.White,
+                Image = CreateMenuIcon(iconKind),
+                ImageScaling = ToolStripItemImageScaling.None
+            };
+            item.Click += onClick;
+            return item;
+        }
+
+        private async Task OpenFilesFromMenuAsync()
+        {
+            using var dialog = new OpenFileDialog
+            {
+                Filter = "Media Files|*.mxf;*.MXF;*.mp4;*.MP4;*.mov;*.MOV;*.avi;*.AVI;*.mkv;*.MKV|All Files|*.*",
+                Multiselect = true,
+                Title = "Open Files"
+            };
+
+            if (dialog.ShowDialog() != DialogResult.OK)
+                return;
+
+            await LoadDroppedFilesAsync(dialog.FileNames);
+        }
+
+        private static Bitmap CreateMenuIcon(MenuIconKind kind)
+        {
+            var bitmap = new Bitmap(18, 18);
+            Color accent = kind == MenuIconKind.Play ? Color.FromArgb(235, 124, 24) : Color.FromArgb(185, 198, 202);
+
+            using var g = Graphics.FromImage(bitmap);
+            using var brush = new SolidBrush(accent);
+            using var pen = new Pen(accent, 2f);
+            g.Clear(Color.Transparent);
+
+            switch (kind)
+            {
+                case MenuIconKind.FileOpen:
+                    g.DrawRectangle(pen, 3, 4, 12, 12);
+                    g.DrawLine(pen, 3, 7, 7, 7);
+                    g.DrawLine(pen, 7, 7, 7, 4);
+                    break;
+                case MenuIconKind.FolderOpen:
+                    g.DrawLine(pen, 2, 6, 7, 6);
+                    g.DrawLine(pen, 7, 6, 9, 8);
+                    g.DrawLine(pen, 9, 8, 16, 8);
+                    g.DrawRectangle(pen, 2, 8, 14, 9);
+                    break;
+                case MenuIconKind.Power:
+                    g.DrawArc(pen, 3, 5, 12, 12, 35, 290);
+                    g.DrawLine(pen, 9, 2, 9, 9);
+                    break;
+                case MenuIconKind.Play:
+                    g.FillPolygon(brush, new[] { new Point(5, 3), new Point(15, 9), new Point(5, 15) });
+                    break;
+                case MenuIconKind.Pause:
+                    g.FillRectangle(brush, 5, 4, 4, 12);
+                    g.FillRectangle(brush, 11, 4, 4, 12);
+                    break;
+                case MenuIconKind.NegativeJog:
+                    g.FillPolygon(brush, new[] { new Point(13, 3), new Point(5, 9), new Point(13, 15) });
+                    g.FillRectangle(brush, 3, 3, 2, 12);
+                    break;
+                case MenuIconKind.PositiveJog:
+                    g.FillPolygon(brush, new[] { new Point(5, 3), new Point(13, 9), new Point(5, 15) });
+                    g.FillRectangle(brush, 15, 3, 2, 12);
+                    break;
+                case MenuIconKind.Rewind:
+                    g.FillPolygon(brush, new[] { new Point(9, 3), new Point(3, 9), new Point(9, 15) });
+                    g.FillPolygon(brush, new[] { new Point(16, 3), new Point(10, 9), new Point(16, 15) });
+                    break;
+                case MenuIconKind.FastForward:
+                    g.FillPolygon(brush, new[] { new Point(2, 3), new Point(8, 9), new Point(2, 15) });
+                    g.FillPolygon(brush, new[] { new Point(9, 3), new Point(15, 9), new Point(9, 15) });
+                    break;
+                case MenuIconKind.MoveFirst:
+                    g.FillRectangle(brush, 3, 3, 2, 12);
+                    g.FillPolygon(brush, new[] { new Point(15, 3), new Point(6, 9), new Point(15, 15) });
+                    break;
+                case MenuIconKind.MoveLast:
+                    g.FillPolygon(brush, new[] { new Point(3, 3), new Point(12, 9), new Point(3, 15) });
+                    g.FillRectangle(brush, 14, 3, 2, 12);
+                    break;
+            }
+
+            return bitmap;
         }
 
         private void BuildLeftPlayerArea(Control parent)
@@ -743,7 +993,7 @@ namespace MxfPlayer
             var layout = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
-                ColumnCount = 5,
+                ColumnCount = 6,
                 RowCount = 1,
                 BackColor = Color.FromArgb(58, 62, 67),
                 Margin = new Padding(0),
@@ -758,6 +1008,7 @@ namespace MxfPlayer
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 145)); // NOW
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 135)); // DUR
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150)); // REM
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 42));  // meters toggle
 
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
@@ -874,11 +1125,27 @@ namespace MxfPlayer
                 Margin = new Padding(0)
             };
 
+            _btnInlineMeters = new Button
+            {
+                Text = "",
+                Image = CreateInlineMetersIcon(Color.LimeGreen),
+                ImageAlign = ContentAlignment.MiddleCenter,
+                Dock = DockStyle.Fill,
+                FlatStyle = FlatStyle.Flat,
+                ForeColor = Color.LimeGreen,
+                BackColor = Color.FromArgb(72, 76, 82),
+                Margin = new Padding(6, 0, 0, 0),
+                TabStop = false
+            };
+            _btnInlineMeters.FlatAppearance.BorderColor = Color.FromArgb(95, 100, 106);
+            _btnInlineMeters.Click += (_, _) => ToggleInlineMeters();
+
             layout.Controls.Add(_lblCurrentFile, 0, 0);
             layout.Controls.Add(_lblStart, 1, 0);
             layout.Controls.Add(_lblNow, 2, 0);
             layout.Controls.Add(_lblDur, 3, 0);
             layout.Controls.Add(_lblRemain, 4, 0);
+            layout.Controls.Add(_btnInlineMeters, 5, 0);
 
             panel.Controls.Add(layout);
 
@@ -1207,7 +1474,9 @@ namespace MxfPlayer
             var btnMoveLast = CreatePlaybackButton("⏭", 36);
             var btnMinus10 = CreatePlaybackButton("-10", 60);
             var btnPlus10 = CreatePlaybackButton("+10", 60);
-            var btnMeters = CreatePlaybackButton("8 CH", 54);
+            var btnMeters = CreatePlaybackButton("", 40);
+            btnMeters.Image = CreateInlineMetersIcon(Color.LimeGreen);
+            btnMeters.ImageAlign = ContentAlignment.MiddleCenter;
 
             BindPlaybackEvents(
                 btnPlay,
@@ -1335,6 +1604,60 @@ namespace MxfPlayer
             _metersWindow.Show(this);
         }
 
+        private void ToggleInlineMeters()
+        {
+            if (_metersWindow != null)
+                _metersWindow.Close();
+
+            SetInlineMetersVisible(!_areInlineMetersVisible);
+        }
+
+        private void SetInlineMetersVisible(bool visible)
+        {
+            _areInlineMetersVisible = visible;
+
+            if (_videoAndMetersLayout.ColumnStyles.Count > 1)
+                _videoAndMetersLayout.ColumnStyles[1].Width = visible ? MainMetersWidth : 0;
+
+            if (visible)
+            {
+                if (_metersPanel.Parent != null)
+                    _metersPanel.Parent.Controls.Remove(_metersPanel);
+
+                if (!_videoAndMetersLayout.Controls.Contains(_metersPanel))
+                    _videoAndMetersLayout.Controls.Add(_metersPanel, 1, 0);
+
+                _metersPanel.Dock = DockStyle.Fill;
+            }
+            else if (_metersPanel.Parent == _videoAndMetersLayout)
+            {
+                _videoAndMetersLayout.Controls.Remove(_metersPanel);
+            }
+
+            if (_btnInlineMeters != null)
+            {
+                _btnInlineMeters.Image?.Dispose();
+                _btnInlineMeters.Image = CreateInlineMetersIcon(visible ? Color.LimeGreen : Color.FromArgb(120, 130, 120));
+                _btnInlineMeters.BackColor = visible ? Color.FromArgb(72, 76, 82) : Color.FromArgb(52, 56, 60);
+            }
+        }
+
+        private static Bitmap CreateInlineMetersIcon(Color color)
+        {
+            var bitmap = new Bitmap(20, 20);
+
+            using (var g = Graphics.FromImage(bitmap))
+            using (var brush = new SolidBrush(color))
+            {
+                g.Clear(Color.Transparent);
+                g.FillRectangle(brush, 4, 12, 3, 5);
+                g.FillRectangle(brush, 9, 7, 3, 10);
+                g.FillRectangle(brush, 14, 4, 3, 13);
+            }
+
+            return bitmap;
+        }
+
         private void DetachMetersPanel()
         {
             if (_metersPanel.Parent != null)
@@ -1342,6 +1665,8 @@ namespace MxfPlayer
 
             if (_videoAndMetersLayout.ColumnStyles.Count > 1)
                 _videoAndMetersLayout.ColumnStyles[1].Width = 0;
+
+            _areInlineMetersVisible = false;
         }
 
         private void RestoreMetersPanel()
@@ -1352,16 +1677,7 @@ namespace MxfPlayer
                 _metersWindow = null;
             }
 
-            if (_metersPanel.Parent != null)
-                _metersPanel.Parent.Controls.Remove(_metersPanel);
-
-            if (_videoAndMetersLayout.ColumnStyles.Count > 1)
-                _videoAndMetersLayout.ColumnStyles[1].Width = MainMetersWidth;
-
-            if (!_videoAndMetersLayout.Controls.Contains(_metersPanel))
-                _videoAndMetersLayout.Controls.Add(_metersPanel, 1, 0);
-
-            _metersPanel.Dock = DockStyle.Fill;
+            SetInlineMetersVisible(true);
         }
 
         private async void HandlePlay()
@@ -1608,6 +1924,8 @@ namespace MxfPlayer
 
         private void ReleaseNowTimecodeInputFocus()
         {
+            _isEditingNowTimecode = false;
+
             if (_lblNow == null || !_lblNow.Focused)
                 return;
 
@@ -2343,6 +2661,21 @@ namespace MxfPlayer
             public override Color ImageMarginGradientBegin => Color.FromArgb(58, 62, 67);
             public override Color ImageMarginGradientMiddle => Color.FromArgb(58, 62, 67);
             public override Color ImageMarginGradientEnd => Color.FromArgb(58, 62, 67);
+        }
+
+        private enum MenuIconKind
+        {
+            FileOpen,
+            FolderOpen,
+            Power,
+            Play,
+            Pause,
+            NegativeJog,
+            PositiveJog,
+            Rewind,
+            FastForward,
+            MoveFirst,
+            MoveLast
         }
 
         private class DoubleBufferedPanel : Panel
