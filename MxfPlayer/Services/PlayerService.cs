@@ -48,15 +48,19 @@ namespace MxfPlayer.Services
         private readonly Dictionary<long, Bitmap> _videoFrameCache = new();
         private const long VideoFrameCacheBudgetBytes = 256L * 1024L * 1024L;
         private const int MinCachedVideoFrames = 12;
-        private const int MaxCachedVideoFrames = 80; // Hard cap for decoded bitmaps kept in memory.
-        private int _maxCachedVideoFrames = 40;
-        private const int VideoPreloadLowWaterFrames = 30; // Start refilling when forward buffer drops below this.
-        private const int VideoPreloadHighWaterFrames = 80; // Pause background decode when this much is ready.
-        private const int ReverseVideoDecodeWindowFrames = 80; // Keep reverse decode close to the playhead.
-        private const int ReverseVideoPreloadLowWaterFrames = 40; // Refill reverse cache before the continuous window runs dry.
-        private const int VideoDecoderRestartGapFrames = 30; // Restart decoder if playback has outrun the cached window.
+        private const int MaxCachedVideoFrames = 64; // Hard cap for decoded bitmaps kept in memory.
+        private int _maxCachedVideoFrames = 48;
+        private const int VideoPreloadLowWaterFrames = 18; // Start refilling when the forward queue drops below this.
+        private const int VideoPreloadHighWaterFrames = 48; // Pause background decode before it becomes a large preload cache.
+        private const int ReverseVideoDecodeWindowFrames = 40; // Keep reverse decode close to the playhead.
+        private const int ReverseVideoPreloadLowWaterFrames = 20; // Refill reverse cache before the short window runs dry.
+        private const int VideoDecoderRestartGapFrames = 12; // Restart decoder if playback has outrun the cached window.
         private const int VideoDecoderRestartCooldownMs = 1500;
-        private const double VideoStallResumeBufferSeconds = 0.75;//播放中卡住後：等 0.75 秒
+        private const double VideoStallResumeBufferSeconds = 0.25;//播放中卡住後：等短 queue 即可恢復
+        private const int VideoInspectionKeepBehindFrames = 4;
+        private const int VideoInspectionKeepAheadFrames = 4;
+        private const int VideoInspectionDecodeBehindFrames = 4;
+        private const int VideoInspectionDecodeAheadFrames = 12;
         private long _currentFrameIndex;
         private long _totalVideoFrames;
         private CancellationTokenSource? _videoCts;
@@ -73,10 +77,18 @@ namespace MxfPlayer.Services
         private readonly Stopwatch _videoStatusLogClock = Stopwatch.StartNew();
         private readonly Stopwatch _videoDecodeRestartClock = Stopwatch.StartNew();
         private long _playbackStartFrame;
+        private long _lastVideoTargetFrame = -1;
+        private long _lastVideoPlaybackFrame = -1;
+        private long _videoStallTargetFrame = -1;
+        private long _videoStallCount;
+        private long _videoResumeCount;
+        private long _videoFrameDropCount;
         private const int AudioOutputLatencyMs = 100;
-        private const int ReverseAudioCacheWindowMs = 60000;
-        private const int ReverseAudioCacheRefreshBehindMs = 5000;
-        private const int ReverseAudioMinRefreshBehindMs = 15000;
+        private const int ReverseAudioCacheWindowMs = 12000;
+        private const int ReverseAudioMaxSourceWindowMs = 60000;
+        private const int ReverseAudioCacheRefreshBehindMs = 2000;
+        private const int ReverseAudioMinRefreshBehindMs = 3000;
+        private const int ReverseAudioKeepAheadMs = 1000;
         private const int ReverseAudioInitialPlaybackMs = 2000;
         private const int ReverseAudioInitialMaxSourceMs = 12000;
 
@@ -127,6 +139,25 @@ namespace MxfPlayer.Services
 
                 return continuousFrame >= 0 && _currentFrameIndex - continuousFrame >= requiredFrames;
             }
+        }
+
+        private bool HasInspectionVideoWindowLocked()
+        {
+            if (_videoFrameCache.Count == 0 || !_videoFrameCache.ContainsKey(_currentFrameIndex))
+                return false;
+
+            long startFrame = Math.Max(0, _currentFrameIndex - VideoInspectionDecodeBehindFrames);
+            long endFrame = _totalVideoFrames > 0
+                ? Math.Min(_totalVideoFrames - 1, _currentFrameIndex + VideoInspectionDecodeAheadFrames)
+                : _currentFrameIndex + VideoInspectionDecodeAheadFrames;
+
+            for (long frame = startFrame; frame <= endFrame; frame++)
+            {
+                if (!_videoFrameCache.ContainsKey(frame))
+                    return false;
+            }
+
+            return true;
         }
 
         private long GetContinuousCachedFrameLimit(long frameIndex, bool forward)
@@ -285,6 +316,7 @@ namespace MxfPlayer.Services
             lock (_lock)
             {
                 ClearVideoFrameCacheLocked();
+                ResetVideoDiagnosticsLocked();
                 _currentFrameIndex = Math.Clamp(startFrame, 0, Math.Max(0, _totalVideoFrames - 1));
                 _playbackStartFrame = _currentFrameIndex;
             }
@@ -415,6 +447,7 @@ namespace MxfPlayer.Services
 
                 provider.ResetWindow(cacheStartFrame, fps, pcm);
                 provider.SeekFrame(frameIndex, fps);
+                provider.TrimTailAfterFrame(frameIndex, fps, ReverseAudioKeepAheadMs);
             }, token);
 
             if (keepPlaying)
@@ -434,13 +467,14 @@ namespace MxfPlayer.Services
                 return;
 
             float effectiveRate = rate < 0 ? rate : -Math.Max(1.0f, Math.Abs(rate));
-            long reverseWindowFrames = FrameFromTimeMs((long)(ReverseAudioCacheWindowMs * Math.Abs(effectiveRate)), fps);
+            int sourceWindowMs = GetReverseAudioSourceWindowMs(effectiveRate);
+            long reverseWindowFrames = FrameFromTimeMs(sourceWindowMs, fps);
             long cacheStartFrame = Math.Max(0, frameIndex - reverseWindowFrames);
             var token = _audioCacheCts?.Token ?? CancellationToken.None;
             string path = CurrentPath;
             int generation = _audioCacheGeneration;
             int refreshBehindMs = GetReverseAudioRefreshBehindMs(effectiveRate);
-            int maxDurationMs = (int)Math.Ceiling(ReverseAudioCacheWindowMs * Math.Abs(effectiveRate) + refreshBehindMs);
+            int maxDurationMs = sourceWindowMs + refreshBehindMs;
 
             _audioCacheTask = Task.Run(() =>
             {
@@ -448,15 +482,24 @@ namespace MxfPlayer.Services
                 if (token.IsCancellationRequested || generation != _audioCacheGeneration)
                     return;
 
-                provider.PrependWindow(cacheStartFrame, fps, pcm);
+                if (provider.PrependWindow(cacheStartFrame, fps, pcm))
+                    provider.TrimTailAfterFrame(frameIndex, fps, ReverseAudioKeepAheadMs);
             }, token);
+        }
+
+        private int GetReverseAudioSourceWindowMs(float rate)
+        {
+            double multiplier = Math.Max(1.0, Math.Abs(rate));
+            int scaled = (int)Math.Ceiling(ReverseAudioCacheWindowMs * multiplier);
+            return Math.Clamp(scaled, ReverseAudioInitialPlaybackMs, ReverseAudioMaxSourceWindowMs);
         }
 
         private int GetReverseAudioRefreshBehindMs(float rate)
         {
             double multiplier = Math.Max(1.0, Math.Abs(rate));
             int scaled = (int)Math.Ceiling(ReverseAudioCacheRefreshBehindMs * multiplier * 2.0);
-            return Math.Max(ReverseAudioMinRefreshBehindMs, scaled);
+            int capped = Math.Min(GetReverseAudioSourceWindowMs(rate) / 2, scaled);
+            return Math.Max(ReverseAudioMinRefreshBehindMs, capped);
         }
 
         private int GetInitialReverseAudioBehindMs(float rate)
@@ -1025,18 +1068,20 @@ namespace MxfPlayer.Services
             {
                 long victimIndex = _videoRate >= 0
                     ? _videoFrameCache.Keys
-                        .Where(index => index < _currentFrameIndex - 3)
+                        .Where(index => index < _currentFrameIndex - VideoInspectionKeepBehindFrames)
                         .DefaultIfEmpty(long.MinValue)
                         .Min()
                     : _videoFrameCache.Keys
-                        .Where(index => index > _currentFrameIndex + 3)
+                        .Where(index => index > _currentFrameIndex + VideoInspectionKeepAheadFrames)
                         .DefaultIfEmpty(long.MinValue)
                         .Max();
 
                 if (victimIndex == long.MinValue)
                 {
                     victimIndex = _videoFrameCache.Keys
-                        .Where(index => Math.Abs(index - _currentFrameIndex) >= 3)
+                        .Where(index =>
+                            index < _currentFrameIndex - VideoInspectionKeepBehindFrames ||
+                            index > _currentFrameIndex + VideoInspectionKeepAheadFrames)
                         .OrderByDescending(index => Math.Abs(index - _currentFrameIndex))
                         .DefaultIfEmpty(long.MinValue)
                         .First();
@@ -1056,6 +1101,16 @@ namespace MxfPlayer.Services
                 frame.Dispose();
 
             _videoFrameCache.Clear();
+        }
+
+        private void ResetVideoDiagnosticsLocked()
+        {
+            _lastVideoTargetFrame = -1;
+            _lastVideoPlaybackFrame = -1;
+            _videoStallTargetFrame = -1;
+            _videoStallCount = 0;
+            _videoResumeCount = 0;
+            _videoFrameDropCount = 0;
         }
 
         private void InitFFmpeg(string path, float rate)
@@ -1561,9 +1616,19 @@ namespace MxfPlayer.Services
             else
                 targetFrame = Math.Max(0, _playbackStartFrame - framesToMove);
 
-            if (IsVideoFrameCached(targetFrame))
+            _lastVideoTargetFrame = targetFrame;
+
+            if (TryGetMonotonicPlaybackFrame(targetFrame, out long playbackFrame))
             {
-                _currentFrameIndex = targetFrame;
+                if (_lastVideoPlaybackFrame >= 0 && playbackFrame != _lastVideoPlaybackFrame)
+                {
+                    long skippedFrames = Math.Abs(playbackFrame - _lastVideoPlaybackFrame) - 1;
+                    if (skippedFrames > 0)
+                        _videoFrameDropCount += skippedFrames;
+                }
+
+                _currentFrameIndex = playbackFrame;
+                _lastVideoPlaybackFrame = playbackFrame;
             }
             else
             {
@@ -1579,10 +1644,46 @@ namespace MxfPlayer.Services
                 Pause();
         }
 
-        private bool IsVideoFrameCached(long frameIndex)
+        private bool TryGetMonotonicPlaybackFrame(long targetFrame, out long playbackFrame)
         {
             lock (_lock)
-                return _videoFrameCache.ContainsKey(frameIndex);
+            {
+                if (_videoFrameCache.ContainsKey(targetFrame))
+                {
+                    playbackFrame = targetFrame;
+                    return true;
+                }
+
+                if (_videoRate >= 0)
+                {
+                    long candidate = _videoFrameCache.Keys
+                        .Where(index => index > _currentFrameIndex && index <= targetFrame)
+                        .DefaultIfEmpty(-1)
+                        .Max();
+
+                    if (candidate >= 0)
+                    {
+                        playbackFrame = candidate;
+                        return true;
+                    }
+                }
+                else
+                {
+                    long candidate = _videoFrameCache.Keys
+                        .Where(index => index < _currentFrameIndex && index >= targetFrame)
+                        .DefaultIfEmpty(-1)
+                        .Min();
+
+                    if (candidate >= 0)
+                    {
+                        playbackFrame = candidate;
+                        return true;
+                    }
+                }
+            }
+
+            playbackFrame = targetFrame;
+            return false;
         }
 
         private void StallPlaybackForVideoBuffer()
@@ -1591,38 +1692,79 @@ namespace MxfPlayer.Services
                 return;
 
             _isPlaybackStalledForVideo = true;
-            _playbackStartFrame = _currentFrameIndex;
+            _videoStallTargetFrame = _lastVideoTargetFrame >= 0
+                ? _lastVideoTargetFrame
+                : _currentFrameIndex;
+            _videoStallCount++;
+            Debug.WriteLine(
+                $"[VideoStall] count={_videoStallCount} current={_currentFrameIndex} " +
+                $"target={_lastVideoTargetFrame} stallTarget={_videoStallTargetFrame} rate={_videoRate:0.###} " +
+                $"decodeTask={_videoDecodeTask?.Status.ToString() ?? "null"} generation={_videoDecodeGeneration}");
             _playbackClock.Stop();
             try { _waveOut?.Pause(); } catch { }
         }
 
         private void ResumePlaybackAfterVideoBufferIfReady()
         {
-            if (!HasVideoStallResumeBuffer())
+            if (!TryGetVideoStallResumeFrame(out long resumeFrame))
                 return;
 
-            SeekAudioByFrame(_currentFrameIndex, _audioFps);
-            WaitForAudioBuffer(_currentFrameIndex, _audioFps, _videoRate, 1000);
+            _currentFrameIndex = resumeFrame;
+            _lastVideoPlaybackFrame = resumeFrame;
+            SeekAudioByFrame(resumeFrame, _audioFps);
+            WaitForAudioBuffer(resumeFrame, _audioFps, _videoRate, 1000);
             PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
-            _playbackStartFrame = _currentFrameIndex;
+            _playbackStartFrame = resumeFrame;
             _playbackClock.Restart();
             _isPlaybackStalledForVideo = false;
+            _videoStallTargetFrame = -1;
+            _videoResumeCount++;
+            Debug.WriteLine(
+                $"[VideoResume] count={_videoResumeCount} resume={resumeFrame} current={_currentFrameIndex} " +
+                $"target={_lastVideoTargetFrame} rate={_videoRate:0.###} required={GetVideoStallResumeBufferFrames()}");
         }
 
-        private bool HasVideoStallResumeBuffer()
+        private bool TryGetVideoStallResumeFrame(out long resumeFrame)
         {
             lock (_lock)
             {
-                long continuousFrame = GetContinuousCachedFrameLimit(_currentFrameIndex, _videoRate >= 0);
-                if (continuousFrame < 0)
-                    return false;
-
                 int requiredFrames = GetVideoStallResumeBufferFrames();
-                if (_videoRate >= 0)
-                    return continuousFrame - _currentFrameIndex >= requiredFrames;
+                long anchorFrame = _videoStallTargetFrame >= 0
+                    ? ClampFrameIndex(_videoStallTargetFrame)
+                    : _currentFrameIndex;
 
-                return _currentFrameIndex - continuousFrame >= requiredFrames;
+                if (_videoRate >= 0)
+                {
+                    foreach (long candidate in _videoFrameCache.Keys
+                                 .Where(index => index >= anchorFrame)
+                                 .OrderBy(index => index))
+                    {
+                        long continuousFrame = GetContinuousCachedFrameLimit(candidate, forward: true);
+                        if (continuousFrame >= 0 && continuousFrame - candidate >= requiredFrames)
+                        {
+                            resumeFrame = candidate;
+                            return true;
+                        }
+                    }
+                }
+                else
+                {
+                    foreach (long candidate in _videoFrameCache.Keys
+                                 .Where(index => index <= anchorFrame)
+                                 .OrderByDescending(index => index))
+                    {
+                        long continuousFrame = GetContinuousCachedFrameLimit(candidate, forward: false);
+                        if (continuousFrame >= 0 && candidate - continuousFrame >= requiredFrames)
+                        {
+                            resumeFrame = candidate;
+                            return true;
+                        }
+                    }
+                }
             }
+
+            resumeFrame = -1;
+            return false;
         }
 
         private int GetVideoStallResumeBufferFrames()
@@ -1645,6 +1787,14 @@ namespace MxfPlayer.Services
             int cacheCount;
             long displayFrame;
             long continuousFrame = -1;
+            long targetFrame = _lastVideoTargetFrame;
+            long playbackFrame = _lastVideoPlaybackFrame;
+            long stallCount = _videoStallCount;
+            long resumeCount = _videoResumeCount;
+            long droppedFrames = _videoFrameDropCount;
+            int decodeGeneration = _videoDecodeGeneration;
+            bool isStalled = _isPlaybackStalledForVideo;
+            bool isPlaying = _isVideoPlaying;
             lock (_lock)
             {
                 currentFrame = _currentFrameIndex;
@@ -1664,12 +1814,21 @@ namespace MxfPlayer.Services
                 : -1;
             string taskStatus = _videoDecodeTask?.Status.ToString() ?? "null";
             bool taskCompleted = _videoDecodeTask?.IsCompleted ?? true;
+            string audioProvider = _videoRate < 0
+                ? (_slidingAudioProvider != null ? "sliding" : "none")
+                : (_fileAudioProvider != null ? "file" : "none");
+            long targetGap = targetFrame >= 0
+                ? (_videoRate >= 0 ? targetFrame - currentFrame : currentFrame - targetFrame)
+                : -1;
 
             Debug.WriteLine(
-                $"[VideoBuffer] current={currentFrame} display={displayFrame} " +
+                $"[VideoBuffer] playing={isPlaying} stalled={isStalled} current={currentFrame} " +
+                $"target={targetFrame} playback={playbackFrame} targetGap={targetGap} display={displayFrame} " +
                 $"cache={minCachedFrame}-{maxCachedFrame} ahead={cacheAhead} continuous={continuousAhead} " +
                 $"continuousEnd={continuousFrame} count={cacheCount} " +
-                $"decodeTask={taskStatus} completed={taskCompleted} rate={_videoRate:0.###}");
+                $"decodeTask={taskStatus} completed={taskCompleted} generation={decodeGeneration} " +
+                $"audio={audioProvider} stalls={stallCount} resumes={resumeCount} dropped={droppedFrames} " +
+                $"rate={_videoRate:0.###}");
         }
 
         public void SeekVideoByFrame(long frameIndex)
@@ -1689,6 +1848,10 @@ namespace MxfPlayer.Services
             long minCachedFrame = -1;
             long maxCachedFrame = -1;
             long continuousCachedFrame = -1;
+            bool inspectionMode = !_isVideoPlaying && !_isPlaybackStalledForVideo;
+            long decoderAnchorFrame = _isPlaybackStalledForVideo && _videoStallTargetFrame >= 0
+                ? ClampFrameIndex(_videoStallTargetFrame)
+                : _currentFrameIndex;
             bool restartLaggingDecoder = false;
             lock (_lock)
             {
@@ -1698,33 +1861,38 @@ namespace MxfPlayer.Services
                     maxCachedFrame = _videoFrameCache.Keys.Max();
                 }
 
-                if (!forceRestart && _videoFrameCache.ContainsKey(_currentFrameIndex))
+                if (!forceRestart && _videoFrameCache.ContainsKey(decoderAnchorFrame))
                 {
-                    continuousCachedFrame = GetContinuousCachedFrameLimit(_currentFrameIndex, _videoRate >= 0);
-                    if (_videoRate >= 0)
+                    if (inspectionMode && HasInspectionVideoWindowLocked())
+                        return;
+
+                    if (!inspectionMode)
                     {
-                        if (continuousCachedFrame >= 0 &&
-                            continuousCachedFrame - _currentFrameIndex > GetRequiredVideoBufferFramesForRate(_videoRate))
+                        continuousCachedFrame = GetContinuousCachedFrameLimit(decoderAnchorFrame, _videoRate >= 0);
+                        if (_videoRate >= 0)
+                        {
+                            if (continuousCachedFrame >= 0 &&
+                                continuousCachedFrame - decoderAnchorFrame > GetRequiredVideoBufferFramesForRate(_videoRate))
+                            {
+                                return;
+                            }
+                        }
+                        else if (continuousCachedFrame >= 0 &&
+                                 decoderAnchorFrame - continuousCachedFrame > GetReverseVideoPreloadLowWaterFrames())
                         {
                             return;
                         }
                     }
-                    else if (continuousCachedFrame >= 0 &&
-                             _currentFrameIndex - continuousCachedFrame > GetReverseVideoPreloadLowWaterFrames())
-                    {
-                        return;
-                    }
                 }
 
                 restartLaggingDecoder = _videoRate >= 0
-                    ? maxCachedFrame >= 0 && _currentFrameIndex > maxCachedFrame + VideoDecoderRestartGapFrames
-                    : continuousCachedFrame >= 0 && _currentFrameIndex < continuousCachedFrame - VideoDecoderRestartGapFrames;
+                    ? maxCachedFrame >= 0 && decoderAnchorFrame >= maxCachedFrame
+                    : minCachedFrame >= 0 && decoderAnchorFrame <= minCachedFrame;
             }
 
             if (!forceRestart && _videoDecodeTask != null && !_videoDecodeTask.IsCompleted)
             {
                 if (!restartLaggingDecoder ||
-                    Math.Abs(_videoRate) <= 1.0f ||
                     _videoDecodeRestartClock.ElapsedMilliseconds < VideoDecoderRestartCooldownMs)
                 {
                     return;
@@ -1743,16 +1911,23 @@ namespace MxfPlayer.Services
             _videoCts = new CancellationTokenSource();
             long startFrame;
             long? endFrameExclusive = null;
-            if (_videoRate < 0)
+            if (inspectionMode)
+            {
+                startFrame = Math.Max(0, decoderAnchorFrame - VideoInspectionDecodeBehindFrames);
+                endFrameExclusive = _totalVideoFrames > 0
+                    ? Math.Min(_totalVideoFrames, decoderAnchorFrame + VideoInspectionDecodeAheadFrames + 1)
+                    : decoderAnchorFrame + VideoInspectionDecodeAheadFrames + 1;
+            }
+            else if (_videoRate < 0)
             {
                 int reverseWindowFrames = Math.Min(ReverseVideoDecodeWindowFrames, GetMaxCachedVideoFramesForRate(_videoRate));
-                startFrame = Math.Max(0, _currentFrameIndex - reverseWindowFrames + 1);
-                endFrameExclusive = Math.Min(_totalVideoFrames, _currentFrameIndex + 1);
+                startFrame = Math.Max(0, decoderAnchorFrame - reverseWindowFrames + 1);
+                endFrameExclusive = Math.Min(_totalVideoFrames, decoderAnchorFrame + 1);
             }
             else
             {
-                startFrame = forceRestart || restartLaggingDecoder || maxCachedFrame < _currentFrameIndex
-                    ? _currentFrameIndex
+                startFrame = forceRestart || restartLaggingDecoder || maxCachedFrame < decoderAnchorFrame
+                    ? decoderAnchorFrame
                     : Math.Min(_totalVideoFrames - 1, maxCachedFrame + 1);
             }
             var token = _videoCts.Token;

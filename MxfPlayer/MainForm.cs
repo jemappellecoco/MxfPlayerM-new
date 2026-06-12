@@ -61,7 +61,6 @@ namespace MxfPlayer
         private const int MeterUpdateIntervalMs = 100;
         private const int TimelineUpdateIntervalMs = 100;
         private const int MainMetersWidth = 170;
-        private const int PlaybackPrebufferFrames = 120;
         private const int PlaybackPrebufferTimeoutMs = 30000;
         public MainForm()
         {
@@ -79,6 +78,7 @@ namespace MxfPlayer
             _playbackController = new PlaybackController(_player, _meterTimer, ResetMeters);
             this.FormClosing += (s, e) =>
             {
+                ClearDisplayedVideoFrame();
                 _player.Dispose();
             };
         }
@@ -388,7 +388,7 @@ namespace MxfPlayer
 
                         try
                         {
-                            _displayedVideoFrameIndex = -1;
+                            ClearDisplayedVideoFrame();
                             await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
                             await _player.WaitForVideoBufferAheadAsync(
                                 _player.CurrentFrameIndex,
@@ -409,7 +409,7 @@ namespace MxfPlayer
                 }
                 else
                 {
-                    _displayedVideoFrameIndex = -1;
+                    ClearDisplayedVideoFrame();
                     await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
                     await _player.WaitForVideoBufferAheadAsync(
                         _player.CurrentFrameIndex,
@@ -793,6 +793,16 @@ namespace MxfPlayer
             _displayedVideoFrame = nextFrame;
             _displayedVideoFrameIndex = snapshotFrameIndex;
             _videoView.Image = nextFrame;
+
+            previousFrame?.Dispose();
+        }
+
+        private void ClearDisplayedVideoFrame()
+        {
+            var previousFrame = _displayedVideoFrame;
+            _videoView.Image = null;
+            _displayedVideoFrame = null;
+            _displayedVideoFrameIndex = -1;
 
             previousFrame?.Dispose();
         }
@@ -1812,8 +1822,7 @@ namespace MxfPlayer
         }
         private int GetPlaybackPrebufferFrames(float rate)
         {
-            double multiplier = Math.Max(1.0, Math.Abs(rate));
-            return (int)Math.Ceiling(PlaybackPrebufferFrames * multiplier);
+            return _player.GetRequiredVideoBufferFramesForRate(rate);
         }
         private double GetFpsFromInfo(MediaInfoResult info)
         {

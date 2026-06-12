@@ -75,6 +75,34 @@ namespace MxfPlayer.Services
             }
         }
 
+        public void TrimTailAfterFrame(long frameIndex, double fps, int keepAheadMs)
+        {
+            if (fps <= 0) fps = 29.97;
+
+            lock (_lock)
+            {
+                long keepEndSample = FrameToSample(frameIndex, fps) +
+                    (_sampleRate * (long)Math.Max(0, keepAheadMs)) / 1000;
+                long keepSourceFrames = keepEndSample - _baseSampleIndex;
+                if (keepSourceFrames < 0)
+                {
+                    _pcmData.Clear();
+                    _baseSampleIndex = keepEndSample;
+                    _positionSampleIndex = keepEndSample;
+                    return;
+                }
+
+                long keepBytes = keepSourceFrames * _bytesPerSourceFrame;
+                if (keepBytes >= _pcmData.Count)
+                    return;
+
+                int removeStart = (int)Math.Max(0, keepBytes);
+                _pcmData.RemoveRange(removeStart, _pcmData.Count - removeStart);
+                if (_positionSampleIndex > keepEndSample)
+                    _positionSampleIndex = keepEndSample;
+            }
+        }
+
         public bool IsFrameDataAvailable(long frameIndex, double fps, int requiredAheadMs)
         {
             if (fps <= 0) fps = 29.97;
