@@ -156,6 +156,70 @@ namespace MxfPlayer.Services
             }
         }
 
+        public bool TryGetChannelPeaksAtFrame(long frameIndex, double fps, float[] peaks)
+        {
+            if (peaks.Length == 0)
+                return false;
+
+            Array.Clear(peaks, 0, peaks.Length);
+            if (frameIndex < 0) frameIndex = 0;
+            if (fps <= 0) fps = 29.97;
+
+            lock (_streamLock)
+            {
+                if (_disposed)
+                    return false;
+
+                long originalPosition = _fileStream.Position;
+                try
+                {
+                    long startSample = (long)Math.Round(frameIndex * _sampleRate / fps);
+                    long endSample = (long)Math.Round((frameIndex + 1) * _sampleRate / fps);
+                    long baseSampleIndex = (long)Math.Round(_baseTimeMs * _sampleRate / 1000.0);
+                    startSample -= baseSampleIndex;
+                    endSample -= baseSampleIndex;
+
+                    if (startSample < 0)
+                        return false;
+
+                    long sourceFrames = Math.Max(1, endSample - startSample);
+                    long pos = startSample * _channels * 2L;
+                    pos = (pos / (_channels * 2L)) * (_channels * 2L);
+                    if (pos < 0 || pos >= _fileStream.Length)
+                        return false;
+
+                    int bytesToRead = (int)Math.Min(sourceFrames * _channels * 2L, _fileStream.Length - pos);
+                    bytesToRead = (bytesToRead / (_channels * 2)) * (_channels * 2);
+                    if (bytesToRead <= 0)
+                        return false;
+
+                    byte[] rawBuffer = new byte[bytesToRead];
+                    _fileStream.Position = pos;
+                    int bytesRead = _fileStream.Read(rawBuffer, 0, rawBuffer.Length);
+                    int framesRead = bytesRead / (_channels * 2);
+                    int channelCount = Math.Min(peaks.Length, _channels);
+
+                    for (int frame = 0; frame < framesRead; frame++)
+                    {
+                        int frameOffset = frame * _channels * 2;
+                        for (int channel = 0; channel < channelCount; channel++)
+                        {
+                            int offset = frameOffset + (channel * 2);
+                            short sample = BitConverter.ToInt16(rawBuffer, offset);
+                            peaks[channel] = Math.Max(peaks[channel], GetInt16Peak(sample));
+                        }
+                    }
+
+                    return true;
+                }
+                finally
+                {
+                    if (!_disposed)
+                        _fileStream.Position = Math.Min(originalPosition, _fileStream.Length);
+                }
+            }
+        }
+
         public unsafe int Read(byte[] buffer, int offset, int count)
         {
             try

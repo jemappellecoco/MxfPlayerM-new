@@ -1302,11 +1302,14 @@ namespace MxfPlayer.Services
                 }
             }
 
-            if (_videoRate < 0 && _slidingAudioProvider != null)
-                return _slidingAudioProvider.GetChannelPeakAtFrame(frameIndex, _audioFps, channel);
-
-            if (_fileAudioProvider != null)
-                return _fileAudioProvider.GetChannelPeakAtFrame(frameIndex, _audioFps, channel);
+            if (TryCaptureProviderFrameAudioPeaks(frameIndex, _audioFps))
+            {
+                lock (_lastFrameAudioPeaksLock)
+                {
+                    if (channel >= 0 && channel < _lastFrameAudioPeaks.Length)
+                        return _lastFrameAudioPeaks[channel];
+                }
+            }
 
             const long windowMs = 120;
             float peak = 0f;
@@ -1472,6 +1475,25 @@ namespace MxfPlayer.Services
         private readonly float[] _lastFrameAudioPeaks = new float[8];
         private readonly object _lastFrameAudioPeaksLock = new();
         private long _lastFrameAudioPeakFrame = -1;
+        private bool TryCaptureProviderFrameAudioPeaks(long frameIndex, double fps)
+        {
+            float[] peaks = new float[_lastFrameAudioPeaks.Length];
+            bool captured = _videoRate < 0 && _slidingAudioProvider != null
+                ? _slidingAudioProvider.TryGetChannelPeaksAtFrame(frameIndex, fps, peaks)
+                : _fileAudioProvider != null && _fileAudioProvider.TryGetChannelPeaksAtFrame(frameIndex, fps, peaks);
+
+            if (!captured)
+                return false;
+
+            lock (_lastFrameAudioPeaksLock)
+            {
+                Array.Copy(peaks, _lastFrameAudioPeaks, _lastFrameAudioPeaks.Length);
+                _lastFrameAudioPeakFrame = frameIndex;
+            }
+
+            return true;
+        }
+
         private byte[] ExtractPcm(AVFrame* frame)
         {
             int channels = frame->ch_layout.nb_channels;
@@ -1834,11 +1856,44 @@ namespace MxfPlayer.Services
         public void SeekVideoByFrame(long frameIndex)
         {
             if (_totalVideoFrames <= 0) return;
-            _currentFrameIndex = ClampFrameIndex(frameIndex);
-            _playbackStartFrame = _currentFrameIndex;
+            SetPlaybackPositionFrame(ClampFrameIndex(frameIndex));
             EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
             if (_isVideoPlaying)
                 _playbackClock.Restart();
+        }
+
+        public void SeekPlaybackByFrame(long frameIndex, double fps, bool waitForPreviousAudioCache = false)
+        {
+            if (_totalVideoFrames <= 0) return;
+            if (fps <= 0) fps = CurrentFps;
+
+            long targetFrame = ClampFrameIndex(frameIndex);
+            _videoCts?.Cancel();
+            Interlocked.Increment(ref _videoDecodeGeneration);
+            lock (_lock)
+            {
+                ClearVideoFrameCacheLocked();
+                SetPlaybackPositionFrame(targetFrame);
+            }
+            EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
+            StartAudioCacheFromFrame(
+                targetFrame,
+                fps,
+                Math.Abs(_videoRate) > 0 ? _videoRate : 1.0f,
+                keepPlaying: false,
+                waitForPreviousAudioCache);
+            if (_isVideoPlaying)
+                _playbackClock.Restart();
+        }
+
+        private void SetPlaybackPositionFrame(long frameIndex)
+        {
+            _currentFrameIndex = frameIndex;
+            _playbackStartFrame = frameIndex;
+            _lastVideoTargetFrame = frameIndex;
+            _lastVideoPlaybackFrame = frameIndex;
+            _videoStallTargetFrame = -1;
+            _isPlaybackStalledForVideo = false;
         }
 
         private void EnsureVideoDecoderNearCurrentFrame(bool forceRestart = false)
@@ -2024,18 +2079,10 @@ namespace MxfPlayer.Services
 
         private void CaptureFrameAudioPeaks(long frameIndex, double fps)
         {
-            lock (_lastFrameAudioPeaksLock)
-            {
-                Array.Clear(_lastFrameAudioPeaks, 0, _lastFrameAudioPeaks.Length);
+            if (TryCaptureProviderFrameAudioPeaks(frameIndex, fps))
+                return;
 
-                if (_fileAudioProvider != null)
-                {
-                    for (int channel = 0; channel < _lastFrameAudioPeaks.Length; channel++)
-                        _lastFrameAudioPeaks[channel] = _fileAudioProvider.GetChannelPeakAtFrame(frameIndex, fps, channel);
-                }
-
-                _lastFrameAudioPeakFrame = frameIndex;
-            }
+            ClearFrameAudioPeaks();
         }
 
         private void ClearFrameAudioPeaks()

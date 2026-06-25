@@ -176,6 +176,42 @@ namespace MxfPlayer.Services
             }
         }
 
+        public bool TryGetChannelPeaksAtFrame(long frameIndex, double fps, float[] peaks)
+        {
+            if (peaks.Length == 0)
+                return false;
+
+            Array.Clear(peaks, 0, peaks.Length);
+            if (fps <= 0) fps = 29.97;
+
+            lock (_lock)
+            {
+                long startSample = FrameToSample(frameIndex, fps);
+                long endSample = FrameToSample(frameIndex + 1, fps);
+                long startFrame = startSample - _baseSampleIndex;
+                long endFrame = endSample - _baseSampleIndex;
+
+                if (startFrame < 0 || startFrame >= BufferedSourceFrames)
+                    return false;
+
+                endFrame = Math.Min(endFrame, BufferedSourceFrames);
+                int channelCount = Math.Min(peaks.Length, _channels);
+
+                for (long sourceFrame = startFrame; sourceFrame < endFrame; sourceFrame++)
+                {
+                    int frameOffset = (int)(sourceFrame * _bytesPerSourceFrame);
+                    for (int channel = 0; channel < channelCount; channel++)
+                    {
+                        int sourceOffset = frameOffset + (channel * 2);
+                        short sample = ReadInt16(sourceOffset);
+                        peaks[channel] = Math.Max(peaks[channel], GetInt16Peak(sample));
+                    }
+                }
+
+                return true;
+            }
+        }
+
         public int Read(byte[] buffer, int offset, int count)
         {
             lock (_lock)

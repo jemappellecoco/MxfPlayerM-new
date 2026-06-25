@@ -5,6 +5,7 @@ using System.Windows.Forms;
 using MxfPlayer.Models;
 using MxfPlayer.Services;
 using MxfPlayer.Controllers;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Threading.Tasks;
 using System.Globalization;
@@ -20,10 +21,12 @@ namespace MxfPlayer
         private readonly FolderService _folder = new();
         private readonly MediaInfoService _mediaInfo = new();
         private readonly MediaSpecService _mediaSpec = new();
-        private readonly Dictionary<string, MediaInfoResult> _mediaCache = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, CachedMediaAnalysis> _analysisMemory = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, MediaInfoResult> _mediaCache = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, CachedMediaAnalysis> _analysisMemory = new(StringComparer.OrdinalIgnoreCase);
         private readonly AudioMixerService _audioMixer = new();
         private readonly PlaybackController _playbackController;
+        private Dictionary<HotKeyAction, Keys> _hotKeyBindings = HotKeySettings.Load();
+        private CancellationTokenSource? _folderLoadCts;
         private Panel _timelineLabelsPanel = null!;
         private readonly Random _rnd = new();
         private PictureBox _videoView = null!;
@@ -46,6 +49,8 @@ namespace MxfPlayer
         private readonly List<CheckBox> _channelChecks = new();
         private TableLayoutPanel _videoAndMetersLayout = null!;
         private Control _metersPanel = null!;
+        private Panel? _meterScalePanel;
+        private Panel? _meterBarAreaPanel;
         private Form? _metersWindow;
         private bool _isStartingPlayback = false;
         private bool _isEditingNowTimecode = false;
@@ -57,11 +62,14 @@ namespace MxfPlayer
         private int _timelineUpdateElapsedMs = 0;
         private bool _isFrameStepping = false;
         private bool _isBoundarySeeking = false;
+        private int _pendingFrameStepDelta = 0;
         private bool _areInlineMetersVisible = true;
         private const int MeterUpdateIntervalMs = 100;
         private const int TimelineUpdateIntervalMs = 100;
         private const int MainMetersWidth = 170;
-        private const int PlaybackPrebufferTimeoutMs = 30000;
+        private const int MeterBarWidth = 10;
+        private static readonly double[] MeterDbLabels = { 0, -6, -12, -18, -24, -30, -36, -42, -48, -54, -60 };
+        private const int PlaybackStartupBufferTimeoutMs = 4000;
         public MainForm()
         {
             Text = "Offline xPlayer";
@@ -71,6 +79,7 @@ namespace MxfPlayer
             MinimumSize = new Size(1400, 820);
             BackColor = Color.FromArgb(45, 48, 52);
             ForeColor = Color.White;
+            KeyPreview = true;
 
             InitUI();
             ConfigureFileDrop(this);
@@ -150,35 +159,154 @@ namespace MxfPlayer
                     return true;
                 }
 
-                if (!_isEditingNowTimecode && focusedKeyCode == Keys.Left)
-                {
-                    StepFrameByKeyboard(-1);
+                if (ShouldHandleHotKey(keyData) && TryExecuteHotKey(keyData))
                     return true;
-                }
-
-                if (!_isEditingNowTimecode && focusedKeyCode == Keys.Right)
-                {
-                    StepFrameByKeyboard(1);
-                    return true;
-                }
 
                 return base.ProcessCmdKey(ref msg, keyData);
             }
 
-            Keys keyCode = keyData & Keys.KeyCode;
-            if (keyCode == Keys.Left)
-            {
-                StepFrameByKeyboard(-1);
+            if (ShouldHandleHotKey(keyData) && TryExecuteHotKey(keyData))
                 return true;
-            }
-
-            if (keyCode == Keys.Right)
-            {
-                StepFrameByKeyboard(1);
-                return true;
-            }
 
             return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        protected override bool ProcessKeyPreview(ref Message m)
+        {
+            const int wmKeyDown = 0x0100;
+            const int wmSysKeyDown = 0x0104;
+
+            if (m.Msg is wmKeyDown or wmSysKeyDown)
+            {
+                Keys keyData = (Keys)(int)m.WParam | ModifierKeys;
+                if (ShouldHandleHotKey(keyData) && TryExecuteHotKey(keyData))
+                    return true;
+            }
+
+            return base.ProcessKeyPreview(ref m);
+        }
+
+        private bool TryExecuteHotKey(Keys keyData)
+        {
+            Keys shortcut = HotKeySettings.Normalize(keyData);
+            foreach ((HotKeyAction action, Keys binding) in _hotKeyBindings)
+            {
+                if (binding != shortcut)
+                    continue;
+
+                ExecuteHotKeyAction(action);
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool ShouldHandleHotKey(Keys keyData)
+        {
+            if (_lblNow != null && _lblNow.Focused)
+                return !_isEditingNowTimecode;
+
+            return !IsPlainTextEntryKey(keyData);
+        }
+
+        private bool IsPlainTextEntryKey(Keys keyData)
+        {
+            if (ActiveControl is not TextBoxBase textBox || textBox == _lblNow)
+                return false;
+
+            Keys modifiers = keyData & (Keys.Control | Keys.Shift | Keys.Alt);
+            if (modifiers != Keys.None)
+                return false;
+
+            Keys keyCode = keyData & Keys.KeyCode;
+            return keyCode is >= Keys.A and <= Keys.Z
+                || keyCode is >= Keys.D0 and <= Keys.D9
+                || keyCode is Keys.Space
+                || keyCode is Keys.OemMinus
+                || keyCode is Keys.Oemplus
+                || keyCode is Keys.Oemcomma
+                || keyCode is Keys.OemPeriod
+                || keyCode is Keys.OemQuestion
+                || keyCode is Keys.OemSemicolon
+                || keyCode is Keys.OemQuotes
+                || keyCode is Keys.OemOpenBrackets
+                || keyCode is Keys.OemCloseBrackets
+                || keyCode is Keys.OemPipe
+                || keyCode is Keys.Oemtilde;
+        }
+
+        private void ExecuteHotKeyAction(HotKeyAction action)
+        {
+            switch (action)
+            {
+                case HotKeyAction.OpenFiles:
+                    _ = OpenFilesFromMenuAsync();
+                    break;
+                case HotKeyAction.OpenFolder:
+                    OnSelectFolder(this, EventArgs.Empty);
+                    break;
+                case HotKeyAction.Quit:
+                    Close();
+                    break;
+                case HotKeyAction.Play:
+                    HandlePlay();
+                    break;
+                case HotKeyAction.Pause:
+                    HandlePause();
+                    break;
+                case HotKeyAction.PlayPause:
+                    if (_meterTimer.Enabled)
+                        HandlePause();
+                    else
+                        HandlePlay();
+                    break;
+                case HotKeyAction.StepBackward:
+                    StepFrameByKeyboard(-1);
+                    break;
+                case HotKeyAction.StepForward:
+                    StepFrameByKeyboard(1);
+                    break;
+                case HotKeyAction.MoveFirst:
+                    HandleMoveFirst();
+                    break;
+                case HotKeyAction.MoveLast:
+                    HandleMoveLast();
+                    break;
+                case HotKeyAction.Rewind:
+                    HandleMoveBackForward();
+                    break;
+                case HotKeyAction.FastForward:
+                    HandleMoveFastForward();
+                    break;
+                case HotKeyAction.JumpBackward10:
+                    _ = HandleJump(-10);
+                    break;
+                case HotKeyAction.JumpForward10:
+                    _ = HandleJump(10);
+                    break;
+                case HotKeyAction.JumpBackward5:
+                    _ = HandleJump(-5);
+                    break;
+                case HotKeyAction.JumpForward5:
+                    _ = HandleJump(5);
+                    break;
+                case HotKeyAction.ToggleMetersWindow:
+                    ToggleMetersWindow();
+                    break;
+                case HotKeyAction.ToggleInlineMeters:
+                    ToggleInlineMeters();
+                    break;
+                case HotKeyAction.ToggleChannel1:
+                case HotKeyAction.ToggleChannel2:
+                case HotKeyAction.ToggleChannel3:
+                case HotKeyAction.ToggleChannel4:
+                case HotKeyAction.ToggleChannel5:
+                case HotKeyAction.ToggleChannel6:
+                case HotKeyAction.ToggleChannel7:
+                case HotKeyAction.ToggleChannel8:
+                    ToggleAudioChannel((int)action - (int)HotKeyAction.ToggleChannel1);
+                    break;
+            }
         }
 
         private void ShowMediaInfo(MediaInfoResult info, CachedMediaAnalysis? analysis = null)
@@ -331,6 +459,7 @@ namespace MxfPlayer
 
             _mediaCache[filePath] = info;
             _analysisMemory[filePath] = analysis;
+
             return analysis;
         }
 
@@ -390,15 +519,7 @@ namespace MxfPlayer
                         {
                             ClearDisplayedVideoFrame();
                             await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
-                            await _player.WaitForVideoBufferAheadAsync(
-                                _player.CurrentFrameIndex,
-                                GetPlaybackPrebufferFrames(1.0f),
-                                PlaybackPrebufferTimeoutMs);
-                            await _player.WaitForAudioBufferAsync(
-                                _player.CurrentFrameIndex,
-                                fps,
-                                1.0f,
-                                PlaybackPrebufferTimeoutMs);
+                            await WaitForPlaybackStartupBuffersAsync(fps, 1.0f);
                             UpdateVideoFrame();
                         }
                         finally
@@ -411,15 +532,7 @@ namespace MxfPlayer
                 {
                     ClearDisplayedVideoFrame();
                     await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
-                    await _player.WaitForVideoBufferAheadAsync(
-                        _player.CurrentFrameIndex,
-                        GetPlaybackPrebufferFrames(1.0f),
-                        PlaybackPrebufferTimeoutMs);
-                    await _player.WaitForAudioBufferAsync(
-                        _player.CurrentFrameIndex,
-                        fps,
-                        1.0f,
-                        PlaybackPrebufferTimeoutMs);
+                    await WaitForPlaybackStartupBuffersAsync(fps, 1.0f);
                     UpdateVideoFrame();
                 }
 
@@ -517,17 +630,79 @@ namespace MxfPlayer
             }
         }
      
-        private void LoadFolderToGrid(string folderPath)
+        private async Task LoadFolderToGridAsync(string folderPath, string? selectedPath = null)
         {
+            _folderLoadCts?.Cancel();
+            _folderLoadCts?.Dispose();
+
+            var loadCts = new CancellationTokenSource();
+            _folderLoadCts = loadCts;
+            CancellationToken token = loadCts.Token;
+
             _txtPath.Text = folderPath;
-
-            var files = _folder.LoadFolder(folderPath);
-            PopulateGrid(files, "正在檢查資料夾影片");
-
-            double totalGB = CalculateTotalSizeGB(files);
-            UpdateRightSummary(files.Count, totalGB);
+            _gridFiles.Rows.Clear();
             ClearSelectedMediaInfo();
+            UpdateRightSummary(0, 0);
+
+            using var loading = new LoadingForm(this, "");
+            loading.SetProgressMode(1);
+            loading.Show();
+            loading.Refresh();
+
+            IProgress<FolderLoadProgress> progress = new Progress<FolderLoadProgress>(progressValue =>
+            {
+                if (!loading.IsDisposed)
+                    loading.UpdateProgress("正在檢查資料夾影片", progressValue.FileName, progressValue.Current, progressValue.Total);
+            });
+
+            try
+            {
+                FolderLoadResult result = await Task.Run(
+                    () => BuildFolderLoadResult(folderPath, progress, token),
+                    token);
+
+                if (_folderLoadCts != loadCts || token.IsCancellationRequested)
+                    return;
+
+                PopulateGridRows(result.Rows);
+                UpdateRightSummary(result.Rows.Count, result.TotalGB);
+                ClearSelectedMediaInfo();
+
+                if (!string.IsNullOrWhiteSpace(selectedPath))
+                    SelectFileInGrid(selectedPath);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"載入資料夾失敗：{ex.Message}");
+            }
+            finally
+            {
+                if (!loading.IsDisposed)
+                    loading.Close();
+
+                if (_folderLoadCts == loadCts)
+                    _folderLoadCts = null;
+
+                loadCts.Dispose();
+            }
         }
+
+        private sealed record FolderLoadProgress(int Current, int Total, string FileName);
+
+        private sealed record FolderLoadResult(List<MediaFileRowData> Rows, double TotalGB);
+
+        private sealed record MediaFileRowData(
+            MediaFile File,
+            string Som,
+            string Eom,
+            string Duration,
+            string SpecCheck,
+            string SpecErrorText,
+            bool IsSpecError,
+            bool IsDecodeChecking);
 
         private void ClearSelectedMediaInfo()
         {
@@ -543,6 +718,52 @@ namespace MxfPlayer
             _gridFiles.Rows.Clear();
 
             AddMediaFilesWithProgress(files, loadingTitle);
+        }
+
+        private void PopulateGridRows(List<MediaFileRowData> rows)
+        {
+            _gridFiles.SuspendLayout();
+            try
+            {
+                _gridFiles.Rows.Clear();
+                foreach (MediaFileRowData rowData in rows)
+                    AddMediaFileRow(rowData);
+            }
+            finally
+            {
+                _gridFiles.ResumeLayout();
+            }
+        }
+
+        private FolderLoadResult BuildFolderLoadResult(
+            string folderPath,
+            IProgress<FolderLoadProgress>? progress,
+            CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+
+            List<MediaFile> files = _folder.LoadFolder(folderPath);
+            var rows = new List<MediaFileRowData>(files.Count);
+            long totalBytes = 0;
+
+            for (int i = 0; i < files.Count; i++)
+            {
+                token.ThrowIfCancellationRequested();
+
+                MediaFile file = files[i];
+                progress?.Report(new FolderLoadProgress(i + 1, files.Count, file.FileName));
+                rows.Add(BuildMediaFileRowData(file));
+
+                try
+                {
+                    totalBytes += new FileInfo(file.FullPath).Length;
+                }
+                catch
+                {
+                }
+            }
+
+            return new FolderLoadResult(rows, totalBytes / 1024.0 / 1024.0 / 1024.0);
         }
 
         private void AddMediaFilesWithProgress(List<MediaFile> files, string loadingTitle)
@@ -564,13 +785,64 @@ namespace MxfPlayer
             }
         }
 
+        private async Task AddMediaFilesWithProgressAsync(List<MediaFile> files, string loadingTitle)
+        {
+            if (files.Count == 0)
+                return;
+
+            using var loading = new LoadingForm(this, "");
+            loading.SetProgressMode(files.Count);
+            loading.Show();
+            loading.Refresh();
+
+            IProgress<FolderLoadProgress> progress = new Progress<FolderLoadProgress>(progressValue =>
+            {
+                if (!loading.IsDisposed)
+                    loading.UpdateProgress(loadingTitle, progressValue.FileName, progressValue.Current, progressValue.Total);
+            });
+
+            List<MediaFileRowData> rows = await Task.Run(() =>
+            {
+                var rowData = new List<MediaFileRowData>(files.Count);
+                for (int i = 0; i < files.Count; i++)
+                {
+                    MediaFile file = files[i];
+                    progress.Report(new FolderLoadProgress(i + 1, files.Count, file.FileName));
+                    rowData.Add(BuildMediaFileRowData(file));
+                }
+
+                return rowData;
+            });
+
+            if (!loading.IsDisposed)
+                loading.Close();
+
+            _gridFiles.SuspendLayout();
+            try
+            {
+                foreach (MediaFileRowData rowData in rows)
+                    AddMediaFileRow(rowData);
+            }
+            finally
+            {
+                _gridFiles.ResumeLayout();
+            }
+        }
+
         private int AddMediaFileRow(MediaFile file)
+        {
+            return AddMediaFileRow(BuildMediaFileRowData(file));
+        }
+
+        private MediaFileRowData BuildMediaFileRowData(MediaFile file)
         {
             string som = "00:00:00;00";
             string eom = "00:00:00;00";
             string duration = "00:00:00;00";
             string specCheck = "Error";
             string specErrorText = "";
+            bool isSpecError = false;
+            bool isDecodeChecking = false;
 
             try
             {
@@ -583,8 +855,10 @@ namespace MxfPlayer
 
                 specCheck = GetDisplaySpecCheck(analysis);
                 specErrorText = string.Join(Environment.NewLine, GetDisplayErrors(analysis));
+                isSpecError = IsDisplaySpecError(analysis);
+                isDecodeChecking = analysis.DecodeCheckStatus == "Checking";
 
-                if (IsDisplaySpecError(analysis))
+                if (isSpecError)
                 {
                     // 先印到 Output 視窗，方便你 debug
                     System.Diagnostics.Debug.WriteLine($"[Spec Error] {file.FileName}");
@@ -600,28 +874,32 @@ namespace MxfPlayer
                 System.Diagnostics.Debug.WriteLine(ex.Message);
             }
 
+            return new MediaFileRowData(file, som, eom, duration, specCheck, specErrorText, isSpecError, isDecodeChecking);
+        }
+
+        private int AddMediaFileRow(MediaFileRowData rowData)
+        {
             int rowIndex = _gridFiles.Rows.Add(
-                file.FileName,
-                som,
-                eom,
-                duration,
-                Path.GetExtension(file.FileName),
-                specCheck
+                rowData.File.FileName,
+                rowData.Som,
+                rowData.Eom,
+                rowData.Duration,
+                Path.GetExtension(rowData.File.FileName),
+                rowData.SpecCheck
             );
 
             var row = _gridFiles.Rows[rowIndex];
-            row.Tag = file;
+            row.Tag = rowData.File;
 
             // 把錯誤原因放在格式檢查欄的 Tooltip
-            row.Cells[5].ToolTipText = specErrorText;
+            row.Cells[5].ToolTipText = rowData.SpecErrorText;
 
-            if (_analysisMemory.TryGetValue(file.FullPath, out var rowAnalysis) && IsDisplaySpecError(rowAnalysis))
+            if (rowData.IsSpecError)
             {
                 row.Cells[5].Style.ForeColor = Color.Red;
                 row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
             }
-            else if (_analysisMemory.TryGetValue(file.FullPath, out rowAnalysis) &&
-                     rowAnalysis.DecodeCheckStatus == "Checking")
+            else if (rowData.IsDecodeChecking)
             {
                 row.Cells[5].Style.ForeColor = Color.Orange;
                 row.Cells[5].Style.Font = new Font(_gridFiles.Font, FontStyle.Bold);
@@ -655,7 +933,7 @@ namespace MxfPlayer
 
         private async Task LoadDroppedFilesAsync(string[] paths)
         {
-            var droppedFiles = GetDroppedMediaFiles(paths);
+            var droppedFiles = await Task.Run(() => GetDroppedMediaFiles(paths));
             if (droppedFiles.Count == 0)
                 return;
 
@@ -674,7 +952,7 @@ namespace MxfPlayer
                 filesToAdd.Add(file);
             }
 
-            AddMediaFilesWithProgress(filesToAdd, "正在檢查拖放影片");
+            await AddMediaFilesWithProgressAsync(filesToAdd, "正在檢查拖放影片");
 
             var allFiles = GetGridMediaFiles();
             UpdateRightSummary(allFiles.Count, CalculateTotalSizeGB(allFiles));
@@ -834,6 +1112,7 @@ namespace MxfPlayer
             playbackMenu.DropDownItems.Add(CreateMenuItem("Move Last", MenuIconKind.MoveLast, (_, _) => HandleMoveLast()));
 
             var toolsMenu = CreateTopMenu("Tools");
+            toolsMenu.DropDownItems.Add(CreateMenuItem("HotKey...", MenuIconKind.Keyboard, OnHotKeyMenuClicked));
 
             menu.Items.Add(fileMenu);
             menu.Items.Add(playbackMenu);
@@ -875,6 +1154,17 @@ namespace MxfPlayer
                 return;
 
             await LoadDroppedFilesAsync(dialog.FileNames);
+        }
+
+        private void OnHotKeyMenuClicked(object? sender, EventArgs e)
+        {
+            using var dialog = new HotKeySettingsForm(_hotKeyBindings);
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            _hotKeyBindings = HotKeySettings.CloneBindings(dialog.Bindings);
+            HotKeySettings.Save(_hotKeyBindings);
+            _hotKeyBindings = HotKeySettings.Load();
         }
 
         private static Bitmap CreateMenuIcon(MenuIconKind kind)
@@ -934,6 +1224,17 @@ namespace MxfPlayer
                 case MenuIconKind.MoveLast:
                     g.FillPolygon(brush, new[] { new Point(3, 3), new Point(12, 9), new Point(3, 15) });
                     g.FillRectangle(brush, 14, 3, 2, 12);
+                    break;
+                case MenuIconKind.Keyboard:
+                    g.DrawRectangle(pen, 2, 5, 14, 9);
+                    using (var keyBrush = new SolidBrush(accent))
+                    {
+                        for (int y = 8; y <= 11; y += 3)
+                        {
+                            for (int x = 5; x <= 13; x += 4)
+                                g.FillRectangle(keyBrush, x, y, 1, 1);
+                        }
+                    }
                     break;
             }
 
@@ -1175,13 +1476,21 @@ namespace MxfPlayer
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 2,
-                RowCount = 1,
+                RowCount = 2,
                 Margin = new Padding(0),
                 Padding = new Padding(0)
             };
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 46));  
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             host.Controls.Add(root);
+
+            root.Controls.Add(new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.FromArgb(58, 62, 67)
+            }, 0, 0);
 
            
             var scalePanel = new Panel
@@ -1189,54 +1498,28 @@ namespace MxfPlayer
                 Dock = DockStyle.Fill,
                 BackColor = Color.FromArgb(58, 62, 67)
             };
-            root.Controls.Add(scalePanel, 0, 0);
-
-            double[] dbLabels = { 0, -6, -12, -18, -24, -30, -36, -42, -48, -54, -60 };
+            _meterScalePanel = scalePanel;
+            root.Controls.Add(scalePanel, 0, 1);
 
             scalePanel.Resize += (_, _) =>
             {
-                scalePanel.Controls.Clear();
-
-                int h = scalePanel.ClientSize.Height;
-                if (h <= 0) return;
-
-                _meterAreaHeight = Math.Max(12, h - 4);
-
-                foreach (double db in dbLabels)
-                {
-                    int y = _meterScale.DbToY(db, _meterAreaHeight);
-
-                    var lbl = new Label
-                    {
-                        Text = db.ToString("0"),
-                        ForeColor = Color.White,
-                        AutoSize = false,
-                        Width = 42,
-                        Height = 16,
-                        Left = 0,
-                        Top = Math.Max(0, Math.Min(y - 8, h - 16)),
-                        TextAlign = ContentAlignment.MiddleRight,
-                        Font = new Font("Segoe UI", 8f, FontStyle.Regular)
-                    };
-
-                    scalePanel.Controls.Add(lbl);
-                }
-
-                var dbUnit = new Label
-                {
-                    Text = "dB",
-                    ForeColor = Color.White,
-                    AutoSize = false,
-                    Width = 42,
-                    Height = 16,
-                    Left = 0,
-                    Top = h - 18,
-                    TextAlign = ContentAlignment.MiddleRight,
-                    Font = new Font("Segoe UI", 8f, FontStyle.Regular)
-                };
-
-                scalePanel.Controls.Add(dbUnit);
+                _meterAreaHeight = GetCurrentMeterAreaHeight();
+                RefreshMeterScaleLabels();
             };
+            var checksLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 8,
+                RowCount = 1,
+                Margin = new Padding(0),
+                Padding = new Padding(0)
+            };
+
+            for (int i = 0; i < 8; i++)
+                checksLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 12.5f));
+
+            root.Controls.Add(checksLayout, 1, 0);
+
             var barsLayout = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
@@ -1249,25 +1532,26 @@ namespace MxfPlayer
             for (int i = 0; i < 8; i++)
                 barsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 12.5f));
 
-            root.Controls.Add(barsLayout, 1, 0);
+            _meterBarAreaPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.FromArgb(58, 62, 67)
+            };
+            _meterBarAreaPanel.Controls.Add(barsLayout);
+            _meterBarAreaPanel.Resize += (_, _) =>
+            {
+                _meterAreaHeight = GetCurrentMeterAreaHeight();
+                RefreshMeterScaleLabels();
+                RescaleMeterBarHeights();
+            };
+
+            root.Controls.Add(_meterBarAreaPanel, 1, 1);
 
             _meterBars.Clear();
             _channelChecks.Clear();
 
             for (int i = 0; i < 8; i++)
             {
-          
-                var channelLayout = new TableLayoutPanel
-                {
-                    Dock = DockStyle.Fill,
-                    RowCount = 2,
-                    ColumnCount = 1,
-                    Margin = new Padding(1, 0, 1, 0),
-                    Padding = new Padding(0)
-                };
-                channelLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
-                channelLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
                 var chk = new CheckBox
                 {
                     Text = $"CH{i + 1}",
@@ -1284,14 +1568,23 @@ namespace MxfPlayer
                 chk.CheckedChanged += (_, _) => OnChannelCheckChanged(channelIndex, chk.Checked);
 
                 _channelChecks.Add(chk);
+                checksLayout.Controls.Add(chk, i, 0);
+
+                var barSlot = new Panel
+                {
+                    Dock = DockStyle.Fill,
+                    Margin = new Padding(0),
+                    Padding = new Padding(0),
+                    BackColor = Color.FromArgb(58, 62, 67)
+                };
 
                 var barBack = new Panel
                 {
-                    Dock = DockStyle.Fill,
-                    Margin = new Padding(1, 0, 1, 0),
+                    Width = MeterBarWidth,
                     BackColor = Color.FromArgb(36, 39, 43),
                     BorderStyle = BorderStyle.FixedSingle
                 };
+                barSlot.Resize += (_, _) => LayoutMeterBarBack(barSlot, barBack);
 
                 var barFill = new Panel
                 {
@@ -1301,16 +1594,86 @@ namespace MxfPlayer
                 };
 
                 barBack.Controls.Add(barFill);
+                barSlot.Controls.Add(barBack);
+                LayoutMeterBarBack(barSlot, barBack);
                 _meterBars.Add(barFill);
 
-                channelLayout.Controls.Add(chk, 0, 0);
-                channelLayout.Controls.Add(barBack, 0, 1);
-
-                barsLayout.Controls.Add(channelLayout, i, 0);
+                barsLayout.Controls.Add(barSlot, i, 0);
             }
 
             return host;
         }
+
+        private static void LayoutMeterBarBack(Control slot, Control barBack)
+        {
+            int width = Math.Min(MeterBarWidth, Math.Max(1, slot.ClientSize.Width));
+            barBack.Width = width;
+            barBack.Left = Math.Max(0, (slot.ClientSize.Width - width) / 2);
+            barBack.Top = 0;
+            barBack.Height = Math.Max(0, slot.ClientSize.Height);
+        }
+
+        private int GetCurrentMeterAreaHeight()
+        {
+            if (_meterBarAreaPanel != null && _meterBarAreaPanel.ClientSize.Height > 0)
+                return Math.Max(12, _meterBarAreaPanel.ClientSize.Height - 4);
+
+            if (_meterScalePanel != null && _meterScalePanel.ClientSize.Height > 0)
+                return Math.Max(12, _meterScalePanel.ClientSize.Height - 4);
+
+            return Math.Max(12, _meterAreaHeight);
+        }
+
+        private void RefreshMeterScaleLabels()
+        {
+            var scalePanel = _meterScalePanel;
+            if (scalePanel == null || scalePanel.ClientSize.Height <= 0)
+                return;
+
+            scalePanel.SuspendLayout();
+            scalePanel.Controls.Clear();
+
+            int meterHeight = GetCurrentMeterAreaHeight();
+            _meterAreaHeight = meterHeight;
+            int panelHeight = scalePanel.ClientSize.Height;
+
+            foreach (double db in MeterDbLabels)
+            {
+                int y = _meterScale.DbToY(db, meterHeight);
+
+                var lbl = new Label
+                {
+                    Text = db.ToString("0"),
+                    ForeColor = Color.White,
+                    AutoSize = false,
+                    Width = 42,
+                    Height = 16,
+                    Left = 0,
+                    Top = Math.Max(0, Math.Min(y - 8, panelHeight - 16)),
+                    TextAlign = ContentAlignment.MiddleRight,
+                    Font = new Font("Segoe UI", 8f, FontStyle.Regular)
+                };
+
+                scalePanel.Controls.Add(lbl);
+            }
+
+            var dbUnit = new Label
+            {
+                Text = "dB",
+                ForeColor = Color.White,
+                AutoSize = false,
+                Width = 42,
+                Height = 16,
+                Left = 0,
+                Top = Math.Max(0, panelHeight - 18),
+                TextAlign = ContentAlignment.MiddleRight,
+                Font = new Font("Segoe UI", 8f, FontStyle.Regular)
+            };
+
+            scalePanel.Controls.Add(dbUnit);
+            scalePanel.ResumeLayout();
+        }
+
         private async void OnChannelCheckChanged(int channelIndex, bool isChecked)
         {
             // 1. ?湔?桃蔗
@@ -1319,6 +1682,14 @@ namespace MxfPlayer
 
             Console.WriteLine($"[Audio] Channel {channelIndex + 1} changed.");
             await Task.CompletedTask;
+        }
+
+        private void ToggleAudioChannel(int channelIndex)
+        {
+            if (channelIndex < 0 || channelIndex >= _channelChecks.Count)
+                return;
+
+            _channelChecks[channelIndex].Checked = !_channelChecks[channelIndex].Checked;
         }
    
         private Button CreatePlaybackButton(string text, int width, bool highlight = false)
@@ -1788,22 +2159,39 @@ namespace MxfPlayer
 
         private async Task StepFrameAsync(int direction)
         {
-            if (_isFrameStepping)
+            if (direction == 0)
                 return;
+
+            if (_isFrameStepping)
+            {
+                _pendingFrameStepDelta += Math.Sign(direction);
+                return;
+            }
 
             double fps = GetSelectedFps();
             if (fps <= 0)
                 return;
 
             _isFrameStepping = true;
+            int currentDirection = Math.Sign(direction);
             try
             {
-                if (direction < 0)
-                    _playbackController.NegativeLog(fps);
-                else
-                    await _playbackController.PositiveLog(fps);
+                while (currentDirection != 0)
+                {
+                    if (currentDirection < 0)
+                        _playbackController.NegativeLog(fps);
+                    else
+                        await _playbackController.PositiveLog(fps);
 
-                await RefreshAfterFrameStepAsync(fps);
+                    await RefreshAfterFrameStepAsync(fps);
+
+                    currentDirection = 0;
+                    if (_pendingFrameStepDelta != 0)
+                    {
+                        currentDirection = Math.Sign(_pendingFrameStepDelta);
+                        _pendingFrameStepDelta -= currentDirection;
+                    }
+                }
             }
             finally
             {
@@ -1820,9 +2208,23 @@ namespace MxfPlayer
             await _player.PlayFrameAudioAsync(_player.CurrentFrameIndex, fps);
             UpdateMetersFromAudioLevel();
         }
-        private int GetPlaybackPrebufferFrames(float rate)
+        private async Task WaitForPlaybackStartupBuffersAsync(double fps, float rate)
         {
-            return _player.GetRequiredVideoBufferFramesForRate(rate);
+            long frameIndex = _player.CurrentFrameIndex;
+            int startupFrames = _player.GetRequiredVideoBufferFramesForRate(rate);
+
+            Task videoReady = _player.WaitForVideoBufferAheadAsync(
+                frameIndex,
+                startupFrames,
+                PlaybackStartupBufferTimeoutMs);
+
+            Task audioReady = _player.WaitForAudioBufferAsync(
+                frameIndex,
+                fps,
+                rate,
+                PlaybackStartupBufferTimeoutMs);
+
+            await Task.WhenAll(videoReady, audioReady);
         }
         private double GetFpsFromInfo(MediaInfoResult info)
         {
@@ -1912,8 +2314,7 @@ namespace MxfPlayer
             {
                 bool wasPlaying = _meterTimer.Enabled;
                 _playbackController.Pause();
-                _player.SeekVideoByFrame(targetFrame);
-                _player.SeekAudioByFrame(targetFrame, fps);
+                _player.SeekPlaybackByFrame(targetFrame, fps);
                 _displayedVideoFrameIndex = -1;
                 await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 3000);
                 UpdateVideoFrame();
@@ -2169,15 +2570,15 @@ namespace MxfPlayer
                 _txtInfo.Text = $"讀取 MediaInfo 失敗: {ex.Message}";
             }
         }
-        private void OnSelectFolder(object? sender, EventArgs e)
+        private async void OnSelectFolder(object? sender, EventArgs e)
         {
             using var dialog = new FolderBrowserDialog();
             if (dialog.ShowDialog() != DialogResult.OK) return;
 
-            LoadFolderToGrid(dialog.SelectedPath);
+            await LoadFolderToGridAsync(dialog.SelectedPath);
         }
 
-        private void OnRefreshFolder(object? sender, EventArgs e)
+        private async void OnRefreshFolder(object? sender, EventArgs e)
         {
             string folderPath = _txtPath.Text.Trim();
             if (string.IsNullOrWhiteSpace(folderPath) || !Directory.Exists(folderPath))
@@ -2189,15 +2590,7 @@ namespace MxfPlayer
 
             try
             {
-                var files = _folder.LoadFolder(folderPath);
-                PopulateGrid(files);
-
-                double totalGB = CalculateTotalSizeGB(files);
-                UpdateRightSummary(files.Count, totalGB);
-                ClearSelectedMediaInfo();
-
-                if (!string.IsNullOrWhiteSpace(selectedPath))
-                    SelectFileInGrid(selectedPath);
+                await LoadFolderToGridAsync(folderPath, selectedPath);
             }
             catch (Exception ex)
             {
@@ -2272,14 +2665,12 @@ namespace MxfPlayer
 
         private void UpdateMetersFromAudioLevel()
         {
-            int meterHeight = _meterAreaHeight;
-
-            if (meterHeight <= 0 && _meterBars.Count > 0 && _meterBars[0].Parent != null)
-                meterHeight = Math.Max(12, _meterBars[0].Parent.ClientSize.Height - 4);
+            int meterHeight = GetCurrentMeterAreaHeight();
 
             if (meterHeight <= 0)
                 return;
 
+            _meterAreaHeight = meterHeight;
             long currentMs = _playbackController.GetCurrentTime();
 
             for (int i = 0; i < _meterBars.Count; i++)
@@ -2292,19 +2683,51 @@ namespace MxfPlayer
             }
         }
 
-        private void ResetMeters()
+        private void ApplyMeterBarHeights(float level)
         {
+            int meterHeight = GetCurrentMeterAreaHeight();
+            if (meterHeight <= 0)
+                return;
+
+            _meterAreaHeight = meterHeight;
+            int height = _meterScale.LevelToBarHeight(level, meterHeight);
+
             foreach (var bar in _meterBars)
             {
-                bar.Height = 8;
+                if (bar.Parent != null)
+                    bar.Height = height;
             }
         }
 
-        private bool _isSeeking = false; // ?啣?銝?蝳行?璅?
+        private void RescaleMeterBarHeights()
+        {
+            int previousHeight = Math.Max(1, _meterAreaHeight);
+            int meterHeight = GetCurrentMeterAreaHeight();
+            if (meterHeight <= 0)
+                return;
+
+            foreach (var bar in _meterBars)
+            {
+                if (bar.Parent == null)
+                    continue;
+
+                double ratio = Math.Clamp(bar.Height / (double)previousHeight, 0.0, 1.0);
+                bar.Height = Math.Max(AudioMeterScaleService.MinBarHeight, (int)Math.Round(meterHeight * ratio));
+            }
+
+            _meterAreaHeight = meterHeight;
+        }
+
+        private void ResetMeters()
+        {
+            ApplyMeterBarHeights(0);
+        }
+
+        private bool _isSeeking = false; 
         private long _rewindAnchorTime = -1;
         private void UpdateTimelineFromPlayer()
         {
-            // ?湔?嚗??迤?冽?啜迤?冽???銝??歲頧?瘝???蝯?銝??脖?
+            
             if (_isDraggingTimeline || _isUpdatingTimeline || _isSeeking) return;
 
             float rate = _playbackController.CurrentRate;
@@ -2684,7 +3107,8 @@ namespace MxfPlayer
             Rewind,
             FastForward,
             MoveFirst,
-            MoveLast
+            MoveLast,
+            Keyboard
         }
 
         private class DoubleBufferedPanel : Panel

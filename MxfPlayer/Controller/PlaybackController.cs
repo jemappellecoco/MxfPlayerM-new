@@ -23,8 +23,7 @@ namespace MxfPlayer.Controllers
         {
             if (fps <= 0) return;
 
-            _player.SeekVideoByFrame(0);
-            _player.SeekAudioByFrame(0, fps, waitForPreviousCache: false);
+            _player.SeekPlaybackByFrame(0, fps);
             await Task.CompletedTask;
         }
 
@@ -35,8 +34,7 @@ namespace MxfPlayer.Controllers
 
             long frame = _player.LastFrameIndex;
 
-            _player.SeekVideoByFrame(frame);
-            _player.SeekAudioByFrame(frame, fps, waitForPreviousCache: false);
+            _player.SeekPlaybackByFrame(frame, fps);
 
             await Task.CompletedTask;
         }
@@ -93,8 +91,7 @@ namespace MxfPlayer.Controllers
             if (targetFrame < 0) targetFrame = 0;
             if (targetFrame > totalFrames) targetFrame = totalFrames;
 
-            _player.SeekVideoByFrame(targetFrame);
-            _player.SeekAudioByFrame(targetFrame, fps);
+            _player.SeekPlaybackByFrame(targetFrame, fps);
         }
 
         public async Task Jump(int seconds, double fps)
@@ -110,8 +107,7 @@ namespace MxfPlayer.Controllers
             if (length > 0 && targetFrame > totalFrames)
                 targetFrame = totalFrames;
 
-            _player.SeekVideoByFrame(targetFrame);
-            _player.SeekAudioByFrame(targetFrame, fps);
+            _player.SeekPlaybackByFrame(targetFrame, fps);
 
             await Task.CompletedTask;
         }
