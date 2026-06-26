@@ -24,6 +24,7 @@ namespace MxfPlayer
         private readonly Dictionary<string, CachedMediaAnalysis> _analysisMemory = new(StringComparer.OrdinalIgnoreCase);
         private readonly AudioMixerService _audioMixer = new();
         private readonly PlaybackController _playbackController;
+        private Dictionary<HotKeyAction, Keys> _hotKeyBindings = HotKeySettings.Load();
         private Panel _timelineLabelsPanel = null!;
         private readonly Random _rnd = new();
         private PictureBox _videoView = null!;
@@ -57,6 +58,7 @@ namespace MxfPlayer
         private int _timelineUpdateElapsedMs = 0;
         private bool _isFrameStepping = false;
         private bool _isBoundarySeeking = false;
+        private int _pendingFrameStepDelta = 0;
         private bool _areInlineMetersVisible = true;
         private const int MeterUpdateIntervalMs = 100;
         private const int TimelineUpdateIntervalMs = 100;
@@ -72,6 +74,7 @@ namespace MxfPlayer
             MinimumSize = new Size(1400, 820);
             BackColor = Color.FromArgb(45, 48, 52);
             ForeColor = Color.White;
+            KeyPreview = true;
 
             InitUI();
             ConfigureFileDrop(this);
@@ -150,35 +153,154 @@ namespace MxfPlayer
                     return true;
                 }
 
-                if (!_isEditingNowTimecode && focusedKeyCode == Keys.Left)
-                {
-                    StepFrameByKeyboard(-1);
+                if (ShouldHandleHotKey(keyData) && TryExecuteHotKey(keyData))
                     return true;
-                }
-
-                if (!_isEditingNowTimecode && focusedKeyCode == Keys.Right)
-                {
-                    StepFrameByKeyboard(1);
-                    return true;
-                }
 
                 return base.ProcessCmdKey(ref msg, keyData);
             }
 
-            Keys keyCode = keyData & Keys.KeyCode;
-            if (keyCode == Keys.Left)
-            {
-                StepFrameByKeyboard(-1);
+            if (ShouldHandleHotKey(keyData) && TryExecuteHotKey(keyData))
                 return true;
-            }
-
-            if (keyCode == Keys.Right)
-            {
-                StepFrameByKeyboard(1);
-                return true;
-            }
 
             return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        protected override bool ProcessKeyPreview(ref Message m)
+        {
+            const int wmKeyDown = 0x0100;
+            const int wmSysKeyDown = 0x0104;
+
+            if (m.Msg is wmKeyDown or wmSysKeyDown)
+            {
+                Keys keyData = (Keys)(int)m.WParam | ModifierKeys;
+                if (ShouldHandleHotKey(keyData) && TryExecuteHotKey(keyData))
+                    return true;
+            }
+
+            return base.ProcessKeyPreview(ref m);
+        }
+
+        private bool TryExecuteHotKey(Keys keyData)
+        {
+            Keys shortcut = HotKeySettings.Normalize(keyData);
+            foreach ((HotKeyAction action, Keys binding) in _hotKeyBindings)
+            {
+                if (binding != shortcut)
+                    continue;
+
+                ExecuteHotKeyAction(action);
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool ShouldHandleHotKey(Keys keyData)
+        {
+            if (_lblNow != null && _lblNow.Focused)
+                return !_isEditingNowTimecode;
+
+            return !IsPlainTextEntryKey(keyData);
+        }
+
+        private bool IsPlainTextEntryKey(Keys keyData)
+        {
+            if (ActiveControl is not TextBoxBase textBox || textBox == _lblNow)
+                return false;
+
+            Keys modifiers = keyData & (Keys.Control | Keys.Shift | Keys.Alt);
+            if (modifiers != Keys.None)
+                return false;
+
+            Keys keyCode = keyData & Keys.KeyCode;
+            return keyCode is >= Keys.A and <= Keys.Z
+                || keyCode is >= Keys.D0 and <= Keys.D9
+                || keyCode is Keys.Space
+                || keyCode is Keys.OemMinus
+                || keyCode is Keys.Oemplus
+                || keyCode is Keys.Oemcomma
+                || keyCode is Keys.OemPeriod
+                || keyCode is Keys.OemQuestion
+                || keyCode is Keys.OemSemicolon
+                || keyCode is Keys.OemQuotes
+                || keyCode is Keys.OemOpenBrackets
+                || keyCode is Keys.OemCloseBrackets
+                || keyCode is Keys.OemPipe
+                || keyCode is Keys.Oemtilde;
+        }
+
+        private void ExecuteHotKeyAction(HotKeyAction action)
+        {
+            switch (action)
+            {
+                case HotKeyAction.OpenFiles:
+                    _ = OpenFilesFromMenuAsync();
+                    break;
+                case HotKeyAction.OpenFolder:
+                    OnSelectFolder(this, EventArgs.Empty);
+                    break;
+                case HotKeyAction.Quit:
+                    Close();
+                    break;
+                case HotKeyAction.Play:
+                    HandlePlay();
+                    break;
+                case HotKeyAction.Pause:
+                    HandlePause();
+                    break;
+                case HotKeyAction.PlayPause:
+                    if (_meterTimer.Enabled)
+                        HandlePause();
+                    else
+                        HandlePlay();
+                    break;
+                case HotKeyAction.StepBackward:
+                    StepFrameByKeyboard(-1);
+                    break;
+                case HotKeyAction.StepForward:
+                    StepFrameByKeyboard(1);
+                    break;
+                case HotKeyAction.MoveFirst:
+                    HandleMoveFirst();
+                    break;
+                case HotKeyAction.MoveLast:
+                    HandleMoveLast();
+                    break;
+                case HotKeyAction.Rewind:
+                    HandleMoveBackForward();
+                    break;
+                case HotKeyAction.FastForward:
+                    HandleMoveFastForward();
+                    break;
+                case HotKeyAction.JumpBackward10:
+                    _ = HandleJump(-10);
+                    break;
+                case HotKeyAction.JumpForward10:
+                    _ = HandleJump(10);
+                    break;
+                case HotKeyAction.JumpBackward5:
+                    _ = HandleJump(-5);
+                    break;
+                case HotKeyAction.JumpForward5:
+                    _ = HandleJump(5);
+                    break;
+                case HotKeyAction.ToggleMetersWindow:
+                    ToggleMetersWindow();
+                    break;
+                case HotKeyAction.ToggleInlineMeters:
+                    ToggleInlineMeters();
+                    break;
+                case HotKeyAction.ToggleChannel1:
+                case HotKeyAction.ToggleChannel2:
+                case HotKeyAction.ToggleChannel3:
+                case HotKeyAction.ToggleChannel4:
+                case HotKeyAction.ToggleChannel5:
+                case HotKeyAction.ToggleChannel6:
+                case HotKeyAction.ToggleChannel7:
+                case HotKeyAction.ToggleChannel8:
+                    ToggleAudioChannel((int)action - (int)HotKeyAction.ToggleChannel1);
+                    break;
+            }
         }
 
         private void ShowMediaInfo(MediaInfoResult info, CachedMediaAnalysis? analysis = null)
@@ -824,6 +946,7 @@ namespace MxfPlayer
             playbackMenu.DropDownItems.Add(CreateMenuItem("Move Last", MenuIconKind.MoveLast, (_, _) => HandleMoveLast()));
 
             var toolsMenu = CreateTopMenu("Tools");
+            toolsMenu.DropDownItems.Add(CreateMenuItem("HotKey...", MenuIconKind.Keyboard, OnHotKeyMenuClicked));
 
             menu.Items.Add(fileMenu);
             menu.Items.Add(playbackMenu);
@@ -925,9 +1048,31 @@ namespace MxfPlayer
                     g.FillPolygon(brush, new[] { new Point(3, 3), new Point(12, 9), new Point(3, 15) });
                     g.FillRectangle(brush, 14, 3, 2, 12);
                     break;
+                case MenuIconKind.Keyboard:
+                    g.DrawRectangle(pen, 2, 5, 14, 9);
+                    using (var keyBrush = new SolidBrush(accent))
+                    {
+                        for (int y = 8; y <= 11; y += 3)
+                        {
+                            for (int x = 5; x <= 13; x += 4)
+                                g.FillRectangle(keyBrush, x, y, 1, 1);
+                        }
+                    }
+                    break;
             }
 
             return bitmap;
+        }
+
+        private void OnHotKeyMenuClicked(object? sender, EventArgs e)
+        {
+            using var dialog = new HotKeySettingsForm(_hotKeyBindings);
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+                return;
+
+            _hotKeyBindings = HotKeySettings.CloneBindings(dialog.Bindings);
+            HotKeySettings.Save(_hotKeyBindings);
+            _hotKeyBindings = HotKeySettings.Load();
         }
 
         private void BuildLeftPlayerArea(Control parent)
@@ -1309,6 +1454,14 @@ namespace MxfPlayer
 
             Console.WriteLine($"[Audio] Channel {channelIndex + 1} changed.");
             await Task.CompletedTask;
+        }
+
+        private void ToggleAudioChannel(int channelIndex)
+        {
+            if (channelIndex < 0 || channelIndex >= _channelChecks.Count)
+                return;
+
+            _channelChecks[channelIndex].Checked = !_channelChecks[channelIndex].Checked;
         }
    
         private Button CreatePlaybackButton(string text, int width, bool highlight = false)
@@ -1778,22 +1931,39 @@ namespace MxfPlayer
 
         private async Task StepFrameAsync(int direction)
         {
-            if (_isFrameStepping)
+            if (direction == 0)
                 return;
+
+            if (_isFrameStepping)
+            {
+                _pendingFrameStepDelta += Math.Sign(direction);
+                return;
+            }
 
             double fps = GetSelectedFps();
             if (fps <= 0)
                 return;
 
             _isFrameStepping = true;
+            int currentDirection = Math.Sign(direction);
             try
             {
-                if (direction < 0)
-                    _playbackController.NegativeLog(fps);
-                else
-                    await _playbackController.PositiveLog(fps);
+                while (currentDirection != 0)
+                {
+                    if (currentDirection < 0)
+                        _playbackController.NegativeLog(fps);
+                    else
+                        await _playbackController.PositiveLog(fps);
 
-                await RefreshAfterFrameStepAsync(fps);
+                    await RefreshAfterFrameStepAsync(fps);
+
+                    currentDirection = 0;
+                    if (_pendingFrameStepDelta != 0)
+                    {
+                        currentDirection = Math.Sign(_pendingFrameStepDelta);
+                        _pendingFrameStepDelta -= currentDirection;
+                    }
+                }
             }
             finally
             {
@@ -2675,7 +2845,8 @@ namespace MxfPlayer
             Rewind,
             FastForward,
             MoveFirst,
-            MoveLast
+            MoveLast,
+            Keyboard
         }
 
         private class DoubleBufferedPanel : Panel

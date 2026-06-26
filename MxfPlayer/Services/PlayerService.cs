@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Diagnostics;
@@ -15,11 +14,6 @@ using System.Drawing.Imaging;
 
 namespace MxfPlayer.Services
 {
-    public class ConfigModel
-    {
-        public string FFmpegPath { get; set; } = "";
-    }
-
     public unsafe class PlayerService : IDisposable
     {
         private bool _filterReady = false; 
@@ -246,14 +240,9 @@ namespace MxfPlayer.Services
         {
             try
             {
-                string jsonPath = Path.Combine(AppContext.BaseDirectory, "config.json");
-                if (File.Exists(jsonPath))
-                {
-                    var json = File.ReadAllText(jsonPath);
-                    var config = JsonSerializer.Deserialize<ConfigModel>(json);
-                    if (!string.IsNullOrEmpty(config?.FFmpegPath))
-                        ffmpeg.RootPath = config.FFmpegPath;
-                }
+                var config = AppConfigService.Load();
+                if (!string.IsNullOrWhiteSpace(config.FFmpegPath))
+                    ffmpeg.RootPath = config.FFmpegPath;
             }
             catch { }
         }

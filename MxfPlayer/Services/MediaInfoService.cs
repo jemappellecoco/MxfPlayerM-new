@@ -8,10 +8,18 @@ namespace MxfPlayer.Services
 {
     public class MediaInfoService
     {
-        private readonly string _mediaInfoPath = @"C:\Tools\MediaInfo_CLI\MediaInfo.exe";
+        private readonly string _mediaInfoPath;
+
+        public MediaInfoService()
+        {
+            _mediaInfoPath = AppConfigService.Load().MediaInfoPath;
+        }
 
         public MediaInfoResult GetInfo(string filePath)
         {
+            if (string.IsNullOrWhiteSpace(_mediaInfoPath))
+                throw new FileNotFoundException("MediaInfoPath 未設定，請在 config.json 設定 MediaInfo.exe 路徑");
+
             if (!File.Exists(_mediaInfoPath))
                 throw new FileNotFoundException("找不到 MediaInfo.exe", _mediaInfoPath);
 

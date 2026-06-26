@@ -194,7 +194,7 @@ namespace MxfPlayer.Services
 
         private void AddDecodeIntegrityErrors(string filePath, MediaSpecCheckResult result, CancellationToken token = default)
         {
-            string ffmpegPath = @"C:\ffmpeg-7.1.1-essentials_build\bin\ffmpeg.exe";
+            string ffmpegPath = ResolveFfmpegExePath(AppConfigService.Load().FFmpegPath);
 
             Debug.WriteLine("[DecodeCheck] start: " + filePath);
 
@@ -212,7 +212,9 @@ namespace MxfPlayer.Services
 
             if (!File.Exists(ffmpegPath))
             {
-                result.Errors.Add($"找不到 FFmpeg：{ffmpegPath}");
+                result.Errors.Add(string.IsNullOrWhiteSpace(ffmpegPath)
+                    ? "FFmpegPath 未設定，請在 config.json 設定 FFmpeg bin 目錄或 ffmpeg.exe 路徑"
+                    : $"找不到 FFmpeg：{ffmpegPath}");
                 return;
             }
 
@@ -277,6 +279,18 @@ namespace MxfPlayer.Services
             {
                 result.Errors.Add("檢查影片完整性時發生錯誤：" + ex.Message);
             }
+        }
+
+        private string ResolveFfmpegExePath(string configuredPath)
+        {
+            if (string.IsNullOrWhiteSpace(configuredPath))
+                return "";
+
+            string trimmedPath = configuredPath.Trim();
+            if (string.Equals(Path.GetFileName(trimmedPath), "ffmpeg.exe", StringComparison.OrdinalIgnoreCase))
+                return trimmedPath;
+
+            return Path.Combine(trimmedPath, "ffmpeg.exe");
         }
 
         private string SimplifyFfmpegError(string error)
