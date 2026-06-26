@@ -1,4 +1,4 @@
 {
-  "FFmpegPath": "C:\\Tools\\ffmpeg-8.1-full_build-shared\\bin",
-  "MediaInfoPath": "C:\\Tools\\MediaInfo_CLI\\MediaInfo.exe"
+  "FFmpegPath": "C:\\ffmpeg\\bin",
+  "MediaInfoPath": "C:\\Program Files\\MediaInfo\\MediaInfo.exe"
 }

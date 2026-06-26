@@ -62,6 +62,7 @@ namespace MxfPlayer.Services
         private int _audioCacheGeneration;
         private bool _isVideoPlaying;
         private bool _isPlaybackStalledForVideo;
+        private string? _ffmpegRuntimeError;
         private float _videoRate = 1.0f;
         private readonly Stopwatch _playbackClock = new();
         private readonly Stopwatch _videoStatusLogClock = Stopwatch.StartNew();
@@ -243,16 +244,42 @@ namespace MxfPlayer.Services
                 var config = AppConfigService.Load();
                 if (!string.IsNullOrWhiteSpace(config.FFmpegPath))
                     ffmpeg.RootPath = config.FFmpegPath;
+
+                ValidateFFmpegRuntime();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _ffmpegRuntimeError = "FFmpeg 初始化失敗：" + ex.Message;
+            }
         }
 
         public Task StartAudioBridge(string path, int audioCount, long startTimeMs = 0, float rate = 1.0f, double fps = 0, int sampleRate = 48000)
         {
+            if (!string.IsNullOrWhiteSpace(_ffmpegRuntimeError))
+                throw new InvalidOperationException(_ffmpegRuntimeError);
+
             fps = fps > 0 ? fps : CurrentFps;
 
             LoadForBufferedPlayback(path, audioCount, startTimeMs, rate, fps, sampleRate);
             return WaitForFrameBufferAsync(FrameFromTimeMs(startTimeMs, fps), 3000);
+        }
+
+        private void ValidateFFmpegRuntime()
+        {
+            int avCodecMajor = GetFFmpegMajorVersion(ffmpeg.avcodec_version());
+            int avFormatMajor = GetFFmpegMajorVersion(ffmpeg.avformat_version());
+            int avUtilMajor = GetFFmpegMajorVersion(ffmpeg.avutil_version());
+
+            if (avCodecMajor < 60 || avFormatMajor < 60 || avUtilMajor < 58)
+            {
+                _ffmpegRuntimeError =
+                    $"FFmpeg 版本太舊，無法播放。目前載入的是 libavcodec {avCodecMajor}, libavformat {avFormatMajor}, libavutil {avUtilMajor}；請改用 FFmpeg 8.x shared/full build，config 的 FFmpegPath 要指到 bin 資料夾。";
+            }
+        }
+
+        private int GetFFmpegMajorVersion(uint version)
+        {
+            return (int)(version >> 16);
         }
 
 
@@ -1125,16 +1152,25 @@ namespace MxfPlayer.Services
                     int streamIdx = _audioStreamIndices[i];
                     var ctx = _audioDecoders[streamIdx].Ptr;
 
-                    byte[] layoutName = new byte[64];
-                    fixed (byte* pLayout = layoutName)
-                    
-                        ffmpeg.av_channel_layout_describe(&ctx->ch_layout, pLayout, (ulong)layoutName.Length);
+                    string sampleFormat = ffmpeg.av_get_sample_fmt_name(ctx->sample_fmt) ?? "";
+                    string channelLayout = GetAudioChannelLayout(ctx);
+                    if (ctx->sample_rate <= 0 || string.IsNullOrWhiteSpace(sampleFormat) || string.IsNullOrWhiteSpace(channelLayout))
+                    {
+                        System.Diagnostics.Debug.WriteLine("[FFmpeg Filter Error] Audio stream has incomplete format information.");
+                        return;
+                    }
 
-                    string args = $"sample_rate={ctx->sample_rate}:sample_fmt={ffmpeg.av_get_sample_fmt_name(ctx->sample_fmt)}:channel_layout={System.Text.Encoding.UTF8.GetString(layoutName).TrimEnd('\0')}";
+                    string args = $"sample_rate={ctx->sample_rate}:sample_fmt={sampleFormat}:channel_layout={channelLayout}";
 
                     AVFilterContext* srcCtx;
                     string name = $"in{i}";
-                    ffmpeg.avfilter_graph_create_filter(&srcCtx, abuffer, name, args, null, _filterGraph);
+                    int createRet = ffmpeg.avfilter_graph_create_filter(&srcCtx, abuffer, name, args, null, _filterGraph);
+                    if (createRet < 0 || srcCtx == null)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"[FFmpeg Filter Error] Failed to create audio source filter: {GetFfmpegError(createRet)}");
+                        return;
+                    }
+
                     _srcContexts[i] = srcCtx;
 
                     var currOut = ffmpeg.avfilter_inout_alloc();
@@ -1147,7 +1183,13 @@ namespace MxfPlayer.Services
 
                 AVFilter* abuffersink = ffmpeg.avfilter_get_by_name("abuffersink");
                 AVFilterContext* sinkCtx = null;
-                ffmpeg.avfilter_graph_create_filter(&sinkCtx, abuffersink, "out", null, null, _filterGraph);
+                int sinkRet = ffmpeg.avfilter_graph_create_filter(&sinkCtx, abuffersink, "out", null, null, _filterGraph);
+                if (sinkRet < 0 || sinkCtx == null)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[FFmpeg Filter Error] Failed to create audio sink filter: {GetFfmpegError(sinkRet)}");
+                    return;
+                }
+
                 _sinkContext = sinkCtx;
 
                 AVSampleFormat[] fmts = { AVSampleFormat.AV_SAMPLE_FMT_S16, AVSampleFormat.AV_SAMPLE_FMT_NONE };
@@ -1168,12 +1210,7 @@ namespace MxfPlayer.Services
                 if (ret < 0)
                 {
                  
-                    byte* errBuff = (byte*)Marshal.AllocHGlobal(256);
-                    ffmpeg.av_strerror(ret, errBuff, 256);
-                    string errMsg = Marshal.PtrToStringAnsi((IntPtr)errBuff);
-                    Marshal.FreeHGlobal((IntPtr)errBuff);
-
-                    System.Diagnostics.Debug.WriteLine($"[FFmpeg Filter Error] {errMsg}");
+                    System.Diagnostics.Debug.WriteLine($"[FFmpeg Filter Error] {GetFfmpegError(ret)}");
                     return; 
                 }
                 if (ret >= 0)
@@ -1184,6 +1221,51 @@ namespace MxfPlayer.Services
 
                 ffmpeg.avfilter_inout_free(&inputs);
                 ffmpeg.avfilter_inout_free(&outputs);
+            }
+        }
+
+        private string GetAudioChannelLayout(AVCodecContext* ctx)
+        {
+            int channels = ctx->ch_layout.nb_channels;
+            if (channels <= 0)
+                return "";
+
+            byte[] layoutName = new byte[128];
+            fixed (byte* pLayout = layoutName)
+                ffmpeg.av_channel_layout_describe(&ctx->ch_layout, pLayout, (ulong)layoutName.Length);
+
+            string describedLayout = System.Text.Encoding.UTF8.GetString(layoutName).TrimEnd('\0');
+            if (!string.IsNullOrWhiteSpace(describedLayout) && !describedLayout.StartsWith("0 channels", StringComparison.OrdinalIgnoreCase))
+                return describedLayout;
+
+            return channels switch
+            {
+                1 => "mono",
+                2 => "stereo",
+                3 => "2.1",
+                4 => "quad",
+                5 => "5.0",
+                6 => "5.1",
+                7 => "6.1",
+                8 => "7.1",
+                _ => ""
+            };
+        }
+
+        private string GetFfmpegError(int errorCode)
+        {
+            if (errorCode >= 0)
+                return "";
+
+            byte* errBuff = (byte*)Marshal.AllocHGlobal(256);
+            try
+            {
+                ffmpeg.av_strerror(errorCode, errBuff, 256);
+                return Marshal.PtrToStringAnsi((IntPtr)errBuff) ?? errorCode.ToString(CultureInfo.InvariantCulture);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal((IntPtr)errBuff);
             }
         }
 

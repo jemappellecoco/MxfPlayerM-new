@@ -1,52 +1,35 @@
 ﻿using System;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Threading.Tasks;
 using MxfPlayer.Models;
 
 namespace MxfPlayer.Services
 {
     public class MediaInfoService
     {
+        private const int MediaInfoTimeoutMs = 15000;
         private readonly string _mediaInfoPath;
 
         public MediaInfoService()
         {
-            _mediaInfoPath = AppConfigService.Load().MediaInfoPath;
+            _mediaInfoPath = ResolveMediaInfoPath(AppConfigService.Load().MediaInfoPath);
         }
 
         public MediaInfoResult GetInfo(string filePath)
         {
             if (string.IsNullOrWhiteSpace(_mediaInfoPath))
-                throw new FileNotFoundException("MediaInfoPath 未設定，請在 config.json 設定 MediaInfo.exe 路徑");
+                throw new FileNotFoundException("MediaInfoPath 未設定，請在 config.json 設定 MediaInfo.exe 或 MediaInfo.dll 路徑");
 
             if (!File.Exists(_mediaInfoPath))
-                throw new FileNotFoundException("找不到 MediaInfo.exe", _mediaInfoPath);
+                throw new FileNotFoundException("找不到 MediaInfo", _mediaInfoPath);
 
             if (!File.Exists(filePath))
                 throw new FileNotFoundException("找不到影片檔案", filePath);
 
-            var psi = new ProcessStartInfo
-            {
-                FileName = _mediaInfoPath,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            psi.ArgumentList.Add("--Output=JSON");
-            psi.ArgumentList.Add(filePath);
-            using var process = Process.Start(psi);
-            if (process == null)
-                throw new Exception("MediaInfo 啟動失敗");
-
-            string output = process.StandardOutput.ReadToEnd();
-            string error = process.StandardError.ReadToEnd();
-            process.WaitForExit();
-
-            if (string.IsNullOrWhiteSpace(output))
-                throw new Exception("MediaInfo 沒有輸出內容：" + error);
+            string output = ReadMediaInfoJson(filePath);
 
             // 開發時可打開這行檢查 JSON
             // File.WriteAllText("debug.json", output);
@@ -135,6 +118,303 @@ namespace MxfPlayer.Services
               
             };
         }
+        private string ReadMediaInfoJson(string filePath)
+        {
+            if (string.Equals(Path.GetExtension(_mediaInfoPath), ".dll", StringComparison.OrdinalIgnoreCase))
+            {
+                string? directDllOutput = TryReadMediaInfoJsonFromDll(_mediaInfoPath, filePath, out string? directDllError);
+                if (!string.IsNullOrWhiteSpace(directDllOutput))
+                    return directDllOutput;
+
+                throw new Exception("MediaInfo.dll 沒有輸出 JSON：" + directDllError);
+            }
+
+            if (IsLikelyGuiMediaInfoExecutable(_mediaInfoPath))
+                throw new Exception("MediaInfoPath 指到 GUI 版 MediaInfo.exe，但找不到可用的 MediaInfo.dll。請安裝完整 MediaInfo 或改指向 MediaInfo_CLI\\MediaInfo.exe");
+
+            string? shellError;
+            string? shellOutput = TryReadMediaInfoJsonFromShell(filePath, out shellError);
+            if (!string.IsNullOrWhiteSpace(shellOutput))
+                return shellOutput;
+
+            string? executableError;
+            string? output = TryReadMediaInfoJsonFromExecutable(filePath, out executableError);
+            if (!string.IsNullOrWhiteSpace(output))
+                return output;
+
+            string? dllPath = FindMediaInfoDll();
+            if (!string.IsNullOrWhiteSpace(dllPath))
+            {
+                string? dllOutput = TryReadMediaInfoJsonFromDll(dllPath, filePath, out string? dllError);
+                if (!string.IsNullOrWhiteSpace(dllOutput))
+                    return dllOutput;
+
+                executableError += " / " + dllError;
+            }
+
+            throw new Exception("MediaInfo 沒有輸出 JSON：" + shellError + " / " + executableError);
+        }
+
+        private string ResolveMediaInfoPath(string configuredPath)
+        {
+            if (!string.IsNullOrWhiteSpace(configuredPath) && File.Exists(configuredPath))
+            {
+                if (IsLikelyGuiMediaInfoExecutable(configuredPath))
+                {
+                    string? configuredDll = FindMediaInfoDllNear(configuredPath);
+                    if (!string.IsNullOrWhiteSpace(configuredDll))
+                        return configuredDll;
+                }
+
+                return configuredPath;
+            }
+
+            foreach (string candidate in GetDefaultMediaInfoCandidates())
+            {
+                if (File.Exists(candidate))
+                    return candidate;
+            }
+
+            return configuredPath;
+        }
+
+        private string[] GetDefaultMediaInfoCandidates()
+        {
+            string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            string programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+
+            return new[]
+            {
+                Path.Combine(programFiles, "MediaInfo", "MediaInfo.dll"),
+                Path.Combine(programFiles, "MediaInfo", "MediaInfo.exe"),
+                Path.Combine(programFilesX86, "MediaInfo", "MediaInfo.dll"),
+                Path.Combine(programFilesX86, "MediaInfo", "MediaInfo.exe"),
+                @"C:\Tools\MediaInfo_CLI\MediaInfo.exe"
+            };
+        }
+
+        private string? TryReadMediaInfoJsonFromExecutable(string filePath, out string? errorMessage)
+        {
+            errorMessage = null;
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = _mediaInfoPath,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            psi.ArgumentList.Add("--Output=JSON");
+            psi.ArgumentList.Add(filePath);
+
+            using var process = Process.Start(psi);
+            if (process == null)
+                throw new Exception("MediaInfo 啟動失敗");
+
+            Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+            Task<string> errorTask = process.StandardError.ReadToEndAsync();
+
+            if (!process.WaitForExit(MediaInfoTimeoutMs))
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+                errorMessage = "MediaInfo exe 執行逾時，可能是 GUI 版本未輸出 JSON";
+                return null;
+            }
+
+            string output = outputTask.GetAwaiter().GetResult();
+            string error = errorTask.GetAwaiter().GetResult();
+
+            if (!string.IsNullOrWhiteSpace(output))
+                return output;
+
+            errorMessage = string.IsNullOrWhiteSpace(error)
+                ? "MediaInfo exe 沒有輸出內容"
+                : error;
+
+            return null;
+        }
+
+        private string? TryReadMediaInfoJsonFromShell(string filePath, out string? errorMessage)
+        {
+            errorMessage = null;
+
+            string command = $"\"{EscapeCmdArgument(_mediaInfoPath)}\" --Output=JSON \"{EscapeCmdArgument(filePath)}\"";
+            var psi = new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            psi.ArgumentList.Add("/d");
+            psi.ArgumentList.Add("/s");
+            psi.ArgumentList.Add("/c");
+            psi.ArgumentList.Add(command);
+
+            using var process = Process.Start(psi);
+            if (process == null)
+                throw new Exception("MediaInfo shell 啟動失敗");
+
+            Task<string> outputTask = process.StandardOutput.ReadToEndAsync();
+            Task<string> errorTask = process.StandardError.ReadToEndAsync();
+
+            if (!process.WaitForExit(MediaInfoTimeoutMs))
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+                errorMessage = "MediaInfo shell 執行逾時";
+                return null;
+            }
+
+            string output = outputTask.GetAwaiter().GetResult();
+            string error = errorTask.GetAwaiter().GetResult();
+
+            if (!string.IsNullOrWhiteSpace(output))
+                return output;
+
+            errorMessage = string.IsNullOrWhiteSpace(error)
+                ? "MediaInfo shell 沒有輸出內容"
+                : error;
+            return null;
+        }
+
+        private string EscapeCmdArgument(string value)
+        {
+            return value.Replace("\"", "\\\"");
+        }
+
+        private string? FindMediaInfoDll()
+        {
+            return FindMediaInfoDllNear(_mediaInfoPath);
+        }
+
+        private string? FindMediaInfoDllNear(string mediaInfoPath)
+        {
+            string? directory = Path.GetDirectoryName(mediaInfoPath);
+            if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+                return null;
+
+            string sameDirectoryDll = Path.Combine(directory, "MediaInfo.dll");
+            if (File.Exists(sameDirectoryDll))
+                return sameDirectoryDll;
+
+            try
+            {
+                foreach (string candidate in Directory.EnumerateFiles(directory, "MediaInfo.dll", SearchOption.AllDirectories))
+                    return candidate;
+            }
+            catch { }
+
+            return null;
+        }
+
+        private bool IsLikelyGuiMediaInfoExecutable(string mediaInfoPath)
+        {
+            if (!string.Equals(Path.GetExtension(mediaInfoPath), ".exe", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            string normalized = mediaInfoPath.ToLowerInvariant();
+            return normalized.Contains("\\program files\\mediainfo\\") ||
+                   normalized.Contains("\\program files (x86)\\mediainfo\\");
+        }
+
+        private string? TryReadMediaInfoJsonFromDll(string dllPath, string filePath, out string? errorMessage)
+        {
+            errorMessage = null;
+
+            try
+            {
+                return ReadMediaInfoJsonFromDll(dllPath, filePath);
+            }
+            catch (Exception ex)
+            {
+                errorMessage = ex.Message;
+                return null;
+            }
+        }
+
+        private string ReadMediaInfoJsonFromDll(string dllPath, string filePath)
+        {
+            nint library = NativeLibrary.Load(dllPath);
+            nint handle = 0;
+
+            try
+            {
+                var mediaInfoNew = GetExport<MediaInfoNewDelegate>(library, "MediaInfo_New");
+                var mediaInfoDelete = GetExport<MediaInfoDeleteDelegate>(library, "MediaInfo_Delete");
+                var mediaInfoOpen = GetExport<MediaInfoOpenDelegate>(library, "MediaInfo_Open");
+                var mediaInfoClose = GetExport<MediaInfoCloseDelegate>(library, "MediaInfo_Close");
+                var mediaInfoInform = GetExport<MediaInfoInformDelegate>(library, "MediaInfo_Inform");
+                var mediaInfoOption = GetExport<MediaInfoOptionDelegate>(library, "MediaInfo_Option");
+
+                handle = mediaInfoNew();
+                if (handle == 0)
+                    throw new Exception("MediaInfo.dll 初始化失敗");
+
+                mediaInfoOption(handle, "Inform", "JSON");
+
+                if (mediaInfoOpen(handle, filePath) == 0)
+                    throw new Exception("MediaInfo.dll 無法開啟影片檔案");
+
+                nint result = mediaInfoInform(handle, 0);
+                string output = Marshal.PtrToStringUni(result) ?? "";
+                mediaInfoClose(handle);
+                mediaInfoDelete(handle);
+                handle = 0;
+
+                if (string.IsNullOrWhiteSpace(output))
+                    throw new Exception("MediaInfo.dll 沒有輸出 JSON");
+
+                return output;
+            }
+            finally
+            {
+                if (handle != 0)
+                {
+                    try
+                    {
+                        var mediaInfoClose = GetExport<MediaInfoCloseDelegate>(library, "MediaInfo_Close");
+                        var mediaInfoDelete = GetExport<MediaInfoDeleteDelegate>(library, "MediaInfo_Delete");
+                        mediaInfoClose(handle);
+                        mediaInfoDelete(handle);
+                    }
+                    catch { }
+                }
+
+                NativeLibrary.Free(library);
+            }
+        }
+
+        private T GetExport<T>(nint library, string name) where T : Delegate
+        {
+            nint address = NativeLibrary.GetExport(library, name);
+            return Marshal.GetDelegateForFunctionPointer<T>(address);
+        }
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate nint MediaInfoNewDelegate();
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate void MediaInfoDeleteDelegate(nint handle);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode)]
+        private delegate nint MediaInfoOpenDelegate(nint handle, [MarshalAs(UnmanagedType.LPWStr)] string fileName);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate void MediaInfoCloseDelegate(nint handle);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate nint MediaInfoInformDelegate(nint handle, nint reserved);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode)]
+        private delegate nint MediaInfoOptionDelegate(
+            nint handle,
+            [MarshalAs(UnmanagedType.LPWStr)] string option,
+            [MarshalAs(UnmanagedType.LPWStr)] string value);
+
         private string FormatFrameRate(string frameRate, string fpsNum, string fpsDen)
         {
             if (string.IsNullOrWhiteSpace(frameRate))

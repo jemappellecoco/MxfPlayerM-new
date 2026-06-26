@@ -1844,7 +1844,7 @@ namespace MxfPlayer
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"a’-a”?a?±a‧—: {ex.Message}");
+                MessageBox.Show($"播放失敗：{ex.Message}");
             }
         }
         private void HandlePause()
@@ -2427,7 +2427,7 @@ namespace MxfPlayer
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"a’-a”?a?±a‧—: {ex.Message}");
+                MessageBox.Show($"播放失敗：{ex.Message}");
             }
         }
 
