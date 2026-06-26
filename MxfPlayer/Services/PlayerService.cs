@@ -46,9 +46,9 @@ namespace MxfPlayer.Services
         private int _pcmOutputChannels;
         public double CurrentFps => _audioFps > 0 ? _audioFps : 29.97;
         private readonly Dictionary<long, Bitmap> _videoFrameCache = new();
-        private const long VideoFrameCacheBudgetBytes = 256L * 1024L * 1024L;
-        private const int MinCachedVideoFrames = 12;
-        private const int MaxCachedVideoFrames = 64; // Hard cap for decoded bitmaps kept in memory.
+        private const long VideoFrameCacheBudgetBytes = 512L * 1024L * 1024L;
+        private const int MinCachedVideoFrames = 18;
+        private const int MaxCachedVideoFrames = 96; // Hard cap for decoded bitmaps kept in memory.
         private int _maxCachedVideoFrames = 48;
         private const int VideoPreloadLowWaterFrames = 18; // Start refilling when the forward queue drops below this.
         private const int VideoPreloadHighWaterFrames = 48; // Pause background decode before it becomes a large preload cache.
@@ -106,8 +106,8 @@ namespace MxfPlayer.Services
             double multiplier = Math.Max(1.0, Math.Abs(rate));
             int requestedFrames = (int)Math.Ceiling(VideoPreloadLowWaterFrames * multiplier);
             int maxFrames = GetMaxCachedVideoFramesForRate(rate);
-            int reserveFrames = Math.Max(6, maxFrames / 4);
-            return Math.Clamp(Math.Min(requestedFrames, maxFrames - reserveFrames), 3, maxFrames);
+            int playableFrames = Math.Max(3, maxFrames - 2);
+            return Math.Clamp(Math.Min(requestedFrames, playableFrames), 3, maxFrames);
         }
 
         private int GetVideoPreloadHighWaterFramesForRate(float rate)
@@ -115,8 +115,8 @@ namespace MxfPlayer.Services
             double multiplier = Math.Max(1.0, Math.Abs(rate));
             int requestedFrames = (int)Math.Ceiling(VideoPreloadHighWaterFrames * multiplier);
             int maxFrames = GetMaxCachedVideoFramesForRate(rate);
-            int reserveFrames = Math.Max(3, maxFrames / 8);
-            return Math.Clamp(Math.Min(requestedFrames, maxFrames - reserveFrames), 3, maxFrames);
+            int preloadFrames = Math.Max(3, maxFrames - 1);
+            return Math.Clamp(Math.Min(requestedFrames, preloadFrames), 3, maxFrames);
         }
 
         private int GetMaxCachedVideoFramesForRate(float rate)

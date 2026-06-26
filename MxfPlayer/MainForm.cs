@@ -562,6 +562,7 @@ namespace MxfPlayer
                 if (!started) return;
             }
 
+            ResetPlaybackRateToNormal();
             ResetUiUpdateThrottle();
             await _playbackController.Play();
             _lblNow.ForeColor = Color.Orange;
@@ -2142,6 +2143,13 @@ namespace MxfPlayer
             float rate = _playbackController.MoveFastForward();
             ApplyPlaybackRate(rate);
         }
+
+        private void ResetPlaybackRateToNormal()
+        {
+            _playbackController.ResetRate();
+            _lblRate.Text = "1x";
+        }
+
         private async void HandleNegativeLog()
         {
             await StepFrameAsync(-1);
