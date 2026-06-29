@@ -558,11 +558,13 @@ namespace MxfPlayer
         {
             ReleaseNowTimecodeInputFocus();
 
-            long startTimeMs = _player.CurrentPath == file.FullPath
+            bool isDifferentFile = !string.Equals(_player.CurrentPath, file.FullPath, StringComparison.OrdinalIgnoreCase);
+
+            long startTimeMs = !isDifferentFile
                 ? _playbackController.GetCurrentTime()
                 : 0;
 
-            bool needsStart = _player.CurrentPath != file.FullPath || !_player.IsAudioReady;
+            bool needsStart = isDifferentFile || !_player.IsAudioReady;
             if (needsStart)
             {
                 _playbackController.Pause();
@@ -572,7 +574,7 @@ namespace MxfPlayer
             }
 
             ResetUiUpdateThrottle();
-            if (resetRateToNormal)
+            if (resetRateToNormal || isDifferentFile)
             {
                 _lblRate.Text = "1x";
                 await _playbackController.PlayNormal();
