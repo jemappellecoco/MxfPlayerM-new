@@ -357,7 +357,7 @@ namespace MxfPlayer.Services
                 int cacheChannelCount = Math.Clamp(_pcmOutputChannels > 0 ? _pcmOutputChannels : CurrentAudioCount, 1, ChannelMask.Length);
                 _fileAudioProvider = new MxfAudioProvider(_pcmCachePath, cacheChannelCount, baseTimeMs, _audioSampleRate)
                 {
-                    PlaybackRate = effectiveRate,
+                    PlaybackRate = GetForwardAudioProviderRate(effectiveRate),
                     Mask = ChannelMask
                 };
 
@@ -381,7 +381,7 @@ namespace MxfPlayer.Services
 
                 _audioCacheTask = Task.Run(() =>
                 {
-                    CreatePcmCacheFile(path, pcmPath, cacheStartFrame, fps, token, maxDurationMs);
+                    CreatePcmCacheFile(path, pcmPath, cacheStartFrame, fps, token, maxDurationMs, GetForwardAudioTempoRate(effectiveRate));
                 }, token);
 
                 if (keepPlaying)
@@ -405,7 +405,7 @@ namespace MxfPlayer.Services
 
             _slidingAudioProvider = new SlidingPcmAudioProvider(cacheChannelCount, _audioSampleRate)
             {
-                PlaybackRate = effectiveRate,
+                PlaybackRate = GetReverseAudioProviderRate(effectiveRate),
                 Mask = ChannelMask
             };
             _slidingAudioProvider.SeekFrame(frameIndex, fps);
@@ -425,11 +425,12 @@ namespace MxfPlayer.Services
 
             _audioCacheTask = Task.Run(() =>
             {
-                byte[] pcm = DecodePcmCacheBytes(path, cacheStartFrame, fps, token, maxDurationMs, clearMeterSamples: !keepPlaying);
+                double tempoRate = GetReverseAudioTempoRate(effectiveRate);
+                byte[] pcm = DecodePcmCacheBytes(path, cacheStartFrame, fps, token, maxDurationMs, clearMeterSamples: !keepPlaying, audioTempoRate: (float)tempoRate);
                 if (token.IsCancellationRequested || generation != _audioCacheGeneration)
                     return;
 
-                provider.ResetWindow(cacheStartFrame, fps, pcm);
+                provider.ResetWindow(cacheStartFrame, fps, pcm, tempoRate);
                 provider.SeekFrame(frameIndex, fps);
             }, token);
 
@@ -460,12 +461,33 @@ namespace MxfPlayer.Services
 
             _audioCacheTask = Task.Run(() =>
             {
-                byte[] pcm = DecodePcmCacheBytes(path, cacheStartFrame, fps, token, maxDurationMs, clearMeterSamples: false);
+                double tempoRate = GetReverseAudioTempoRate(effectiveRate);
+                byte[] pcm = DecodePcmCacheBytes(path, cacheStartFrame, fps, token, maxDurationMs, clearMeterSamples: false, audioTempoRate: (float)tempoRate);
                 if (token.IsCancellationRequested || generation != _audioCacheGeneration)
                     return;
 
-                provider.PrependWindow(cacheStartFrame, fps, pcm);
+                provider.PrependWindow(cacheStartFrame, fps, pcm, tempoRate);
             }, token);
+        }
+
+        private float GetForwardAudioTempoRate(float rate)
+        {
+            return rate > 0 ? rate : 1.0f;
+        }
+
+        private float GetForwardAudioProviderRate(float rate)
+        {
+            return rate > 0 ? 1.0f : rate;
+        }
+
+        private double GetReverseAudioTempoRate(float rate)
+        {
+            return Math.Max(1.0, Math.Abs(rate));
+        }
+
+        private float GetReverseAudioProviderRate(float rate)
+        {
+            return rate < 0 ? -1.0f : 1.0f;
         }
 
         private int GetReverseAudioRefreshBehindMs(float rate)
@@ -558,7 +580,7 @@ namespace MxfPlayer.Services
             return Task.Run(() => WaitForAudioBuffer(frameIndex, fps, rate, timeoutMs));
         }
 
-        private void CreatePcmCacheFile(string path, string pcmPath, long startFrame, double fps, CancellationToken token, int? maxDurationMs = null)
+        private void CreatePcmCacheFile(string path, string pcmPath, long startFrame, double fps, CancellationToken token, int? maxDurationMs = null, float audioTempoRate = 1.0f)
         {
             lock (_ffmpegResourceLock)
             {
@@ -569,7 +591,7 @@ namespace MxfPlayer.Services
                         _meterSamples.Clear();
                     }
 
-                    InitFFmpeg(path, 1.0f);
+                    InitFFmpeg(path, audioTempoRate);
 
                     if (_formatContext != null && startFrame > 0)
                     {
@@ -615,7 +637,8 @@ namespace MxfPlayer.Services
             double fps,
             CancellationToken token,
             int maxDurationMs,
-            bool clearMeterSamples)
+            bool clearMeterSamples,
+            float audioTempoRate = 1.0f)
         {
             lock (_ffmpegResourceLock)
             {
@@ -629,7 +652,7 @@ namespace MxfPlayer.Services
                         }
                     }
 
-                    InitFFmpeg(path, 1.0f);
+                    InitFFmpeg(path, audioTempoRate);
 
                     if (_formatContext != null && startFrame > 0)
                     {
@@ -1546,22 +1569,27 @@ namespace MxfPlayer.Services
         {
             float effectiveRate = Math.Abs(rate) > 0 ? rate : 1.0f;
 
-            if (_isVideoPlaying && effectiveRate >= 0 && _fileAudioProvider == null)
+            if (effectiveRate >= 0)
             {
-                StartAudioCacheFromFrame(_currentFrameIndex, _audioFps, effectiveRate, false);
-                WaitForAudioBuffer(_currentFrameIndex, _audioFps, effectiveRate, 1000);
-                PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
+                if (_fileAudioProvider != null)
+                    _fileAudioProvider.PlaybackRate = GetForwardAudioProviderRate(effectiveRate);
+
+                if (_isVideoPlaying)
+                {
+                    StartAudioCacheFromFrame(_currentFrameIndex, _audioFps, effectiveRate, false);
+                    WaitForAudioBuffer(_currentFrameIndex, _audioFps, effectiveRate, 1000);
+                    PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
+                }
+
                 return;
             }
 
-            if (_fileAudioProvider != null)
-                _fileAudioProvider.PlaybackRate = effectiveRate;
             if (_memoryAudioProvider != null)
                 _memoryAudioProvider.PlaybackRate = effectiveRate;
             if (_slidingAudioProvider != null)
-                _slidingAudioProvider.PlaybackRate = effectiveRate;
+                _slidingAudioProvider.PlaybackRate = GetReverseAudioProviderRate(effectiveRate);
 
-            if (_isVideoPlaying && _fileAudioProvider != null)
+            if (_isVideoPlaying)
             {
                 StartAudioCacheFromFrame(_currentFrameIndex, _audioFps, effectiveRate, false);
                 WaitForAudioBuffer(_currentFrameIndex, _audioFps, effectiveRate, 1000);
@@ -1853,11 +1881,13 @@ namespace MxfPlayer.Services
         public void SeekAudioByFrame(long frameIndex, double fps, bool waitForPreviousCache = true)
         {
             frameIndex = ClampFrameIndex(frameIndex);
+            bool positiveTempoPlayback = _videoRate > 0 && Math.Abs(_videoRate - 1.0f) > 0.001f;
 
             bool hasData = _videoRate < 0
                 ? (_slidingAudioProvider != null &&
                    _slidingAudioProvider.IsReverseFrameDataAvailable(frameIndex, fps, 250))
-                : (_fileAudioProvider != null &&
+                : (!positiveTempoPlayback &&
+                   _fileAudioProvider != null &&
                    _fileAudioProvider.IsFrameDataAvailable(frameIndex, fps));
 
             if (!hasData)

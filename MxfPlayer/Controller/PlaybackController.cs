@@ -71,6 +71,17 @@ namespace MxfPlayer.Controllers
             await Task.CompletedTask;
         }
 
+        public async Task PlayNormal(int audioBufferTimeoutMs = 3000)
+        {
+            CurrentRate = 1.0f;
+            _player.SetVideoRate(CurrentRate);
+            _player.ResumeAudio(audioBufferTimeoutMs);
+
+            _meterTimer.Start();
+
+            await Task.CompletedTask;
+        }
+
         public void Pause()
         {
             _player.Pause();

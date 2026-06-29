@@ -11,8 +11,9 @@ namespace MxfPlayer.Services
         private readonly int _sampleRate;
         private readonly int _bytesPerSourceFrame;
         private readonly List<byte> _pcmData = new();
-        private long _baseSampleIndex;
-        private long _positionSampleIndex;
+        private long _baseOriginalSampleIndex;
+        private long _positionSourceSampleIndex;
+        private double _tempoRate = 1.0;
         private float _playbackRate = 1.0f;
 
         public WaveFormat WaveFormat { get; }
@@ -32,33 +33,39 @@ namespace MxfPlayer.Services
             WaveFormat = new WaveFormat(_sampleRate, 16, 2);
         }
 
-        public void ResetWindow(long startFrame, double fps, byte[] pcmData)
+        public void ResetWindow(long startFrame, double fps, byte[] pcmData, double tempoRate = 1.0)
         {
             if (fps <= 0) fps = 29.97;
+            if (tempoRate <= 0) tempoRate = 1.0;
 
             lock (_lock)
             {
-                _baseSampleIndex = FrameToSample(startFrame, fps);
-                _positionSampleIndex = _baseSampleIndex;
+                _tempoRate = tempoRate;
+                _baseOriginalSampleIndex = FrameToSample(startFrame, fps);
+                _positionSourceSampleIndex = 0;
                 _pcmData.Clear();
                 _pcmData.AddRange(pcmData);
             }
         }
 
-        public bool PrependWindow(long startFrame, double fps, byte[] pcmData)
+        public bool PrependWindow(long startFrame, double fps, byte[] pcmData, double tempoRate = 1.0)
         {
             if (pcmData.Length == 0)
                 return false;
             if (fps <= 0) fps = 29.97;
+            if (tempoRate <= 0) tempoRate = 1.0;
 
             lock (_lock)
             {
+                if (Math.Abs(_tempoRate - tempoRate) > 0.001)
+                    return false;
+
                 long startSample = FrameToSample(startFrame, fps);
-                long currentStart = _baseSampleIndex;
+                long currentStart = _baseOriginalSampleIndex;
                 if (startSample >= currentStart)
                     return false;
 
-                long prependFrames = currentStart - startSample;
+                long prependFrames = OriginalSamplesToSourceSamples(currentStart - startSample);
                 long prependBytes = prependFrames * _bytesPerSourceFrame;
                 if (prependBytes <= 0)
                     return false;
@@ -70,7 +77,8 @@ namespace MxfPlayer.Services
 
                 int startOffset = 0;
                 _pcmData.InsertRange(0, new ArraySegment<byte>(pcmData, startOffset, bytesToUse));
-                _baseSampleIndex = currentStart - (bytesToUse / _bytesPerSourceFrame);
+                _baseOriginalSampleIndex = startSample;
+                _positionSourceSampleIndex += bytesToUse / _bytesPerSourceFrame;
                 return true;
             }
         }
@@ -81,8 +89,7 @@ namespace MxfPlayer.Services
 
             lock (_lock)
             {
-                long sample = FrameToSample(frameIndex, fps);
-                long offsetFrames = sample - _baseSampleIndex;
+                long offsetFrames = GetSourceSampleOffset(frameIndex, fps);
                 if (offsetFrames < 0)
                     return false;
 
@@ -97,12 +104,11 @@ namespace MxfPlayer.Services
 
             lock (_lock)
             {
-                long sample = FrameToSample(frameIndex, fps);
-                long offsetFrames = sample - _baseSampleIndex;
+                long offsetFrames = GetSourceSampleOffset(frameIndex, fps);
                 if (offsetFrames < 0 || offsetFrames >= BufferedSourceFrames)
                     return false;
 
-                long requiredFrames = (_sampleRate * (long)Math.Max(0, requiredBehindMs)) / 1000;
+                long requiredFrames = OriginalSamplesToSourceSamples((_sampleRate * (long)Math.Max(0, requiredBehindMs)) / 1000);
                 return offsetFrames >= requiredFrames;
             }
         }
@@ -114,7 +120,7 @@ namespace MxfPlayer.Services
 
             lock (_lock)
             {
-                _positionSampleIndex = FrameToSample(frameIndex, fps);
+                _positionSourceSampleIndex = Math.Clamp(GetSourceSampleOffset(frameIndex, fps), 0, BufferedSourceFrames);
             }
         }
 
@@ -126,10 +132,8 @@ namespace MxfPlayer.Services
 
             lock (_lock)
             {
-                long startSample = FrameToSample(frameIndex, fps);
-                long endSample = FrameToSample(frameIndex + 1, fps);
-                long startFrame = startSample - _baseSampleIndex;
-                long endFrame = endSample - _baseSampleIndex;
+                long startFrame = GetSourceSampleOffset(frameIndex, fps);
+                long endFrame = GetSourceSampleOffset(frameIndex + 1, fps);
 
                 if (startFrame < 0 || startFrame >= BufferedSourceFrames)
                     return 0f;
@@ -163,7 +167,7 @@ namespace MxfPlayer.Services
                     return 0;
 
                 float rate = Math.Abs(_playbackRate);
-                long startSample = _positionSampleIndex;
+                long startSample = _positionSourceSampleIndex;
                 int framesWritten = 0;
 
                 for (int i = 0; i < framesRequested; i++)
@@ -172,7 +176,7 @@ namespace MxfPlayer.Services
                         ? startSample - (long)Math.Round(i * rate)
                         : startSample + (long)Math.Round(i * rate);
 
-                    long sourceFrame = sourceSample - _baseSampleIndex;
+                    long sourceFrame = sourceSample;
                     if (sourceFrame < 0 || sourceFrame >= BufferedSourceFrames)
                         break;
 
@@ -182,9 +186,9 @@ namespace MxfPlayer.Services
                 }
 
                 long frameDelta = (long)Math.Round(framesWritten * rate);
-                _positionSampleIndex = _playbackRate < 0
-                    ? Math.Max(0, _positionSampleIndex - frameDelta)
-                    : _positionSampleIndex + frameDelta;
+                _positionSourceSampleIndex = _playbackRate < 0
+                    ? Math.Max(0, _positionSourceSampleIndex - frameDelta)
+                    : _positionSourceSampleIndex + frameDelta;
 
                 int bytesWritten = framesWritten * 4;
                 if (bytesWritten < count)
@@ -195,6 +199,17 @@ namespace MxfPlayer.Services
         }
 
         private long BufferedSourceFrames => _pcmData.Count / _bytesPerSourceFrame;
+
+        private long GetSourceSampleOffset(long frameIndex, double fps)
+        {
+            long originalSample = FrameToSample(frameIndex, fps);
+            return OriginalSamplesToSourceSamples(originalSample - _baseOriginalSampleIndex);
+        }
+
+        private long OriginalSamplesToSourceSamples(long originalSamples)
+        {
+            return (long)Math.Round(originalSamples / _tempoRate);
+        }
 
         private long FrameToSample(long frameIndex, double fps)
         {

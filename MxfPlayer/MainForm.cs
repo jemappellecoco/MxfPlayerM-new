@@ -554,7 +554,7 @@ namespace MxfPlayer
             }
         }
 
-        private async Task PlaySelectedFileAsync(MediaFile file)
+        private async Task PlaySelectedFileAsync(MediaFile file, bool resetRateToNormal = false)
         {
             ReleaseNowTimecodeInputFocus();
 
@@ -572,7 +572,16 @@ namespace MxfPlayer
             }
 
             ResetUiUpdateThrottle();
-            await _playbackController.Play();
+            if (resetRateToNormal)
+            {
+                _lblRate.Text = "1x";
+                await _playbackController.PlayNormal();
+            }
+            else
+            {
+                await _playbackController.Play();
+            }
+
             _lblNow.ForeColor = Color.Orange;
             UpdateTimelineUI(-1);
         }
@@ -1625,8 +1634,8 @@ namespace MxfPlayer
             var btnPositiveLog = CreatePlaybackButton("▸|", 36);
             var btnMoveFastForward = CreatePlaybackButton("⏩", 36);
             var btnMoveLast = CreatePlaybackButton("⏭", 36);
-            var btnMinus10 = CreatePlaybackButton("-10", 60);
-            var btnPlus10 = CreatePlaybackButton("+10", 60);
+            var btnMinus10 = CreatePlaybackButton("-5", 60);
+            var btnPlus10 = CreatePlaybackButton("+5", 60);
             var btnMeters = CreatePlaybackButton("", 40);
             btnMeters.Image = CreateInlineMetersIcon(Color.LimeGreen);
             btnMeters.ImageAlign = ContentAlignment.MiddleCenter;
@@ -1840,7 +1849,7 @@ namespace MxfPlayer
 
             try
             {
-                await PlaySelectedFileAsync(file);
+                await PlaySelectedFileAsync(file, resetRateToNormal: true);
             }
             catch (Exception ex)
             {
