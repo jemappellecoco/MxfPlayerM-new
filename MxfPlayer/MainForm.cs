@@ -63,8 +63,8 @@ namespace MxfPlayer
         private const int MeterUpdateIntervalMs = 100;
         private const int TimelineUpdateIntervalMs = 100;
         private const int MainMetersWidth = 170;
-        private const int PlaybackPrebufferFrames = 120;
-        private const int PlaybackPrebufferTimeoutMs = 30000;
+        private const float SmoothStartupBufferRate = 2.0f;
+        private const int PlaybackStartupBufferTimeoutMs = 30000;
         public MainForm()
         {
             Text = "Offline xPlayer";
@@ -168,12 +168,20 @@ namespace MxfPlayer
         protected override bool ProcessKeyPreview(ref Message m)
         {
             const int wmKeyDown = 0x0100;
+            const int wmKeyUp = 0x0101;
             const int wmSysKeyDown = 0x0104;
+            const int wmSysKeyUp = 0x0105;
 
             if (m.Msg is wmKeyDown or wmSysKeyDown)
             {
                 Keys keyData = (Keys)(int)m.WParam | ModifierKeys;
                 if (ShouldHandleHotKey(keyData) && TryExecuteHotKey(keyData))
+                    return true;
+            }
+            else if (m.Msg is wmKeyUp or wmSysKeyUp)
+            {
+                Keys keyData = (Keys)(int)m.WParam | ModifierKeys;
+                if (ShouldHandleHotKey(keyData) && TryClearPendingFrameStepHotKey(keyData))
                     return true;
             }
 
@@ -182,17 +190,39 @@ namespace MxfPlayer
 
         private bool TryExecuteHotKey(Keys keyData)
         {
+            if (!TryGetHotKeyAction(keyData, out HotKeyAction action))
+                return false;
+
+            ExecuteHotKeyAction(action);
+            return true;
+        }
+
+        private bool TryGetHotKeyAction(Keys keyData, out HotKeyAction action)
+        {
             Keys shortcut = HotKeySettings.Normalize(keyData);
-            foreach ((HotKeyAction action, Keys binding) in _hotKeyBindings)
+            foreach ((HotKeyAction candidateAction, Keys binding) in _hotKeyBindings)
             {
                 if (binding != shortcut)
                     continue;
 
-                ExecuteHotKeyAction(action);
+                action = candidateAction;
                 return true;
             }
 
+            action = default;
             return false;
+        }
+
+        private bool TryClearPendingFrameStepHotKey(Keys keyData)
+        {
+            if (!TryGetHotKeyAction(keyData, out HotKeyAction action))
+                return false;
+
+            if (action is not HotKeyAction.StepBackward and not HotKeyAction.StepForward)
+                return false;
+
+            _pendingFrameStepDelta = 0;
+            return true;
         }
 
         private bool ShouldHandleHotKey(Keys keyData)
@@ -512,15 +542,8 @@ namespace MxfPlayer
                         {
                             _displayedVideoFrameIndex = -1;
                             await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
-                            await _player.WaitForVideoBufferAheadAsync(
-                                _player.CurrentFrameIndex,
-                                GetPlaybackPrebufferFrames(1.0f),
-                                PlaybackPrebufferTimeoutMs);
-                            await _player.WaitForAudioBufferAsync(
-                                _player.CurrentFrameIndex,
-                                fps,
-                                1.0f,
-                                PlaybackPrebufferTimeoutMs);
+                            if (!await WaitForPlaybackStartupBuffersAsync(fps, SmoothStartupBufferRate))
+                                return false;
                             UpdateVideoFrame();
                         }
                         finally
@@ -533,15 +556,8 @@ namespace MxfPlayer
                 {
                     _displayedVideoFrameIndex = -1;
                     await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
-                    await _player.WaitForVideoBufferAheadAsync(
-                        _player.CurrentFrameIndex,
-                        GetPlaybackPrebufferFrames(1.0f),
-                        PlaybackPrebufferTimeoutMs);
-                    await _player.WaitForAudioBufferAsync(
-                        _player.CurrentFrameIndex,
-                        fps,
-                        1.0f,
-                        PlaybackPrebufferTimeoutMs);
+                    if (!await WaitForPlaybackStartupBuffersAsync(fps, SmoothStartupBufferRate))
+                        return false;
                     UpdateVideoFrame();
                 }
 
@@ -1905,25 +1921,41 @@ namespace MxfPlayer
                 _isBoundarySeeking = false;
             }
         }
-        private void ApplyPlaybackRate(float rate)
+        private async Task ApplyPlaybackRateAsync(float rate)
         {
             _lblRate.Text = $"{rate:0}x";
+            bool wasPlaying = _meterTimer.Enabled;
+            bool needsForwardBuffer = rate > 1.0f;
+
+            if (wasPlaying && needsForwardBuffer)
+                _playbackController.Pause();
+
             _player.SetVideoRate(rate);
             _player.PrepareAudioForRate(rate);
 
             if (Math.Abs(rate - 1.0f) > 0.001f)
                 _player.PrepareVideoBuffer();
+
+            if (needsForwardBuffer)
+            {
+                double fps = GetSelectedFps();
+                bool ready = fps <= 0 ||
+                    await WaitForPlaybackStartupBuffersAsync(fps, Math.Min(rate, SmoothStartupBufferRate), showWarning: wasPlaying);
+
+                if (wasPlaying && ready)
+                    await _playbackController.Play(PlaybackStartupBufferTimeoutMs);
+            }
         }
-        private void HandleMoveBackForward()
+        private async void HandleMoveBackForward()
         {
             float rate = _playbackController.MoveBackForward();
-            ApplyPlaybackRate(rate);
+            await ApplyPlaybackRateAsync(rate);
         }
         
-        private void HandleMoveFastForward()
+        private async void HandleMoveFastForward()
         {
             float rate = _playbackController.MoveFastForward();
-            ApplyPlaybackRate(rate);
+            await ApplyPlaybackRateAsync(rate);
         }
         private async void HandleNegativeLog()
         {
@@ -1991,10 +2023,36 @@ namespace MxfPlayer
             await _player.PlayFrameAudioAsync(_player.CurrentFrameIndex, fps);
             UpdateMetersFromAudioLevel();
         }
-        private int GetPlaybackPrebufferFrames(float rate)
+        private async Task<bool> WaitForPlaybackStartupBuffersAsync(double fps, float rate, bool showWarning = true)
         {
-            double multiplier = Math.Max(1.0, Math.Abs(rate));
-            return (int)Math.Ceiling(PlaybackPrebufferFrames * multiplier);
+            long frameIndex = _player.CurrentFrameIndex;
+            int requiredVideoFrames = _player.GetRequiredVideoBufferFramesForRate(rate);
+
+            Task<bool> videoReadyTask =
+                _player.WaitForVideoBufferAheadAsync(
+                    frameIndex,
+                    requiredVideoFrames,
+                    PlaybackStartupBufferTimeoutMs);
+            Task<bool> audioReadyTask =
+                _player.WaitForAudioBufferAsync(
+                    frameIndex,
+                    fps,
+                    rate,
+                    PlaybackStartupBufferTimeoutMs);
+
+            bool[] ready = await Task.WhenAll(videoReadyTask, audioReadyTask);
+            if (ready[0] && ready[1])
+                return true;
+
+            if (showWarning)
+            {
+                string missing = !ready[0] && !ready[1]
+                    ? "影片與音訊"
+                    : !ready[0] ? "影片" : "音訊";
+                MessageBox.Show($"{missing}緩衝不足，無法保證順播。請稍後再試，或確認這支影片的解碼速度。");
+            }
+
+            return false;
         }
         private double GetFpsFromInfo(MediaInfoResult info)
         {

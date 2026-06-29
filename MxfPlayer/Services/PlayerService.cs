@@ -40,17 +40,18 @@ namespace MxfPlayer.Services
         private int _pcmOutputChannels;
         public double CurrentFps => _audioFps > 0 ? _audioFps : 29.97;
         private readonly Dictionary<long, Bitmap> _videoFrameCache = new();
-        private const long VideoFrameCacheBudgetBytes = 512L * 1024L * 1024L;
-        private const int MinCachedVideoFrames = 48;
-        private const int MaxCachedVideoFrames = 300; // Hard cap for decoded bitmaps kept in memory.
-        private int _maxCachedVideoFrames = 120;
-        private const int VideoPreloadLowWaterFrames = 900; // Start refilling when forward buffer drops below this.
-        private const int VideoPreloadHighWaterFrames = 1500; // Pause background decode when this much is ready.
+        private const long VideoFrameCacheBudgetBytes = 3072L * 1024L * 1024L;
+        private const int MinCachedVideoFrames = 96;
+        private const int MaxCachedVideoFrames = 600; // Hard cap for decoded bitmaps kept in memory.
+        private int _maxCachedVideoFrames = 360;
+        private const int VideoPreloadLowWaterFrames = 450; // Start refilling well before playback gets close to the cached edge.
+        private const int VideoPreloadHighWaterFrames = 560; // Keep background decode running until the cache is nearly full.
+        private const int ForwardVideoCacheTailFrames = 12; // Keep only a short already-played tail so cache favors upcoming frames.
         private const int ReverseVideoDecodeWindowFrames = 300; // Keep reverse decode close to the playhead.
         private const int ReverseVideoPreloadLowWaterFrames = 360; // Refill reverse cache before the continuous window runs dry.
         private const int VideoDecoderRestartGapFrames = 30; // Restart decoder if playback has outrun the cached window.
         private const int VideoDecoderRestartCooldownMs = 1500;
-        private const double VideoStallResumeBufferSeconds = 0.75;//播放中卡住後：等 0.75 秒
+        private const double VideoStallResumeBufferSeconds = 1.5;//播放中卡住後：等 1.5 秒，避免 2x 很快又吃完 buffer
         private long _currentFrameIndex;
         private long _totalVideoFrames;
         private CancellationTokenSource? _videoCts;
@@ -89,7 +90,7 @@ namespace MxfPlayer.Services
             double multiplier = Math.Max(1.0, Math.Abs(rate));
             int requestedFrames = (int)Math.Ceiling(VideoPreloadLowWaterFrames * multiplier);
             int maxFrames = GetMaxCachedVideoFramesForRate(rate);
-            int reserveFrames = Math.Max(6, maxFrames / 4);
+            int reserveFrames = Math.Max(6, maxFrames / 10);
             return Math.Clamp(Math.Min(requestedFrames, maxFrames - reserveFrames), 3, maxFrames);
         }
 
@@ -98,7 +99,7 @@ namespace MxfPlayer.Services
             double multiplier = Math.Max(1.0, Math.Abs(rate));
             int requestedFrames = (int)Math.Ceiling(VideoPreloadHighWaterFrames * multiplier);
             int maxFrames = GetMaxCachedVideoFramesForRate(rate);
-            int reserveFrames = Math.Max(3, maxFrames / 8);
+            int reserveFrames = Math.Max(3, maxFrames / 20);
             return Math.Clamp(Math.Min(requestedFrames, maxFrames - reserveFrames), 3, maxFrames);
         }
 
@@ -709,12 +710,12 @@ namespace MxfPlayer.Services
             });
         }
 
-        public Task WaitForVideoBufferAheadAsync(long frameIndex, int requiredAheadFrames, int timeoutMs = 3000)
+        public Task<bool> WaitForVideoBufferAheadAsync(long frameIndex, int requiredAheadFrames, int timeoutMs = 3000)
         {
             return Task.Run(() =>
             {
                 if (requiredAheadFrames <= 0)
-                    return;
+                    return true;
 
                 var sw = Stopwatch.StartNew();
                 long clampedFrame = Math.Max(0, frameIndex);
@@ -729,13 +730,15 @@ namespace MxfPlayer.Services
                         if (continuousFrame >= 0 &&
                             continuousFrame - clampedFrame >= requiredAhead)
                         {
-                            return;
+                            return true;
                         }
                     }
 
                     EnsureVideoDecoderNearCurrentFrame();
                     Thread.Sleep(25);
                 }
+
+                return false;
             });
         }
 
@@ -858,6 +861,8 @@ namespace MxfPlayer.Services
 
                 codecContext = ffmpeg.avcodec_alloc_context3(codec);
                 ffmpeg.avcodec_parameters_to_context(codecContext, codecParameters);
+                codecContext->thread_count = Math.Max(1, Environment.ProcessorCount - 1);
+                codecContext->thread_type = ffmpeg.FF_THREAD_FRAME;
                 if (ffmpeg.avcodec_open2(codecContext, codec, null) < 0) return;
 
                 int width = codecContext->width;
@@ -1663,6 +1668,7 @@ namespace MxfPlayer.Services
             if (IsVideoFrameCached(targetFrame))
             {
                 _currentFrameIndex = targetFrame;
+                TrimForwardVideoCacheTail();
             }
             else
             {
@@ -1682,6 +1688,26 @@ namespace MxfPlayer.Services
         {
             lock (_lock)
                 return _videoFrameCache.ContainsKey(frameIndex);
+        }
+
+        private void TrimForwardVideoCacheTail()
+        {
+            if (_videoRate < 0)
+                return;
+
+            lock (_lock)
+            {
+                long keepFromFrame = Math.Max(0, _currentFrameIndex - ForwardVideoCacheTailFrames);
+                var staleFrames = _videoFrameCache.Keys
+                    .Where(index => index < keepFromFrame)
+                    .ToList();
+
+                foreach (long frameIndex in staleFrames)
+                {
+                    if (_videoFrameCache.Remove(frameIndex, out var oldFrame))
+                        oldFrame.Dispose();
+                }
+            }
         }
 
         private void StallPlaybackForVideoBuffer()
@@ -1857,7 +1883,11 @@ namespace MxfPlayer.Services
             var token = _videoCts.Token;
             int decodeGeneration = Interlocked.Increment(ref _videoDecodeGeneration);
             _videoDecodeRestartClock.Restart();
-            _videoDecodeTask = Task.Run(() => DecodeVideoFrameWindow(CurrentPath, startFrame, decodeGeneration, token, endFrameExclusive), token);
+            _videoDecodeTask = Task.Factory.StartNew(
+                () => DecodeVideoFrameWindow(CurrentPath, startFrame, decodeGeneration, token, endFrameExclusive),
+                token,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
         }
 
         private int GetReverseVideoPreloadLowWaterFrames()
