@@ -27,7 +27,7 @@ namespace MxfPlayer
         private Dictionary<HotKeyAction, Keys> _hotKeyBindings = HotKeySettings.Load();
         private Panel _timelineLabelsPanel = null!;
         private readonly Random _rnd = new();
-        private PictureBox _videoView = null!;
+        private VideoFrameView _videoView = null!;
         private TextBox _txtPath = null!;
         private DataGridView _gridFiles = null!;
         private RichTextBox _txtInfo = null!;
@@ -53,6 +53,10 @@ namespace MxfPlayer
         private bool _isBuffering = false;
         private MediaInfoResult? _currentMediaInfo;
         private readonly AudioMeterScaleService _meterScale = new();
+        private readonly object _meterLevelsLock = new();
+        private readonly float[] _latestMeterLevels = new float[8];
+        private CancellationTokenSource? _meterLevelsCts;
+        private Task? _meterLevelsTask;
         private int _meterAreaHeight = 0;
         private int _meterUpdateElapsedMs = 0;
         private int _timelineUpdateElapsedMs = 0;
@@ -80,8 +84,10 @@ namespace MxfPlayer
             ConfigureFileDrop(this);
             InitTimer();
             _playbackController = new PlaybackController(_player, _meterTimer, ResetMeters);
+            StartMeterLevelWorker();
             this.FormClosing += (s, e) =>
             {
+                _meterLevelsCts?.Cancel();
                 _player.Dispose();
             };
         }
@@ -540,7 +546,7 @@ namespace MxfPlayer
 
                         try
                         {
-                            _displayedVideoFrameIndex = -1;
+                            ClearDisplayedVideoFrame();
                             await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
                             if (!await WaitForPlaybackStartupBuffersAsync(fps, SmoothStartupBufferRate))
                                 return false;
@@ -554,7 +560,7 @@ namespace MxfPlayer
                 }
                 else
                 {
-                    _displayedVideoFrameIndex = -1;
+                    ClearDisplayedVideoFrame();
                     await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
                     if (!await WaitForPlaybackStartupBuffersAsync(fps, SmoothStartupBufferRate))
                         return false;
@@ -891,7 +897,7 @@ namespace MxfPlayer
         {
             _meterTimer = new System.Windows.Forms.Timer();
      
-            _meterTimer.Interval = 33;
+            _meterTimer.Interval = 15;
             _meterTimer.Tick += async (_, _) =>
             {
                 if (_isBuffering)
@@ -905,7 +911,7 @@ namespace MxfPlayer
                 if (_meterUpdateElapsedMs >= MeterUpdateIntervalMs)
                 {
                     _meterUpdateElapsedMs = 0;
-                    UpdateMetersFromAudioLevel();
+                    ApplyLatestMeterLevels();
                 }
 
                 _timelineUpdateElapsedMs += _meterTimer.Interval;
@@ -933,17 +939,21 @@ namespace MxfPlayer
             if (frameIndex == _displayedVideoFrameIndex)
                 return;
 
-            var nextFrame = _player.CreateDisplayVideoFrameSnapshot(out var snapshotFrameIndex);
+            var nextFrame = _player.GetDisplayVideoFrameReference(out var snapshotFrameIndex);
             if (nextFrame == null)
                 return;
 
-            var previousFrame = _displayedVideoFrame;
-
             _displayedVideoFrame = nextFrame;
             _displayedVideoFrameIndex = snapshotFrameIndex;
-            _videoView.Image = nextFrame;
+            _videoView.SetFrame(nextFrame);
+        }
 
-            previousFrame?.Dispose();
+        private void ClearDisplayedVideoFrame()
+        {
+            _videoView.SetFrame(null);
+            _displayedVideoFrame = null;
+            _displayedVideoFrameIndex = -1;
+            _player.ClearDisplayedVideoFrameReference();
         }
 
         private void BuildMenu()
@@ -1138,12 +1148,11 @@ namespace MxfPlayer
             _videoAndMetersLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, MainMetersWidth));
             videoWrap.Controls.Add(_videoAndMetersLayout);
 
-            _videoView = new PictureBox
+            _videoView = new VideoFrameView
             {
                 Dock = DockStyle.Fill,
                 BackColor = Color.Black,
-                Margin = new Padding(0),
-                SizeMode = PictureBoxSizeMode.Zoom
+                Margin = new Padding(0)
             };
             _videoAndMetersLayout.Controls.Add(_videoView, 0, 0);
 
@@ -2026,7 +2035,7 @@ namespace MxfPlayer
         private async Task<bool> WaitForPlaybackStartupBuffersAsync(double fps, float rate, bool showWarning = true)
         {
             long frameIndex = _player.CurrentFrameIndex;
-            int requiredVideoFrames = _player.GetRequiredVideoBufferFramesForRate(rate);
+            int requiredVideoFrames = _player.GetStartupVideoBufferFramesForRate(rate);
 
             Task<bool> videoReadyTask =
                 _player.WaitForVideoBufferAheadAsync(
@@ -2511,19 +2520,109 @@ namespace MxfPlayer
                 return;
 
             long currentMs = _playbackController.GetCurrentTime();
+            float[] levels = CalculateMeterLevels(currentMs);
+            StoreLatestMeterLevels(levels);
+            ApplyMeterLevels(levels, meterHeight);
+        }
 
-            for (int i = 0; i < _meterBars.Count; i++)
+        private void ApplyLatestMeterLevels()
+        {
+            int meterHeight = _meterAreaHeight;
+
+            if (meterHeight <= 0 && _meterBars.Count > 0 && _meterBars[0].Parent != null)
+                meterHeight = Math.Max(12, _meterBars[0].Parent.ClientSize.Height - 4);
+
+            if (meterHeight <= 0)
+                return;
+
+            float[] levels;
+            lock (_meterLevelsLock)
+            {
+                levels = (float[])_latestMeterLevels.Clone();
+            }
+
+            ApplyMeterLevels(levels, meterHeight);
+        }
+
+        private void ApplyMeterLevels(float[] levels, int meterHeight)
+        {
+            for (int i = 0; i < _meterBars.Count && i < levels.Length; i++)
             {
                 var bar = _meterBars[i];
                 if (bar.Parent == null) continue;
 
-                float level = _player.GetChannelLevelAtTime(i, currentMs);
+                float level = levels[i];
                 bar.Height = _meterScale.LevelToBarHeight(level, meterHeight);
             }
         }
 
+        private float[] CalculateMeterLevels(long currentMs)
+        {
+            var levels = new float[8];
+            for (int i = 0; i < levels.Length; i++)
+                levels[i] = _player.GetChannelLevelAtTime(i, currentMs);
+
+            return levels;
+        }
+
+        private void StoreLatestMeterLevels(float[] levels)
+        {
+            lock (_meterLevelsLock)
+            {
+                Array.Copy(levels, _latestMeterLevels, Math.Min(levels.Length, _latestMeterLevels.Length));
+            }
+        }
+
+        private void StartMeterLevelWorker()
+        {
+            _meterLevelsCts?.Cancel();
+            _meterLevelsCts = new CancellationTokenSource();
+            CancellationToken token = _meterLevelsCts.Token;
+
+            _meterLevelsTask = Task.Run(async () =>
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        if (_player.IsPlaying)
+                        {
+                            long currentMs = _player.CurrentTimeMs;
+                            StoreLatestMeterLevels(CalculateMeterLevels(currentMs));
+                        }
+
+                        await Task.Delay(MeterUpdateIntervalMs, token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        break;
+                    }
+                    catch
+                    {
+                        try
+                        {
+                            await Task.Delay(MeterUpdateIntervalMs, token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }, token);
+        }
+
         private void ResetMeters()
         {
+            lock (_meterLevelsLock)
+            {
+                Array.Clear(_latestMeterLevels, 0, _latestMeterLevels.Length);
+            }
+
             foreach (var bar in _meterBars)
             {
                 bar.Height = 8;
@@ -2924,6 +3023,60 @@ namespace MxfPlayer
             {
                 DoubleBuffered = true;
                 ResizeRedraw = true;
+            }
+        }
+
+        private class VideoFrameView : Control
+        {
+            private Image? _frame;
+
+            public VideoFrameView()
+            {
+                DoubleBuffered = true;
+                SetStyle(
+                    ControlStyles.AllPaintingInWmPaint |
+                    ControlStyles.OptimizedDoubleBuffer |
+                    ControlStyles.UserPaint |
+                    ControlStyles.ResizeRedraw,
+                    true);
+            }
+
+            public void SetFrame(Image? frame)
+            {
+                if (ReferenceEquals(_frame, frame))
+                    return;
+
+                _frame = frame;
+                Invalidate();
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                base.OnPaint(e);
+
+                e.Graphics.Clear(BackColor);
+                if (_frame == null || ClientSize.Width <= 0 || ClientSize.Height <= 0)
+                    return;
+
+                Rectangle target = GetZoomRectangle(_frame.Width, _frame.Height, ClientSize.Width, ClientSize.Height);
+                e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+                e.Graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+                e.Graphics.DrawImage(_frame, target);
+            }
+
+            private static Rectangle GetZoomRectangle(int imageWidth, int imageHeight, int viewWidth, int viewHeight)
+            {
+                if (imageWidth <= 0 || imageHeight <= 0)
+                    return Rectangle.Empty;
+
+                double scale = Math.Min(
+                    viewWidth / (double)imageWidth,
+                    viewHeight / (double)imageHeight);
+                int width = Math.Max(1, (int)Math.Round(imageWidth * scale));
+                int height = Math.Max(1, (int)Math.Round(imageHeight * scale));
+                int x = (viewWidth - width) / 2;
+                int y = (viewHeight - height) / 2;
+                return new Rectangle(x, y, width, height);
             }
         }
     }

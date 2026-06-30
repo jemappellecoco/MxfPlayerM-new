@@ -1,6 +1,7 @@
 ﻿using NAudio.Wave;
 using System;
 using System.IO;
+using System.Threading;
 
 namespace MxfPlayer.Services
 {
@@ -13,6 +14,7 @@ namespace MxfPlayer.Services
         private readonly object _streamLock = new();
         private bool _disposed;
         private float _playbackRate = 1.0f;
+        private int _underrun;
 
         public WaveFormat WaveFormat { get; }
         public bool[] Mask { get; set; } = new bool[8] { true, true, true, true, true, true, true, true };
@@ -20,6 +22,11 @@ namespace MxfPlayer.Services
         {
             get => _playbackRate;
             set => _playbackRate = Math.Abs(value) < 0.001f ? 0 : value;
+        }
+
+        public bool ConsumeUnderrun()
+        {
+            return Interlocked.Exchange(ref _underrun, 0) != 0;
         }
 
         public MxfAudioProvider(string pcmPath, int channels, long baseTimeMs, int sampleRate)
@@ -186,6 +193,7 @@ namespace MxfPlayer.Services
 
                     if (framesRead == 0)
                     {
+                        Interlocked.Exchange(ref _underrun, 1);
                         Array.Clear(buffer, offset, count);
                         return count;
                     }
@@ -235,7 +243,10 @@ namespace MxfPlayer.Services
                         _fileStream.Position = Math.Min(nextFrame * bytesPerFrameIn, _fileStream.Length);
                         int bytesWritten = framesWritten * 4;
                         if (bytesWritten < count)
+                        {
+                            Interlocked.Exchange(ref _underrun, 1);
                             Array.Clear(buffer, offset + bytesWritten, count - bytesWritten);
+                        }
                         return count;
                     }
                 }
