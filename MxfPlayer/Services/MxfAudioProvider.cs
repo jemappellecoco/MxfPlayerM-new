@@ -1,5 +1,7 @@
 ﻿using NAudio.Wave;
 using System;
+using System.Buffers;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 
@@ -15,6 +17,7 @@ namespace MxfPlayer.Services
         private bool _disposed;
         private float _playbackRate = 1.0f;
         private int _underrun;
+        private long _lastUnderrunLogTicks;
 
         public WaveFormat WaveFormat { get; }
         public bool[] Mask { get; set; } = new bool[8] { true, true, true, true, true, true, true, true };
@@ -27,6 +30,24 @@ namespace MxfPlayer.Services
         public bool ConsumeUnderrun()
         {
             return Interlocked.Exchange(ref _underrun, 0) != 0;
+        }
+
+        private void MarkUnderrun(string reason, long startFrame, int framesRequested, int framesRead, int framesWritten)
+        {
+            Interlocked.Exchange(ref _underrun, 1);
+
+            long nowTicks = Stopwatch.GetTimestamp();
+            long lastTicks = Interlocked.Read(ref _lastUnderrunLogTicks);
+            if ((nowTicks - lastTicks) * 1000.0 / Stopwatch.Frequency < 1000)
+                return;
+            if (Interlocked.CompareExchange(ref _lastUnderrunLogTicks, nowTicks, lastTicks) != lastTicks)
+                return;
+
+            long lengthFrames = _fileStream.Length / Math.Max(1, _channels * 2);
+            Debug.WriteLine(
+                $"[AudioUnderrun] reason={reason} startFrame={startFrame} " +
+                $"requested={framesRequested} read={framesRead} written={framesWritten} " +
+                $"fileFrames={lengthFrames} rate={_playbackRate:0.###}");
         }
 
         public MxfAudioProvider(string pcmPath, int channels, long baseTimeMs, int sampleRate)
@@ -187,67 +208,75 @@ namespace MxfPlayer.Services
                         : startFrame;
 
                     _fileStream.Position = rawStartFrame * bytesPerFrameIn;
-                    byte[] rawBuffer = new byte[sourceFramesNeeded * bytesPerFrameIn];
-                    int bytesRead = _fileStream.Read(rawBuffer, 0, rawBuffer.Length);
-                    int framesRead = bytesRead / bytesPerFrameIn;
-
-                    if (framesRead == 0)
+                    int rawBufferSize = sourceFramesNeeded * bytesPerFrameIn;
+                    byte[] rawBuffer = ArrayPool<byte>.Shared.Rent(rawBufferSize);
+                    try
                     {
-                        Interlocked.Exchange(ref _underrun, 1);
-                        Array.Clear(buffer, offset, count);
-                        return count;
-                    }
+                        int bytesRead = _fileStream.Read(rawBuffer, 0, rawBufferSize);
+                        int framesRead = bytesRead / bytesPerFrameIn;
 
-                    fixed (byte* pRaw = rawBuffer, pBuf = buffer)
-                    {
-                        short* outPtr = (short*)(pBuf + offset);
-                        int framesWritten = 0;
-
-                        for (int i = 0; i < framesRequested; i++)
+                        if (framesRead == 0)
                         {
-                            int sourceFrame = _playbackRate < 0
-                                ? (int)(startFrame - rawStartFrame - (long)Math.Round(i * rate))
-                                : (int)Math.Round(i * rate);
+                            MarkUnderrun("no-data", startFrame, framesRequested, framesRead, 0);
+                            Array.Clear(buffer, offset, count);
+                            return count;
+                        }
 
-                            if (sourceFrame < 0 || sourceFrame >= framesRead) break;
+                        fixed (byte* pRaw = rawBuffer, pBuf = buffer)
+                        {
+                            short* outPtr = (short*)(pBuf + offset);
+                            int framesWritten = 0;
 
-                            short* inPtr = (short*)(pRaw + (sourceFrame * bytesPerFrameIn));
-                            long mixed = 0;
-                            int active = 0;
-
-                            if (_channels == 2)
+                            for (int i = 0; i < framesRequested; i++)
                             {
-                                outPtr[i * 2] = inPtr[0];
-                                outPtr[i * 2 + 1] = inPtr[1];
+                                int sourceFrame = _playbackRate < 0
+                                    ? (int)(startFrame - rawStartFrame - (long)Math.Round(i * rate))
+                                    : (int)Math.Round(i * rate);
+
+                                if (sourceFrame < 0 || sourceFrame >= framesRead) break;
+
+                                short* inPtr = (short*)(pRaw + (sourceFrame * bytesPerFrameIn));
+                                long mixed = 0;
+                                int active = 0;
+
+                                if (_channels == 2)
+                                {
+                                    outPtr[i * 2] = inPtr[0];
+                                    outPtr[i * 2 + 1] = inPtr[1];
+                                    framesWritten++;
+                                    continue;
+                                }
+
+                                for (int ch = 0; ch < Math.Min(Mask.Length, _channels); ch++)
+                                {
+                                    if (Mask[ch]) { mixed += inPtr[ch]; active++; }
+                                }
+                                short final = (active > 0)
+                                ? (short)Math.Clamp(mixed, short.MinValue, short.MaxValue)
+                                : (short)0;
+                                //short final = (active > 0) ? unchecked((short)mixed) : (short)0;
+                                outPtr[i * 2] = final;
+                                outPtr[i * 2 + 1] = final;
                                 framesWritten++;
-                                continue;
                             }
 
-                            for (int ch = 0; ch < Math.Min(Mask.Length, _channels); ch++)
+                            long frameDelta = (long)Math.Round(framesWritten * rate);
+                            long nextFrame = _playbackRate < 0
+                                ? Math.Max(0, startFrame - frameDelta)
+                                : startFrame + frameDelta;
+                            _fileStream.Position = Math.Min(nextFrame * bytesPerFrameIn, _fileStream.Length);
+                            int bytesWritten = framesWritten * 4;
+                            if (bytesWritten < count)
                             {
-                                if (Mask[ch]) { mixed += inPtr[ch]; active++; }
+                                MarkUnderrun("short-read", startFrame, framesRequested, framesRead, framesWritten);
+                                Array.Clear(buffer, offset + bytesWritten, count - bytesWritten);
                             }
-                            short final = (active > 0)
-                            ? (short)Math.Clamp(mixed, short.MinValue, short.MaxValue)
-                            : (short)0;
-                            //short final = (active > 0) ? unchecked((short)mixed) : (short)0;
-                            outPtr[i * 2] = final;
-                            outPtr[i * 2 + 1] = final;
-                            framesWritten++;
+                            return count;
                         }
-
-                        long frameDelta = (long)Math.Round(framesWritten * rate);
-                        long nextFrame = _playbackRate < 0
-                            ? Math.Max(0, startFrame - frameDelta)
-                            : startFrame + frameDelta;
-                        _fileStream.Position = Math.Min(nextFrame * bytesPerFrameIn, _fileStream.Length);
-                        int bytesWritten = framesWritten * 4;
-                        if (bytesWritten < count)
-                        {
-                            Interlocked.Exchange(ref _underrun, 1);
-                            Array.Clear(buffer, offset + bytesWritten, count - bytesWritten);
-                        }
-                        return count;
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(rawBuffer);
                     }
                 }
             }

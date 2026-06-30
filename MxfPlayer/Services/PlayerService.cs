@@ -86,7 +86,8 @@ namespace MxfPlayer.Services
         private long _playbackStartFrame;
         private long _audioClockStartBytes;
         private long _audioClockStartFrame;
-        private const int AudioOutputLatencyMs = 180;
+        private const int AudioOutputLatencyMs = 350;
+        private const int AudioOutputBufferCount = 4;
         private const int AudioStallResumeBufferMs = 1800;
         private const int ReverseAudioCacheWindowMs = 60000;
         private const int ReverseAudioCacheRefreshBehindMs = 5000;
@@ -411,7 +412,8 @@ namespace MxfPlayer.Services
 
                 _waveOut = new WaveOutEvent
                 {
-                    DesiredLatency = AudioOutputLatencyMs
+                    DesiredLatency = AudioOutputLatencyMs,
+                    NumberOfBuffers = AudioOutputBufferCount
                 };
                 _waveOut.Init(_fileAudioProvider);
                 var waveOut = _waveOut;
@@ -458,7 +460,8 @@ namespace MxfPlayer.Services
 
             _waveOut = new WaveOutEvent
             {
-                DesiredLatency = AudioOutputLatencyMs
+                DesiredLatency = AudioOutputLatencyMs,
+                NumberOfBuffers = AudioOutputBufferCount
             };
             _waveOut.Init(_slidingAudioProvider);
             var waveOut = _waveOut;
@@ -1598,12 +1601,21 @@ namespace MxfPlayer.Services
                 }
             }
 
+            float meterPeak = GetMeterSamplePeak(channel, currentTimeMs);
+            if (_isVideoPlaying)
+                return meterPeak;
+
             if (_videoRate < 0 && _slidingAudioProvider != null)
                 return _slidingAudioProvider.GetChannelPeakAtFrame(frameIndex, _audioFps, channel);
 
             if (_fileAudioProvider != null)
                 return _fileAudioProvider.GetChannelPeakAtFrame(frameIndex, _audioFps, channel);
 
+            return meterPeak;
+        }
+
+        private float GetMeterSamplePeak(int channel, long currentTimeMs)
+        {
             const long windowMs = 120;
             float peak = 0f;
 
@@ -2029,7 +2041,10 @@ namespace MxfPlayer.Services
 
         private bool HasAudioUnderrun()
         {
-            return _videoRate >= 0 && _fileAudioProvider?.ConsumeUnderrun() == true;
+            bool underrun = _videoRate >= 0 && _fileAudioProvider?.ConsumeUnderrun() == true;
+            if (underrun)
+                Debug.WriteLine($"[AudioUnderrun] frame={_currentFrameIndex} rate={_videoRate:0.###}");
+            return underrun;
         }
 
         private bool HasAudioPlaybackBuffer(long frameIndex, int requiredAheadMs)
