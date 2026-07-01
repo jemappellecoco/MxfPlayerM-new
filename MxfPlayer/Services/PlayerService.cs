@@ -70,6 +70,7 @@ namespace MxfPlayer.Services
         private Task? _audioCacheTask;
         private string? _pcmCachePath;
         private int _audioCacheGeneration;
+        private float _forwardAudioCacheRate = 1.0f;
         private long _displayedVideoFrameIndex = -1;
         private bool _isVideoPlaying;
         private bool _isPlaybackStalledForVideo;
@@ -389,6 +390,8 @@ namespace MxfPlayer.Services
                 float effectiveRate = Math.Abs(rate) > 0 ? rate : 1.0f;
                 bool reverse = effectiveRate < 0;
                 long cacheStartFrame = frameIndex;
+                if (!reverse)
+                    _forwardAudioCacheRate = effectiveRate;
 
                 if (reverse)
                 {
@@ -405,6 +408,7 @@ namespace MxfPlayer.Services
                 _fileAudioProvider = new MxfAudioProvider(_pcmCachePath, cacheChannelCount, baseTimeMs, _audioSampleRate)
                 {
                     PlaybackRate = GetForwardAudioProviderRate(effectiveRate),
+                    TempoRate = GetForwardAudioTempoRate(effectiveRate),
                     Mask = ChannelMask
                 };
 
@@ -1798,10 +1802,15 @@ namespace MxfPlayer.Services
             _isPlaybackStalledForVideo = false;
             _isPlaybackStalledForAudio = false;
             _playbackClock.Stop();
-            try { _waveOut?.Pause(); } catch { }
+            StopWaveOutForReposition();
 
           
             _waveProvider?.ClearBuffer();
+        }
+
+        private void StopWaveOutForReposition()
+        {
+            try { _waveOut?.Stop(); } catch { }
         }
 
         public void ResumeAudio(int audioBufferTimeoutMs = 3000)
@@ -1901,6 +1910,7 @@ namespace MxfPlayer.Services
             }
 
             if (_fileAudioProvider == null ||
+                Math.Abs(_forwardAudioCacheRate - effectiveRate) > 0.001f ||
                 !_fileAudioProvider.IsFrameDataAvailable(_currentFrameIndex, _audioFps, AudioStallResumeBufferMs))
             {
                 StartAudioCacheFromFrame(_currentFrameIndex, _audioFps, effectiveRate, _isVideoPlaying);
@@ -1999,7 +2009,7 @@ namespace MxfPlayer.Services
             _isPlaybackStalledForAudio = false;
             _playbackStartFrame = _currentFrameIndex;
             _playbackClock.Stop();
-            try { _waveOut?.Pause(); } catch { }
+            StopWaveOutForReposition();
         }
 
         private void StallPlaybackForAudioBuffer()
@@ -2011,7 +2021,7 @@ namespace MxfPlayer.Services
             _isPlaybackStalledForVideo = false;
             _playbackStartFrame = _currentFrameIndex;
             _playbackClock.Stop();
-            try { _waveOut?.Pause(); } catch { }
+            StopWaveOutForReposition();
         }
 
         private void ResumePlaybackAfterVideoBufferIfReady()
@@ -2242,8 +2252,8 @@ namespace MxfPlayer.Services
             bool hasData = _videoRate < 0
                 ? (_slidingAudioProvider != null &&
                    _slidingAudioProvider.IsReverseFrameDataAvailable(frameIndex, fps, 250))
-                : (!positiveTempoPlayback &&
-                   _fileAudioProvider != null &&
+                : (_fileAudioProvider != null &&
+                   (!positiveTempoPlayback || Math.Abs(_forwardAudioCacheRate - _videoRate) <= 0.001f) &&
                    _fileAudioProvider.IsFrameDataAvailable(frameIndex, fps));
 
             if (!hasData)
@@ -2296,7 +2306,7 @@ namespace MxfPlayer.Services
                 int frameMs = Math.Max(35, (int)Math.Ceiling(1000.0 / fps));
                 Thread.Sleep(frameMs + AudioOutputLatencyMs);
 
-                try { _waveOut?.Pause(); } catch { }
+                StopWaveOutForReposition();
 
                 _fileAudioProvider?.SeekFrame(frameIndex, fps);
                 _videoRate = previousRate;
@@ -2465,6 +2475,7 @@ namespace MxfPlayer.Services
 
                 _fileAudioProvider?.Dispose();
                 _fileAudioProvider = null;
+                _forwardAudioCacheRate = 1.0f;
 
                 _memoryAudioProvider = null;
                 _slidingAudioProvider = null;

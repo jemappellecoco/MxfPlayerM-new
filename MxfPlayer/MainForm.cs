@@ -69,6 +69,8 @@ namespace MxfPlayer
         private const int MainMetersWidth = 170;
         private const float SmoothStartupBufferRate = 2.0f;
         private const int PlaybackStartupBufferTimeoutMs = 30000;
+        private const int FastPlaybackBufferTimeout2xMs = 300;
+        private const int FastPlaybackBufferTimeout4xMs = 500;
         public MainForm()
         {
             Text = "Offline xPlayer";
@@ -1935,6 +1937,9 @@ namespace MxfPlayer
             _lblRate.Text = $"{rate:0}x";
             bool wasPlaying = _meterTimer.Enabled;
             bool needsForwardBuffer = rate > 1.0f;
+            int fastBufferTimeoutMs = Math.Abs(rate) >= 4.0f
+                ? FastPlaybackBufferTimeout4xMs
+                : FastPlaybackBufferTimeout2xMs;
 
             if (wasPlaying && needsForwardBuffer)
                 _playbackController.Pause();
@@ -1949,10 +1954,14 @@ namespace MxfPlayer
             {
                 double fps = GetSelectedFps();
                 bool ready = fps <= 0 ||
-                    await WaitForPlaybackStartupBuffersAsync(fps, Math.Min(rate, SmoothStartupBufferRate), showWarning: wasPlaying);
+                    await WaitForPlaybackStartupBuffersAsync(
+                        fps,
+                        rate,
+                        fastBufferTimeoutMs,
+                        showWarning: false);
 
-                if (wasPlaying && ready)
-                    await _playbackController.Play(PlaybackStartupBufferTimeoutMs);
+                if (wasPlaying)
+                    await _playbackController.Play(ready ? fastBufferTimeoutMs : 1);
             }
         }
         private async void HandleMoveBackForward()
@@ -2034,6 +2043,11 @@ namespace MxfPlayer
         }
         private async Task<bool> WaitForPlaybackStartupBuffersAsync(double fps, float rate, bool showWarning = true)
         {
+            return await WaitForPlaybackStartupBuffersAsync(fps, rate, PlaybackStartupBufferTimeoutMs, showWarning);
+        }
+
+        private async Task<bool> WaitForPlaybackStartupBuffersAsync(double fps, float rate, int timeoutMs, bool showWarning = true)
+        {
             long frameIndex = _player.CurrentFrameIndex;
             int requiredVideoFrames = _player.GetStartupVideoBufferFramesForRate(rate);
 
@@ -2041,13 +2055,13 @@ namespace MxfPlayer
                 _player.WaitForVideoBufferAheadAsync(
                     frameIndex,
                     requiredVideoFrames,
-                    PlaybackStartupBufferTimeoutMs);
+                    timeoutMs);
             Task<bool> audioReadyTask =
                 _player.WaitForAudioBufferAsync(
                     frameIndex,
                     fps,
                     rate,
-                    PlaybackStartupBufferTimeoutMs);
+                    timeoutMs);
 
             bool[] ready = await Task.WhenAll(videoReadyTask, audioReadyTask);
             if (ready[0] && ready[1])

@@ -16,6 +16,7 @@ namespace MxfPlayer.Services
         private readonly object _streamLock = new();
         private bool _disposed;
         private float _playbackRate = 1.0f;
+        private double _tempoRate = 1.0;
         private int _underrun;
         private long _lastUnderrunLogTicks;
 
@@ -25,6 +26,12 @@ namespace MxfPlayer.Services
         {
             get => _playbackRate;
             set => _playbackRate = Math.Abs(value) < 0.001f ? 0 : value;
+        }
+
+        public double TempoRate
+        {
+            get => _tempoRate;
+            set => _tempoRate = value > 0.001 ? value : 1.0;
         }
 
         public bool ConsumeUnderrun()
@@ -62,7 +69,7 @@ namespace MxfPlayer.Services
         public bool IsDataAvailable(long timeMs)
         {
             if (timeMs < _baseTimeMs) return false;
-            long targetOffsetBytes = (_sampleRate * _channels * 2 * (timeMs - _baseTimeMs)) / 1000;
+            long targetOffsetBytes = MediaMsToSourceBytes(timeMs - _baseTimeMs);
             return _fileStream.Length >= targetOffsetBytes;
         }
 
@@ -79,8 +86,8 @@ namespace MxfPlayer.Services
             if (timeMs < _baseTimeMs) return false;
 
             long relativeMs = timeMs - _baseTimeMs;
-            long targetOffsetBytes = (_sampleRate * _channels * 2 * relativeMs) / 1000;
-            long requiredAheadBytes = (_sampleRate * _channels * 2 * requiredAheadMs) / 1000;
+            long targetOffsetBytes = MediaMsToSourceBytes(relativeMs);
+            long requiredAheadBytes = MediaMsToSourceBytes(requiredAheadMs);
             long requiredBytes = requiredAheadMs <= 0
                 ? _channels * 2L
                 : requiredAheadBytes;
@@ -95,8 +102,8 @@ namespace MxfPlayer.Services
             if (timeMs < _baseTimeMs) return false;
 
             long relativeMs = timeMs - _baseTimeMs;
-            long targetOffsetBytes = (_sampleRate * _channels * 2 * relativeMs) / 1000;
-            long requiredBehindBytes = (_sampleRate * _channels * 2 * requiredBehindMs) / 1000;
+            long targetOffsetBytes = MediaMsToSourceBytes(relativeMs);
+            long requiredBehindBytes = MediaMsToSourceBytes(requiredBehindMs);
             return targetOffsetBytes >= requiredBehindBytes &&
                    _fileStream.Length > targetOffsetBytes + (_channels * 2);
         }
@@ -106,7 +113,7 @@ namespace MxfPlayer.Services
             long relativeMs = timeMs - _baseTimeMs;
             if (relativeMs < 0) relativeMs = 0;
 
-            long pos = (_sampleRate * _channels * 2 * relativeMs) / 1000;
+            long pos = MediaMsToSourceBytes(relativeMs);
             pos = (pos / (_channels * 2)) * (_channels * 2);
 
             _fileStream.Position = pos;
@@ -117,8 +124,8 @@ namespace MxfPlayer.Services
             if (frameIndex < 0) frameIndex = 0;
             if (fps <= 0) fps = 29.97;
 
-            long sampleIndex = (long)Math.Round(frameIndex * _sampleRate / fps);
-            long baseSampleIndex = (long)Math.Round(_baseTimeMs * _sampleRate / 1000.0);
+            long sampleIndex = MediaSampleToSourceSample((long)Math.Round(frameIndex * _sampleRate / fps));
+            long baseSampleIndex = MediaSampleToSourceSample((long)Math.Round(_baseTimeMs * _sampleRate / 1000.0));
             sampleIndex = Math.Max(0, sampleIndex - baseSampleIndex);
             long pos = sampleIndex * _channels * 2;
             pos = (pos / (_channels * 2)) * (_channels * 2);
@@ -141,9 +148,9 @@ namespace MxfPlayer.Services
                 long originalPosition = _fileStream.Position;
                 try
                 {
-                    long startSample = (long)Math.Round(frameIndex * _sampleRate / fps);
-                    long endSample = (long)Math.Round((frameIndex + 1) * _sampleRate / fps);
-                    long baseSampleIndex = (long)Math.Round(_baseTimeMs * _sampleRate / 1000.0);
+                    long startSample = MediaSampleToSourceSample((long)Math.Round(frameIndex * _sampleRate / fps));
+                    long endSample = MediaSampleToSourceSample((long)Math.Round((frameIndex + 1) * _sampleRate / fps));
+                    long baseSampleIndex = MediaSampleToSourceSample((long)Math.Round(_baseTimeMs * _sampleRate / 1000.0));
                     startSample -= baseSampleIndex;
                     endSample -= baseSampleIndex;
 
@@ -296,6 +303,20 @@ namespace MxfPlayer.Services
         {
             int magnitude = sample == short.MinValue ? 32768 : Math.Abs(sample);
             return magnitude / 32768f;
+        }
+
+        private long MediaMsToSourceBytes(long mediaMs)
+        {
+            if (mediaMs <= 0)
+                return 0;
+
+            long mediaSamples = (_sampleRate * mediaMs) / 1000;
+            return MediaSampleToSourceSample(mediaSamples) * _channels * 2;
+        }
+
+        private long MediaSampleToSourceSample(long mediaSample)
+        {
+            return (long)Math.Round(mediaSample / _tempoRate);
         }
 
         public void Dispose()
