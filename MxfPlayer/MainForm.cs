@@ -520,8 +520,15 @@ namespace MxfPlayer
 
                 if (_mediaCache.TryGetValue(file.FullPath, out var info))
                 {
-                    if (int.TryParse(info.AudioCount, out int parsedAudioCount) && parsedAudioCount > 0)
+                    if (int.TryParse(info.AudioCount, out int parsedAudioCount) &&
+                        parsedAudioCount > 0)
+                    {
                         audioCount = parsedAudioCount;
+                    }
+
+                    _player.ConfigureVideoScan(
+                        info.ScanType,
+                        info.ScanOrder);
                 }
 
                 fps = GetSelectedFps();
@@ -661,7 +668,7 @@ namespace MxfPlayer
 
                     long lastFrame = PlayerService.FrameFromTimeMs(length, fps);
                     long remainFrames = Math.Max(0, lastFrame - _player.CurrentFrameIndex);
-                    _lblRemain.Text = $"REM {FrameToTimecode(remainFrames, fps, dropFrame)}";
+                    SetTextIfChanged(_lblRemain, $"REM {FrameToTimecode(remainFrames, fps, dropFrame)}");
                 }
             }
             catch (Exception ex)
@@ -893,7 +900,7 @@ namespace MxfPlayer
             _lblStart.Text = $"START {info.Som}";
             SetNowTimecodeText(info.Som, dropFrame);
             _lblDur.Text = $"DUR {info.DurationTc}";
-            _lblRemain.Text = $"REM {info.Eom}";
+            SetTextIfChanged(_lblRemain, $"REM {info.Eom}");
         }
         private void InitTimer()
         {
@@ -1194,6 +1201,8 @@ namespace MxfPlayer
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 42));  // meters toggle
 
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            var timecodeFont = new Font("Consolas", 11, FontStyle.Regular);
+            var nowTimecodeFont = new Font("Consolas", 14, FontStyle.Bold);
 
             _lblCurrentFile = new Label
             {
@@ -1213,6 +1222,7 @@ namespace MxfPlayer
                 Dock = DockStyle.Fill,
                 AutoSize = false,
                 ForeColor = Color.Gainsboro,
+                Font = timecodeFont,
                 TextAlign = ContentAlignment.MiddleCenter,
                 Margin = new Padding(0)
             };
@@ -1224,7 +1234,7 @@ namespace MxfPlayer
                 BorderStyle = BorderStyle.None,
                 BackColor = Color.FromArgb(58, 62, 67),
                 ForeColor = Color.Orange,
-                Font = new Font("Segoe UI", 14, FontStyle.Bold),
+                Font = nowTimecodeFont,
                 MaxLength = 11,
                 TextAlign = HorizontalAlignment.Center,
                 Margin = new Padding(0, 3, 0, 0)
@@ -1294,6 +1304,7 @@ namespace MxfPlayer
                 Dock = DockStyle.Fill,
                 AutoSize = false,
                 ForeColor = Color.Gainsboro,
+                Font = timecodeFont,
                 TextAlign = ContentAlignment.MiddleCenter,
                 Margin = new Padding(0)
             };
@@ -1304,6 +1315,7 @@ namespace MxfPlayer
                 Dock = DockStyle.Fill,
                 AutoSize = false,
                 ForeColor = Color.Orange,
+                Font = timecodeFont,
                 TextAlign = ContentAlignment.MiddleRight,
                 Margin = new Padding(0)
             };
@@ -2735,7 +2747,7 @@ namespace MxfPlayer
 
                     long lastFrame = PlayerService.FrameFromTimeMs(length, fps);
                     long remainFrames = Math.Max(0, lastFrame - currentFrame);
-                    _lblRemain.Text = $"REM {FrameToTimecode(remainFrames, fps, dropFrame)}";
+                    SetTextIfChanged(_lblRemain, $"REM {FrameToTimecode(remainFrames, fps, dropFrame)}");
                 }
             }
             finally
@@ -2820,7 +2832,13 @@ namespace MxfPlayer
 
         private void SetNowTimecodeText(string timecode, bool dropFrame)
         {
-            _lblNow.Text = NormalizeNowTimecodeText(timecode, dropFrame);
+            SetTextIfChanged(_lblNow, NormalizeNowTimecodeText(timecode, dropFrame));
+        }
+
+        private static void SetTextIfChanged(Control control, string text)
+        {
+            if (!string.Equals(control.Text, text, StringComparison.Ordinal))
+                control.Text = text;
         }
 
         private string NormalizeNowTimecodeText(string timecode, bool dropFrame)
@@ -3072,20 +3090,18 @@ namespace MxfPlayer
                 if (_frame == null || ClientSize.Width <= 0 || ClientSize.Height <= 0)
                     return;
 
-                Rectangle target = GetZoomRectangle(_frame.Width, _frame.Height, ClientSize.Width, ClientSize.Height);
+                Rectangle target = GetFitRectangle(_frame.Width, _frame.Height, ClientSize.Width, ClientSize.Height);
                 e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
                 e.Graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
                 e.Graphics.DrawImage(_frame, target);
             }
 
-            private static Rectangle GetZoomRectangle(int imageWidth, int imageHeight, int viewWidth, int viewHeight)
+            private static Rectangle GetFitRectangle(int imageWidth, int imageHeight, int viewWidth, int viewHeight)
             {
-                if (imageWidth <= 0 || imageHeight <= 0)
+                if (imageWidth <= 0 || imageHeight <= 0 || viewWidth <= 0 || viewHeight <= 0)
                     return Rectangle.Empty;
 
-                double scale = Math.Min(
-                    viewWidth / (double)imageWidth,
-                    viewHeight / (double)imageHeight);
+                double scale = Math.Min(viewWidth / (double)imageWidth, viewHeight / (double)imageHeight);
                 int width = Math.Max(1, (int)Math.Round(imageWidth * scale));
                 int height = Math.Max(1, (int)Math.Round(imageHeight * scale));
                 int x = (viewWidth - width) / 2;

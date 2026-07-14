@@ -191,6 +191,102 @@ namespace MxfPlayer.Services
             }
         }
 
+        public byte[]? ReadFrameStereoPcm(long frameIndex, double fps, bool[] mask)
+        {
+            if (frameIndex < 0) frameIndex = 0;
+            if (fps <= 0) fps = 29.97;
+
+            lock (_streamLock)
+            {
+                if (_disposed)
+                    return null;
+
+                long originalPosition = _fileStream.Position;
+                try
+                {
+                    long startSample = MediaSampleToSourceSample((long)Math.Round(frameIndex * _sampleRate / fps));
+                    long endSample = MediaSampleToSourceSample((long)Math.Round((frameIndex + 1) * _sampleRate / fps));
+                    long baseSampleIndex = MediaSampleToSourceSample((long)Math.Round(_baseTimeMs * _sampleRate / 1000.0));
+                    startSample -= baseSampleIndex;
+                    endSample -= baseSampleIndex;
+
+                    if (startSample < 0)
+                        return null;
+
+                    long sourceFrames = Math.Max(1, endSample - startSample);
+                    int bytesPerFrameIn = _channels * 2;
+                    long pos = startSample * bytesPerFrameIn;
+                    pos = (pos / bytesPerFrameIn) * bytesPerFrameIn;
+                    if (pos < 0 || pos >= _fileStream.Length)
+                        return null;
+
+                    int bytesToRead = (int)Math.Min(sourceFrames * bytesPerFrameIn, _fileStream.Length - pos);
+                    bytesToRead = (bytesToRead / bytesPerFrameIn) * bytesPerFrameIn;
+                    if (bytesToRead <= 0)
+                        return null;
+
+                    byte[] rawBuffer = new byte[bytesToRead];
+                    _fileStream.Position = pos;
+                    int bytesRead = _fileStream.Read(rawBuffer, 0, rawBuffer.Length);
+                    int framesRead = bytesRead / bytesPerFrameIn;
+                    if (framesRead <= 0)
+                        return null;
+
+                    byte[] stereoPcm = new byte[framesRead * 4];
+                    for (int frame = 0; frame < framesRead; frame++)
+                    {
+                        int inOffset = frame * bytesPerFrameIn;
+                        short left;
+                        short right;
+
+                        if (_channels == 1)
+                        {
+                            left = BitConverter.ToInt16(rawBuffer, inOffset);
+                            right = left;
+                        }
+                        else if (_channels == 2)
+                        {
+                            left = BitConverter.ToInt16(rawBuffer, inOffset);
+                            right = BitConverter.ToInt16(rawBuffer, inOffset + 2);
+                        }
+                        else
+                        {
+                            long mixed = 0;
+                            int active = 0;
+                            int channelLimit = Math.Min(_channels, mask.Length);
+                            for (int channel = 0; channel < channelLimit; channel++)
+                            {
+                                if (!mask[channel])
+                                    continue;
+
+                                mixed += BitConverter.ToInt16(rawBuffer, inOffset + (channel * 2));
+                                active++;
+                            }
+
+                            short sample = active > 0
+                                ? (short)Math.Clamp(mixed, short.MinValue, short.MaxValue)
+                                : (short)0;
+                            left = sample;
+                            right = sample;
+                        }
+
+                        int outOffset = frame * 4;
+                        stereoPcm[outOffset] = (byte)(left & 0xff);
+                        stereoPcm[outOffset + 1] = (byte)((left >> 8) & 0xff);
+                        stereoPcm[outOffset + 2] = (byte)(right & 0xff);
+                        stereoPcm[outOffset + 3] = (byte)((right >> 8) & 0xff);
+                    }
+
+                    return stereoPcm;
+                }
+                finally
+                {
+                    if (!_disposed)
+                        _fileStream.Position = Math.Min(originalPosition, _fileStream.Length);
+                }
+            }
+        }
+
         public unsafe int Read(byte[] buffer, int offset, int count)
         {
             try
