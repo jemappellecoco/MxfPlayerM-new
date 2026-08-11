@@ -112,6 +112,7 @@ namespace MxfPlayer.Services
         private const int ReverseSegmentPreloadFrames = 90;
         private bool _isInterlaced;
         private bool _topFieldFirst = true;
+        private bool _smoothInterlacedMonitoringMode = false;
         private int _displayUnitsPerFrame = 1;
 
         private bool DeinterlacePlaybackVideo => _isInterlaced;
@@ -366,7 +367,8 @@ namespace MxfPlayer.Services
                 AVPixelFormat pixelFormat,
                 AVRational timeBase,
                 AVRational frameRate,
-                AVRational sampleAspectRatio)
+                AVRational sampleAspectRatio,
+                string filterDesc)
             {
                 _graph = ffmpeg.avfilter_graph_alloc();
                 if (_graph == null)
@@ -425,11 +427,6 @@ namespace MxfPlayer.Services
                 inputs->pad_idx = 0;
                 inputs->next = null;
 
-                //string filterMode = FieldPlaybackMode ? "send_field" : "send_frame";
-                //string filterName = FieldPlaybackMode ? "bwdif" : "yadif";
-                //string filterDesc = $"{filterName}=mode={filterMode}:parity=auto:deint=interlaced";
-                string filterDesc = "bwdif=mode=send_field:parity=auto:deint=all";
-
                 int parseRet = ffmpeg.avfilter_graph_parse_ptr(_graph, filterDesc, &inputs, &outputs, null);
                 if (parseRet >= 0 && ffmpeg.avfilter_graph_config(_graph, null) < 0)
                     parseRet = -1;
@@ -486,7 +483,13 @@ namespace MxfPlayer.Services
                 "Bottom Field First",
                 StringComparison.OrdinalIgnoreCase);
 
-            _displayUnitsPerFrame = _isInterlaced ? 2 : 1;
+            _displayUnitsPerFrame = 1;
+        }
+
+        public void SetSmoothInterlacedMonitoringMode(bool enabled)
+        {
+            _smoothInterlacedMonitoringMode = enabled;
+            _displayUnitsPerFrame = 1;
         }
         private static int NormalizeSampleRate(int sampleRate)
         {
@@ -1352,14 +1355,16 @@ namespace MxfPlayer.Services
                     AVRational sourceFrameRate = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0
                         ? stream->avg_frame_rate
                         : stream->r_frame_rate;
-
+                    //string filterDesc = "separatefields,tblend=all_mode=average,framestep=2,scale=iw:ih*2:flags=bicubic";
+                    string filterDesc = "separatefields,framestep=2,scale=iw:ih*2:flags=bicubic";
                     videoFilter = new VideoBwdifFilter(
                         width,
                         height,
                         codecContext->pix_fmt,
                         stream->time_base,
                         sourceFrameRate,
-                        codecContext->sample_aspect_ratio);
+                        codecContext->sample_aspect_ratio,
+                        filterDesc);
                 }
 
                 frame = ffmpeg.av_frame_alloc();
@@ -1680,9 +1685,7 @@ namespace MxfPlayer.Services
 
             while (!token.IsCancellationRequested && IsCurrentVideoDecodeGeneration(decodeGeneration))
             {
-                long currentFrame;
-                lock (_lock)
-                    currentFrame = _currentFrameIndex;
+                long currentFrame = Interlocked.Read(ref _currentFrameIndex);
 
                 if (frameIndex - currentFrame < GetForwardHighWaterDisplayFrames(_videoRate))
                     return;
