@@ -33,6 +33,10 @@ namespace MxfPlayer.Services
         private const int SwsFastBilinear = 1;
         private WaveOutEvent? _waveOut;
         private BufferedWaveProvider _waveProvider;
+        private readonly object _frameAudioLock = new();
+        private WaveOutEvent? _frameAudioOut;
+        private BufferedWaveProvider? _frameAudioProvider;
+        private int _frameAudioSampleRate;
         private MxfAudioProvider? _fileAudioProvider;
         private MemoryPcmAudioProvider? _memoryAudioProvider;
         private SlidingPcmAudioProvider? _slidingAudioProvider;
@@ -42,10 +46,6 @@ namespace MxfPlayer.Services
         private int _pcmOutputChannels;
         public double CurrentFps => _audioFps > 0 ? _audioFps : 29.97;
         private readonly Dictionary<long, Bitmap> _videoFrameCache = new();
-        private static readonly ParallelOptions VideoBlendParallelOptions = new()
-        {
-            MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount / 4, 1, 2)
-        };
         private const long VideoFrameCacheBudgetBytes = 3072L * 1024L * 1024L;
         private const int MinCachedVideoFrames = 96;
         private const int MaxCachedVideoFrames = 600; // Hard cap for decoded bitmaps kept in memory.
@@ -89,10 +89,6 @@ namespace MxfPlayer.Services
         private long _videoDecodePerfSendTicks;
         private long _videoDecodePerfReceiveFrames;
         private long _videoDecodePerfReceiveTicks;
-        private long _videoDecodePerfFilterInputFrames;
-        private long _videoDecodePerfFilterInputTicks;
-        private long _videoDecodePerfFilterOutputFrames;
-        private long _videoDecodePerfFilterOutputTicks;
         private long _videoDecodePerfFrames;
         private long _videoDecodePerfBitmapTicks;
         private long _videoDecodePerfCacheTicks;
@@ -110,13 +106,8 @@ namespace MxfPlayer.Services
         private const int ReverseAudioInitialMaxSourceMs = 12000;
         private const int ReverseSegmentFrames = 300;
         private const int ReverseSegmentPreloadFrames = 90;
-        private bool _isInterlaced;
-        private bool _topFieldFirst = true;
-        private bool _smoothInterlacedMonitoringMode = false;
         private int _displayUnitsPerFrame = 1;
 
-        private bool DeinterlacePlaybackVideo => _isInterlaced;
-        private bool FieldPlaybackMode => _displayUnitsPerFrame > 1;
         private int DisplayUnitsPerFrame => _displayUnitsPerFrame;
         private double DisplayFps => CurrentFps * DisplayUnitsPerFrame;
 
@@ -353,143 +344,11 @@ namespace MxfPlayer.Services
             }
         }
 
-        private sealed unsafe class VideoBwdifFilter : IDisposable
-        {
-            private AVFilterGraph* _graph;
-            private AVFilterContext* _srcContext;
-            private AVFilterContext* _sinkContext;
-
-            public bool IsReady => _graph != null && _srcContext != null && _sinkContext != null;
-
-            public VideoBwdifFilter(
-                int width,
-                int height,
-                AVPixelFormat pixelFormat,
-                AVRational timeBase,
-                AVRational frameRate,
-                AVRational sampleAspectRatio,
-                string filterDesc)
-            {
-                _graph = ffmpeg.avfilter_graph_alloc();
-                if (_graph == null)
-                    return;
-
-                AVFilter* buffer = ffmpeg.avfilter_get_by_name("buffer");
-                AVFilter* bufferSink = ffmpeg.avfilter_get_by_name("buffersink");
-                if (buffer == null || bufferSink == null)
-                    return;
-
-                if (timeBase.num <= 0 || timeBase.den <= 0)
-                    timeBase = new AVRational { num = 1, den = 1000 };
-
-                if (frameRate.num <= 0 || frameRate.den <= 0)
-                    frameRate = new AVRational { num = 30000, den = 1001 };
-
-                if (sampleAspectRatio.num <= 0 || sampleAspectRatio.den <= 0)
-                    sampleAspectRatio = new AVRational { num = 1, den = 1 };
-
-                string args =
-                    $"video_size={width}x{height}:" +
-                    $"pix_fmt={(int)pixelFormat}:" +
-                    $"time_base={timeBase.num}/{timeBase.den}:" +
-                    $"pixel_aspect={sampleAspectRatio.num}/{sampleAspectRatio.den}:" +
-                    $"frame_rate={frameRate.num}/{frameRate.den}";
-
-                AVFilterContext* src = null;
-                AVFilterContext* sink = null;
-                int srcRet = ffmpeg.avfilter_graph_create_filter(&src, buffer, "in", args, null, _graph);
-                if (srcRet < 0 || src == null)
-                    return;
-
-                int sinkRet = ffmpeg.avfilter_graph_create_filter(&sink, bufferSink, "out", null, null, _graph);
-                if (sinkRet < 0 || sink == null)
-                    return;
-
-                _srcContext = src;
-                _sinkContext = sink;
-
-                AVFilterInOut* outputs = ffmpeg.avfilter_inout_alloc();
-                AVFilterInOut* inputs = ffmpeg.avfilter_inout_alloc();
-                if (outputs == null || inputs == null)
-                {
-                    ffmpeg.avfilter_inout_free(&outputs);
-                    ffmpeg.avfilter_inout_free(&inputs);
-                    return;
-                }
-
-                outputs->name = ffmpeg.av_strdup("in");
-                outputs->filter_ctx = _srcContext;
-                outputs->pad_idx = 0;
-                outputs->next = null;
-
-                inputs->name = ffmpeg.av_strdup("out");
-                inputs->filter_ctx = _sinkContext;
-                inputs->pad_idx = 0;
-                inputs->next = null;
-
-                int parseRet = ffmpeg.avfilter_graph_parse_ptr(_graph, filterDesc, &inputs, &outputs, null);
-                if (parseRet >= 0 && ffmpeg.avfilter_graph_config(_graph, null) < 0)
-                    parseRet = -1;
-
-                ffmpeg.avfilter_inout_free(&inputs);
-                ffmpeg.avfilter_inout_free(&outputs);
-
-                if (parseRet < 0)
-                {
-                    Dispose();
-                }
-            }
-
-            public bool AddFrame(AVFrame* frame)
-            {
-                return IsReady &&
-                    ffmpeg.av_buffersrc_add_frame_flags(_srcContext, frame, (int)AV_BUFFERSRC_FLAG_KEEP_REF) >= 0;
-            }
-
-            public bool TryReceiveFrame(AVFrame* frame)
-            {
-                return IsReady && ffmpeg.av_buffersink_get_frame(_sinkContext, frame) >= 0;
-            }
-
-            public void Dispose()
-            {
-                if (_graph != null)
-                {
-                    var graph = _graph;
-                    ffmpeg.avfilter_graph_free(&graph);
-                    _graph = null;
-                }
-
-                _srcContext = null;
-                _sinkContext = null;
-            }
-        }
-
         public PlayerService()
         {
             LoadFFmpegFromConfig();
 
             _waveProvider = CreateWaveProvider(_audioSampleRate);
-        }
-        public void ConfigureVideoScan(string scanType, string scanOrder)
-        {
-            _isInterlaced = string.Equals(
-                scanType?.Trim(),
-                "Interlaced",
-                StringComparison.OrdinalIgnoreCase);
-
-            _topFieldFirst = !string.Equals(
-                scanOrder?.Trim(),
-                "Bottom Field First",
-                StringComparison.OrdinalIgnoreCase);
-
-            _displayUnitsPerFrame = 1;
-        }
-
-        public void SetSmoothInterlacedMonitoringMode(bool enabled)
-        {
-            _smoothInterlacedMonitoringMode = enabled;
-            _displayUnitsPerFrame = 1;
         }
         private static int NormalizeSampleRate(int sampleRate)
         {
@@ -1160,7 +1019,7 @@ namespace MxfPlayer.Services
             return 0;
         }
 
-        private Bitmap CreateBitmapFromFrame(AVFrame* sourceFrame, SwsContext* swsContext, int width, int height, bool deinterlaceFrame = false, int fieldOffset = 0)
+        private Bitmap CreateBitmapFromFrame(AVFrame* sourceFrame, SwsContext* swsContext, int width, int height)
         {
             var bitmap = RentVideoBitmap(width, height);
             var data = bitmap.LockBits(
@@ -1171,8 +1030,6 @@ namespace MxfPlayer.Services
             try
             {
                 int targetStride = data.Stride;
-                int rowBytes = width * 4;
-
                 AVFrame bitmapFrame = default;
                 bitmapFrame.data[0] = (byte*)data.Scan0;
                 bitmapFrame.linesize[0] = targetStride;
@@ -1186,10 +1043,6 @@ namespace MxfPlayer.Services
                     bitmapFrame.data,
                     bitmapFrame.linesize);
 
-                if (!deinterlaceFrame)
-                    return bitmap;
-
-                BobDeinterlaceField((byte*)data.Scan0, targetStride, rowBytes, height, fieldOffset);
             }
             finally
             {
@@ -1197,61 +1050,6 @@ namespace MxfPlayer.Services
             }
 
             return bitmap;
-        }
-
-        private static void BobDeinterlaceField(byte* basePtr, int stride, int rowBytes, int height, int fieldOffset)
-        {
-            const ulong ByteAverageMask64 = 0xFEFEFEFEFEFEFEFEUL;
-            const uint ByteAverageMask32 = 0xFEFEFEFEU;
-            int missingFieldOffset = fieldOffset == 0 ? 1 : 0;
-            int missingRowCount = (height + 1 - missingFieldOffset) / 2;
-            nint baseAddress = (nint)basePtr;
-
-            Parallel.For(0, missingRowCount, VideoBlendParallelOptions, rowIndex =>
-            {
-                int y = missingFieldOffset + (rowIndex * 2);
-                byte* imageBase = (byte*)baseAddress;
-                byte* target = imageBase + (y * stride);
-                int previousY = y - 1;
-                int nextY = y + 1;
-
-                if (previousY < 0 && nextY >= height)
-                    return;
-
-                if (previousY < 0)
-                {
-                    Buffer.MemoryCopy(imageBase + (nextY * stride), target, stride, rowBytes);
-                    return;
-                }
-
-                if (nextY >= height)
-                {
-                    Buffer.MemoryCopy(imageBase + (previousY * stride), target, stride, rowBytes);
-                    return;
-                }
-
-                byte* previous = imageBase + (previousY * stride);
-                byte* next = imageBase + (nextY * stride);
-                int x = 0;
-
-                for (; x <= rowBytes - sizeof(ulong); x += sizeof(ulong))
-                {
-                    ulong a = *(ulong*)(previous + x);
-                    ulong b = *(ulong*)(next + x);
-                    ulong average = (a & b) + (((a ^ b) & ByteAverageMask64) >> 1);
-
-                    *(ulong*)(target + x) = average;
-                }
-
-                for (; x <= rowBytes - sizeof(uint); x += sizeof(uint))
-                {
-                    uint a = *(uint*)(previous + x);
-                    uint b = *(uint*)(next + x);
-                    uint average = (a & b) + (((a ^ b) & ByteAverageMask32) >> 1);
-
-                    *(uint*)(target + x) = average;
-                }
-            });
         }
 
         private Bitmap RentVideoBitmap(int width, int height)
@@ -1293,16 +1091,6 @@ namespace MxfPlayer.Services
             _videoBitmapPool.Clear();
         }
 
-        private static bool ShouldDisplaySingleField(AVFrame* frame)
-        {
-            return (frame->flags & ffmpeg.AV_FRAME_FLAG_INTERLACED) != 0;
-        }
-
-        private static int GetFirstFieldOffset(AVFrame* frame)
-        {
-            return (frame->flags & ffmpeg.AV_FRAME_FLAG_TOP_FIELD_FIRST) != 0 ? 0 : 1;
-        }
-
         private void DecodeVideoFrameWindow(string path, long startFrame, int decodeGeneration, CancellationToken token, long? endFrameExclusive = null)
         {
             AVFormatContext* formatContext = null;
@@ -1310,9 +1098,7 @@ namespace MxfPlayer.Services
 
             AVCodecContext* codecContext = null;
             SwsContext* swsContext = null;
-            VideoBwdifFilter? videoFilter = null;
             AVFrame* frame = null;
-            AVFrame* filteredFrame = null;
             AVPacket* packet = null;
 
             try
@@ -1350,25 +1136,7 @@ namespace MxfPlayer.Services
                     width, height, AVPixelFormat.AV_PIX_FMT_BGR0,
                     SwsFastBilinear, null, null, null);
 
-                if (DeinterlacePlaybackVideo || FieldPlaybackMode)
-                {
-                    AVRational sourceFrameRate = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0
-                        ? stream->avg_frame_rate
-                        : stream->r_frame_rate;
-                    //string filterDesc = "separatefields,tblend=all_mode=average,framestep=2,scale=iw:ih*2:flags=bicubic";
-                    string filterDesc = "separatefields,framestep=2,scale=iw:ih*2:flags=bicubic";
-                    videoFilter = new VideoBwdifFilter(
-                        width,
-                        height,
-                        codecContext->pix_fmt,
-                        stream->time_base,
-                        sourceFrameRate,
-                        codecContext->sample_aspect_ratio,
-                        filterDesc);
-                }
-
                 frame = ffmpeg.av_frame_alloc();
-                filteredFrame = ffmpeg.av_frame_alloc();
                 packet = ffmpeg.av_packet_alloc();
 
                 long seekFrame = Math.Max(0, startFrame - 3);
@@ -1384,7 +1152,6 @@ namespace MxfPlayer.Services
                 long lastWindowFrame = windowEndFrame - 1;
                 long fallbackFrameIndex = seekFrame;
                 long cachedThroughFrame = startFrame - 1;
-                long filterOutputDisplayIndex = -1;
 
                 while (!token.IsCancellationRequested &&
                        IsCurrentVideoDecodeGeneration(decodeGeneration) &&
@@ -1406,8 +1173,6 @@ namespace MxfPlayer.Services
                             DecodeWindowFrames(
                                 codecContext,
                                 frame,
-                                filteredFrame,
-                                videoFilter,
                                 swsContext,
                                 width,
                                 height,
@@ -1417,7 +1182,6 @@ namespace MxfPlayer.Services
                                 windowEndFrame,
                                 ref fallbackFrameIndex,
                                 ref cachedThroughFrame,
-                                ref filterOutputDisplayIndex,
                                 decodeGeneration,
                                 token);
 
@@ -1435,9 +1199,7 @@ namespace MxfPlayer.Services
             finally
             {
                 if (packet != null) ffmpeg.av_packet_free(&packet);
-                if (filteredFrame != null) ffmpeg.av_frame_free(&filteredFrame);
                 if (frame != null) ffmpeg.av_frame_free(&frame);
-                videoFilter?.Dispose();
                 if (swsContext != null) ffmpeg.sws_freeContext(swsContext);
                 if (codecContext != null) ffmpeg.avcodec_free_context(&codecContext);
                 if (formatContext != null) ffmpeg.avformat_close_input(&formatContext);
@@ -1447,8 +1209,6 @@ namespace MxfPlayer.Services
         private void DecodeWindowFrames(
             AVCodecContext* codecContext,
             AVFrame* frame,
-            AVFrame* filteredFrame,
-            VideoBwdifFilter? videoFilter,
             SwsContext* swsContext,
             int width,
             int height,
@@ -1458,7 +1218,6 @@ namespace MxfPlayer.Services
             long windowEndFrame,
             ref long fallbackFrameIndex,
             ref long cachedThroughFrame,
-            ref long filterOutputDisplayIndex,
             int decodeGeneration,
             CancellationToken token)
         {
@@ -1490,97 +1249,29 @@ namespace MxfPlayer.Services
                     break;
                 }
 
-                long bitmapStartTicks = Stopwatch.GetTimestamp();
-                if ((DeinterlacePlaybackVideo || FieldPlaybackMode) && videoFilter?.IsReady == true)
+                if (frameIndex < windowStartFrame)
                 {
-                    if (filterOutputDisplayIndex < 0)
-                        filterOutputDisplayIndex = displayIndex;
-
-                    long filterInputStartTicks = Stopwatch.GetTimestamp();
-                    bool addedToFilter = videoFilter.AddFrame(frame);
-                    TrackVideoFilterInputPerf(Stopwatch.GetTimestamp() - filterInputStartTicks);
-                    if (addedToFilter)
-                    {
-                        while (true)
-                        {
-                            long filterOutputStartTicks = Stopwatch.GetTimestamp();
-                            bool receivedFilteredFrame = videoFilter.TryReceiveFrame(filteredFrame);
-                            TrackVideoFilterOutputPerf(
-                                Stopwatch.GetTimestamp() - filterOutputStartTicks,
-                                receivedFilteredFrame);
-                            if (!receivedFilteredFrame)
-                                break;
-
-                            long filteredDisplayIndex;
-                            if (FieldPlaybackMode)
-                            {
-                                filteredDisplayIndex = filterOutputDisplayIndex;
-                                filterOutputDisplayIndex++;
-                            }
-                            else
-                            {
-                                long filteredFrameIndex = GetFrameIndexFromTimestamp(
-                                    filteredFrame,
-                                    streamTimeBase,
-                                    streamStartTime,
-                                    frameIndex);
-                                filteredDisplayIndex = DisplayIndexFromMediaFrame(filteredFrameIndex);
-                                filterOutputDisplayIndex = Math.Max(filterOutputDisplayIndex + 1, filteredDisplayIndex + 1);
-                            }
-                            long filteredMediaFrameIndex = MediaFrameFromDisplayIndex(filteredDisplayIndex);
-
-                            if (filteredMediaFrameIndex >= windowStartFrame &&
-                                filteredDisplayIndex < TotalDisplayUnits &&
-                                filteredMediaFrameIndex < windowEndFrame &&
-                                ShouldCacheVideoFrame(filteredDisplayIndex, decodeGeneration))
-                            {
-                                long fieldBitmapStartTicks = Stopwatch.GetTimestamp();
-                                Bitmap bitmap = CreateBitmapFromFrame(filteredFrame, swsContext, width, height);
-                                long fieldBitmapTicks = Stopwatch.GetTimestamp() - fieldBitmapStartTicks;
-                                long fieldCacheStartTicks = Stopwatch.GetTimestamp();
-                                bool addedToCache = AddVideoFrameToCache(filteredDisplayIndex, bitmap, decodeGeneration);
-                                long fieldCacheTicks = Stopwatch.GetTimestamp() - fieldCacheStartTicks;
-                                if (addedToCache)
-                                    TrackVideoDecodePerf(fieldBitmapTicks, fieldCacheTicks);
-                            }
-
-                            if (filteredDisplayIndex >= DisplayIndexFromMediaFrame(windowStartFrame) &&
-                                filteredDisplayIndex < DisplayIndexFromMediaFrame(windowEndFrame))
-                            {
-                                cachedThroughFrame = Math.Max(
-                                    cachedThroughFrame,
-                                    filteredMediaFrameIndex);
-                            }
-
-                            ffmpeg.av_frame_unref(filteredFrame);
-                        }
-                    }
+                    ffmpeg.av_frame_unref(frame);
+                    continue;
                 }
-                else
+
+                if (!ShouldCacheVideoFrame(displayIndex, decodeGeneration))
                 {
-                    if (frameIndex < windowStartFrame)
-                    {
-                        ffmpeg.av_frame_unref(frame);
-                        continue;
-                    }
+                    ffmpeg.av_frame_unref(frame);
+                    continue;
+                }
 
-                    if (!ShouldCacheVideoFrame(displayIndex, decodeGeneration))
-                    {
-                        ffmpeg.av_frame_unref(frame);
-                        continue;
-                    }
+                long bitmapStartTicks = Stopwatch.GetTimestamp();
+                Bitmap bitmap = CreateBitmapFromFrame(frame, swsContext, width, height);
+                long bitmapTicks = Stopwatch.GetTimestamp() - bitmapStartTicks;
+                long cacheStartTicks = Stopwatch.GetTimestamp();
+                bool addedToCache = AddVideoFrameToCache(displayIndex, bitmap, decodeGeneration);
+                long cacheTicks = Stopwatch.GetTimestamp() - cacheStartTicks;
 
-                    Bitmap bitmap = CreateBitmapFromFrame(frame, swsContext, width, height);
-                    long bitmapTicks = Stopwatch.GetTimestamp() - bitmapStartTicks;
-                    long cacheStartTicks = Stopwatch.GetTimestamp();
-                    bool addedToCache = AddVideoFrameToCache(displayIndex, bitmap, decodeGeneration);
-                    long cacheTicks = Stopwatch.GetTimestamp() - cacheStartTicks;
-
-                    if (addedToCache)
-                    {
-                        cachedThroughFrame = Math.Max(cachedThroughFrame, frameIndex);
-                        TrackVideoDecodePerf(bitmapTicks, cacheTicks);
-                    }
+                if (addedToCache)
+                {
+                    cachedThroughFrame = Math.Max(cachedThroughFrame, frameIndex);
+                    TrackVideoDecodePerf(bitmapTicks, cacheTicks);
                 }
 
                 ffmpeg.av_frame_unref(frame);
@@ -1605,19 +1296,6 @@ namespace MxfPlayer.Services
             Interlocked.Add(ref _videoDecodePerfReceiveTicks, receiveTicks);
         }
 
-        private void TrackVideoFilterInputPerf(long filterInputTicks)
-        {
-            Interlocked.Increment(ref _videoDecodePerfFilterInputFrames);
-            Interlocked.Add(ref _videoDecodePerfFilterInputTicks, filterInputTicks);
-        }
-
-        private void TrackVideoFilterOutputPerf(long filterOutputTicks, bool receivedFrame)
-        {
-            if (receivedFrame)
-                Interlocked.Increment(ref _videoDecodePerfFilterOutputFrames);
-            Interlocked.Add(ref _videoDecodePerfFilterOutputTicks, filterOutputTicks);
-        }
-
         private void TrackVideoDecodePerf(long bitmapTicks, long cacheTicks)
         {
             long frames = Interlocked.Increment(ref _videoDecodePerfFrames);
@@ -1639,10 +1317,6 @@ namespace MxfPlayer.Services
                 long totalSendTicks = Interlocked.Exchange(ref _videoDecodePerfSendTicks, 0);
                 long totalReceiveFrames = Interlocked.Exchange(ref _videoDecodePerfReceiveFrames, 0);
                 long totalReceiveTicks = Interlocked.Exchange(ref _videoDecodePerfReceiveTicks, 0);
-                long totalFilterInputFrames = Interlocked.Exchange(ref _videoDecodePerfFilterInputFrames, 0);
-                long totalFilterInputTicks = Interlocked.Exchange(ref _videoDecodePerfFilterInputTicks, 0);
-                long totalFilterOutputFrames = Interlocked.Exchange(ref _videoDecodePerfFilterOutputFrames, 0);
-                long totalFilterOutputTicks = Interlocked.Exchange(ref _videoDecodePerfFilterOutputTicks, 0);
                 long totalFrames = Interlocked.Exchange(ref _videoDecodePerfFrames, 0);
                 long totalBitmapTicks = Interlocked.Exchange(ref _videoDecodePerfBitmapTicks, 0);
                 long totalCacheTicks = Interlocked.Exchange(ref _videoDecodePerfCacheTicks, 0);
@@ -1652,8 +1326,6 @@ namespace MxfPlayer.Services
                 double readMs = AverageMilliseconds(totalReadTicks, totalPackets);
                 double sendMs = AverageMilliseconds(totalSendTicks, totalSendPackets);
                 double receiveMs = AverageMilliseconds(totalReceiveTicks, totalReceiveFrames);
-                double filterInMs = AverageMilliseconds(totalFilterInputTicks, totalFilterInputFrames);
-                double filterOutMs = AverageMilliseconds(totalFilterOutputTicks, totalFilterOutputFrames);
                 double bitmapMs = totalFrames > 0
                     ? totalBitmapTicks * 1000.0 / Stopwatch.Frequency / totalFrames
                     : 0;
@@ -1663,7 +1335,6 @@ namespace MxfPlayer.Services
                     $"[VideoDecodePerf] fps={totalFrames / elapsedSeconds:0.0} " +
                     $"activeFps={totalFrames / activeSeconds:0.0} " +
                     $"readMs={readMs:0.00} sendMs={sendMs:0.00} receiveMs={receiveMs:0.00} " +
-                    $"filterInMs={filterInMs:0.00} filterOutMs={filterOutMs:0.00} " +
                     $"bitmapMs={bitmapMs:0.00} cacheMs={cacheMs:0.00} " +
                     $"throttleMs={throttleSeconds * 1000.0:0} frames={totalFrames} packets={totalPackets}");
 
@@ -2332,6 +2003,7 @@ namespace MxfPlayer.Services
 
         public void ResumeAudio(int audioBufferTimeoutMs = 3000)
         {
+            StopFrameAudioOutput();
             ClearFrameAudioPeaks();
             long currentMediaFrame = CurrentFrameIndex;
             SeekAudioByFrame(currentMediaFrame, _audioFps);
@@ -2776,15 +2448,13 @@ namespace MxfPlayer.Services
         public void SeekAudioByFrame(long frameIndex, double fps, bool waitForPreviousCache = true)
         {
             frameIndex = ClampFrameIndex(frameIndex);
-            bool positiveTempoPlayback = _videoRate > 0 && Math.Abs(_videoRate - 1.0f) > 0.001f;
-
             bool hasData = _videoRate < 0
                 ? (_reverseSegment != null &&
                    _reverseSegment.Contains(frameIndex, _videoRate) &&
                    _reverseAudioProvider != null &&
                    _reverseAudioProvider.HasFrameData(frameIndex, 250))
                 : (_fileAudioProvider != null &&
-                   (!positiveTempoPlayback || Math.Abs(_forwardAudioCacheRate - _videoRate) <= 0.001f) &&
+                   Math.Abs(_forwardAudioCacheRate - _videoRate) <= 0.001f &&
                    _fileAudioProvider.IsFrameDataAvailable(frameIndex, fps));
 
             if (!hasData)
@@ -2840,21 +2510,54 @@ namespace MxfPlayer.Services
 
         private void PlayOneShotFrameAudio(byte[] framePcm)
         {
-            var frameProvider = new OneShotPcmAudioProvider(framePcm, _audioSampleRate);
-            using var waveOut = new WaveOutEvent
+            int sampleRate = _audioSampleRate > 0 ? _audioSampleRate : 48000;
+            int frameMs = Math.Max(1, (int)Math.Ceiling(framePcm.Length * 1000.0 / Math.Max(1, sampleRate * 4)));
+
+            lock (_frameAudioLock)
             {
-                DesiredLatency = 40,
-                NumberOfBuffers = 2
-            };
+                if (_frameAudioOut == null ||
+                    _frameAudioProvider == null ||
+                    _frameAudioSampleRate != sampleRate)
+                {
+                    DisposeFrameAudioOutputLocked();
+                    _frameAudioProvider = new BufferedWaveProvider(new WaveFormat(sampleRate, 16, 2))
+                    {
+                        BufferDuration = TimeSpan.FromMilliseconds(250),
+                        DiscardOnBufferOverflow = true,
+                        ReadFully = true
+                    };
+                    _frameAudioOut = new WaveOutEvent
+                    {
+                        DesiredLatency = 40,
+                        NumberOfBuffers = 2
+                    };
+                    _frameAudioOut.Init(_frameAudioProvider);
+                    _frameAudioOut.Play();
+                    _frameAudioSampleRate = sampleRate;
+                }
 
-            using var playbackDone = new ManualResetEventSlim(false);
-            waveOut.PlaybackStopped += (_, _) => playbackDone.Set();
-            waveOut.Init(frameProvider);
-            waveOut.Play();
+                _frameAudioProvider.ClearBuffer();
+                _frameAudioProvider.AddSamples(framePcm, 0, framePcm.Length);
+                if (_frameAudioOut.PlaybackState != PlaybackState.Playing)
+                    _frameAudioOut.Play();
+            }
 
-            int frameMs = Math.Max(35, (int)Math.Ceiling(framePcm.Length * 1000.0 / Math.Max(1, _audioSampleRate * 4)));
-            playbackDone.Wait(frameMs + 200);
-            try { waveOut.Stop(); } catch { }
+            Thread.Sleep(frameMs);
+        }
+
+        private void StopFrameAudioOutput()
+        {
+            lock (_frameAudioLock)
+                DisposeFrameAudioOutputLocked();
+        }
+
+        private void DisposeFrameAudioOutputLocked()
+        {
+            try { _frameAudioOut?.Stop(); } catch { }
+            try { _frameAudioOut?.Dispose(); } catch { }
+            _frameAudioOut = null;
+            _frameAudioProvider = null;
+            _frameAudioSampleRate = 0;
         }
 
         private void CaptureFrameAudioPeaks(long frameIndex, double fps)
@@ -3005,6 +2708,7 @@ namespace MxfPlayer.Services
 
         public void StopAudioBridge()
         {
+            StopFrameAudioOutput();
             _isVideoPlaying = false;
             _isPlaybackStalledForVideo = false;
             _isPlaybackStalledForAudio = false;

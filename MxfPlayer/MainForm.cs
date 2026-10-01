@@ -526,9 +526,6 @@ namespace MxfPlayer
                         audioCount = parsedAudioCount;
                     }
 
-                    _player.ConfigureVideoScan(
-                        info.ScanType,
-                        info.ScanOrder);
                 }
 
                 fps = GetSelectedFps();
