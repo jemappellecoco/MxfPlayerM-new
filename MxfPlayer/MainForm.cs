@@ -526,6 +526,7 @@ namespace MxfPlayer
                         audioCount = parsedAudioCount;
                     }
 
+                    _player.ConfigureVideoScan(info.ScanType);
                 }
 
                 fps = GetSelectedFps();
@@ -3088,7 +3089,7 @@ namespace MxfPlayer
                     return;
 
                 Rectangle target = GetFitRectangle(_frame.Width, _frame.Height, ClientSize.Width, ClientSize.Height);
-                e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
+                e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
                 e.Graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
                 e.Graphics.DrawImage(_frame, target);
             }
