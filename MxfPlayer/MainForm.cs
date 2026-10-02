@@ -25,6 +25,7 @@ namespace MxfPlayer
         private readonly AudioMixerService _audioMixer = new();
         private readonly PlaybackController _playbackController;
         private Dictionary<HotKeyAction, Keys> _hotKeyBindings = HotKeySettings.Load();
+        private readonly MainHotKeyMessageFilter _hotKeyMessageFilter;
         private Panel _timelineLabelsPanel = null!;
         private readonly Random _rnd = new();
         private VideoFrameView _videoView = null!;
@@ -71,8 +72,12 @@ namespace MxfPlayer
         private const int PlaybackStartupBufferTimeoutMs = 30000;
         private const int FastPlaybackBufferTimeout2xMs = 300;
         private const int FastPlaybackBufferTimeout4xMs = 500;
+        private const int ReversePlaybackBufferTimeoutMs = 4000;
         public MainForm()
         {
+            _hotKeyMessageFilter = new MainHotKeyMessageFilter(this);
+            Application.AddMessageFilter(_hotKeyMessageFilter);
+            FormClosed += (_, _) => Application.RemoveMessageFilter(_hotKeyMessageFilter);
             Text = "Offline xPlayer";
             Width = 1680;
             Height = 930;
@@ -171,6 +176,26 @@ namespace MxfPlayer
                 return true;
 
             return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        private sealed class MainHotKeyMessageFilter : IMessageFilter
+        {
+            private readonly MainForm _owner;
+
+            public MainHotKeyMessageFilter(MainForm owner) => _owner = owner;
+
+            public bool PreFilterMessage(ref Message m)
+            {
+                if (Form.ActiveForm != _owner || m.Msg is not (0x0100 or 0x0104))
+                    return false;
+
+                Keys keyData = (Keys)(int)m.WParam | Control.ModifierKeys;
+                if (_owner._lblNow != null && _owner._lblNow.Focused &&
+                    (keyData & Keys.KeyCode) == Keys.Return)
+                    return false;
+
+                return _owner.ShouldHandleHotKey(keyData) && _owner.TryExecuteHotKey(keyData);
+            }
         }
 
         protected override bool ProcessKeyPreview(ref Message m)
@@ -1947,11 +1972,19 @@ namespace MxfPlayer
             _lblRate.Text = $"{rate:0}x";
             bool wasPlaying = _meterTimer.Enabled;
             bool needsForwardBuffer = rate > 1.0f;
+            bool needsReverseBuffer = rate < 0;
+            bool needsRateBuffer = needsForwardBuffer || needsReverseBuffer;
+            bool pausedForBuffer = wasPlaying && needsForwardBuffer;
             int fastBufferTimeoutMs = Math.Abs(rate) >= 4.0f
                 ? FastPlaybackBufferTimeout4xMs
                 : FastPlaybackBufferTimeout2xMs;
+            int bufferTimeoutMs = needsReverseBuffer
+                ? ReversePlaybackBufferTimeoutMs
+                : fastBufferTimeoutMs;
 
-            if (wasPlaying && needsForwardBuffer)
+            // Reverse playback must keep the UI timer running so the player's
+            // stall/resume path can observe newly decoded frames and continue.
+            if (pausedForBuffer)
                 _playbackController.Pause();
 
             _player.SetVideoRate(rate);
@@ -1960,18 +1993,18 @@ namespace MxfPlayer
             if (Math.Abs(rate - 1.0f) > 0.001f)
                 _player.PrepareVideoBuffer();
 
-            if (needsForwardBuffer)
+            if (needsRateBuffer)
             {
                 double fps = GetSelectedFps();
                 bool ready = fps <= 0 ||
                     await WaitForPlaybackStartupBuffersAsync(
                         fps,
                         rate,
-                        fastBufferTimeoutMs,
+                        bufferTimeoutMs,
                         showWarning: false);
 
-                if (wasPlaying)
-                    await _playbackController.Play(ready ? fastBufferTimeoutMs : 1);
+                if (pausedForBuffer)
+                    await _playbackController.Play(ready ? bufferTimeoutMs : 1);
             }
         }
         private async void HandleMoveBackForward()
@@ -2059,11 +2092,14 @@ namespace MxfPlayer
         private async Task<bool> WaitForPlaybackStartupBuffersAsync(double fps, float rate, int timeoutMs, bool showWarning = true)
         {
             long frameIndex = _player.CurrentFrameIndex;
-            int requiredVideoFrames = _player.GetStartupVideoBufferFramesForRate(rate);
+            int requiredVideoFrames = rate < 0
+                ? _player.GetReverseStartupVideoBufferFramesForRate(rate)
+                : _player.GetStartupVideoBufferFramesForRate(rate);
 
             Task<bool> videoReadyTask =
-                _player.WaitForVideoBufferAheadAsync(
+                _player.WaitForVideoBufferForRateAsync(
                     frameIndex,
+                    rate,
                     requiredVideoFrames,
                     timeoutMs);
             Task<bool> audioReadyTask =

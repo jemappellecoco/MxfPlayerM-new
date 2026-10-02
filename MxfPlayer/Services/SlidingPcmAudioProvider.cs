@@ -105,8 +105,12 @@ namespace MxfPlayer.Services
             lock (_lock)
             {
                 long offsetFrames = GetSourceSampleOffset(frameIndex, fps);
-                if (offsetFrames < 0 || offsetFrames >= BufferedSourceFrames)
+                if (offsetFrames < 0 || BufferedSourceFrames <= 0)
                     return false;
+
+                // The segment end maps to the sample boundary just after the
+                // final sample. Reverse playback starts at the final valid sample.
+                offsetFrames = Math.Min(offsetFrames, BufferedSourceFrames - 1);
 
                 long requiredFrames = OriginalSamplesToSourceSamples((_sampleRate * (long)Math.Max(0, requiredBehindMs)) / 1000);
                 return offsetFrames >= requiredFrames;
@@ -120,7 +124,10 @@ namespace MxfPlayer.Services
 
             lock (_lock)
             {
-                _positionSourceSampleIndex = Math.Clamp(GetSourceSampleOffset(frameIndex, fps), 0, BufferedSourceFrames);
+                long maxPosition = _playbackRate < 0
+                    ? Math.Max(0, BufferedSourceFrames - 1)
+                    : BufferedSourceFrames;
+                _positionSourceSampleIndex = Math.Clamp(GetSourceSampleOffset(frameIndex, fps), 0, maxPosition);
             }
         }
 

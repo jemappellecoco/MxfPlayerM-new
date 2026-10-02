@@ -326,7 +326,7 @@ namespace MxfPlayer
 
         private TextBox CreateShortcutEditor()
         {
-            var editor = new TextBox
+            var editor = new ShortcutEditorTextBox
             {
                 Visible = false,
                 BorderStyle = BorderStyle.FixedSingle,
@@ -336,6 +336,7 @@ namespace MxfPlayer
             };
 
             editor.KeyDown += OnShortcutEditorKeyDown;
+            editor.ShortcutKeyDown += OnShortcutEditorKeyDown;
             editor.TextChanged += (_, _) =>
             {
                 if (_editingShortcutItem != null)
@@ -593,6 +594,22 @@ namespace MxfPlayer
                 || keyCode == Keys.RShiftKey
                 || keyCode == Keys.LMenu
                 || keyCode == Keys.RMenu;
+        }
+
+        private sealed class ShortcutEditorTextBox : TextBox
+        {
+            public event KeyEventHandler? ShortcutKeyDown;
+
+            protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+            {
+                if (Visible && ShortcutKeyDown != null)
+                {
+                    ShortcutKeyDown(this, new KeyEventArgs(keyData));
+                    return true;
+                }
+
+                return base.ProcessCmdKey(ref msg, keyData);
+            }
         }
 
         private Control BuildButtonBar()

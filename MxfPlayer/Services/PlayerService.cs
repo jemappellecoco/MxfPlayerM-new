@@ -58,7 +58,7 @@ namespace MxfPlayer.Services
         private const int VideoPreloadHighWaterFrames = 420; // Keep a deeper forward cushion before throttling decode.
         private const int ForwardVideoCacheTailFrames = 12; // Keep only a short already-played tail so cache favors upcoming frames.
         private const int ReverseVideoDecodeWindowFrames = 300; // Keep reverse decode close to the playhead.
-        private const int ReverseVideoPreloadLowWaterFrames = 360; // Refill reverse cache before the continuous window runs dry.
+        private const int ReverseVideoPreloadSeconds = 2;
         private const int VideoDecoderRestartGapFrames = 30; // Restart decoder if playback has outrun the cached window.
         private const int VideoDecoderRestartCooldownMs = 300;
         private const double VideoStallResumeBufferSeconds = 0.6;//播放中卡住後先補短 buffer，避免卡住太久。
@@ -137,6 +137,18 @@ namespace MxfPlayer.Services
                 Math.Min(requestedDisplayFrames, maxDisplayFrames - reserveFrames),
                 30 * DisplayUnitsPerFrame,
                 Math.Max(30 * DisplayUnitsPerFrame, maxDisplayFrames));
+            return DisplayFramesToMediaFrames(displayFrames);
+        }
+
+        public int GetReverseStartupVideoBufferFramesForRate(float rate)
+        {
+            int maxDisplayFrames = GetMaxCachedVideoFramesForRate(rate);
+            int usableWindowFrames = Math.Max(
+                3,
+                Math.Min(ReverseVideoDecodeWindowFrames * DisplayUnitsPerFrame, maxDisplayFrames) - 4);
+            int requestedDisplayFrames = (int)Math.Ceiling(
+                DisplayFps * Math.Max(1.0, Math.Abs(rate)) * ReverseVideoPreloadSeconds);
+            int displayFrames = Math.Clamp(requestedDisplayFrames, 3, usableWindowFrames);
             return DisplayFramesToMediaFrames(displayFrames);
         }
 
@@ -660,7 +672,7 @@ namespace MxfPlayer.Services
         private void StartReverseSlidingAudioCacheFromFrame(long frameIndex, double fps, float rate, bool keepPlaying)
         {
             float effectiveRate = rate < 0 ? rate : -Math.Max(1.0f, Math.Abs(rate));
-            long reverseWindowFrames = Math.Min(ReverseSegmentFrames, Math.Max(30, GetMaxCachedVideoFramesForRate(effectiveRate) - 24));
+            long reverseWindowFrames = GetReverseAudioSegmentFrames(effectiveRate, fps);
             long cacheStartFrame = Math.Max(0, frameIndex - reverseWindowFrames + 1);
             long cacheEndFrame = ClampFrameIndex(frameIndex);
             int cacheChannelCount = Math.Clamp(_pcmOutputChannels > 0 ? _pcmOutputChannels : CurrentAudioCount, 1, ChannelMask.Length);
@@ -684,34 +696,27 @@ namespace MxfPlayer.Services
                 if (token.IsCancellationRequested || generation != _audioCacheGeneration)
                     return;
 
-                var provider = new ReverseSegmentAudioProvider(
-                    pcm,
-                    cacheChannelCount,
-                    _audioSampleRate,
-                    cacheStartFrame,
-                    cacheEndFrame,
-                    fps,
-                    effectiveRate,
-                    tempoRate)
+                var provider = new SlidingPcmAudioProvider(cacheChannelCount, _audioSampleRate)
                 {
-                    Mask = ChannelMask
+                    Mask = ChannelMask,
+                    PlaybackRate = GetReverseAudioProviderRate(effectiveRate)
                 };
-                provider.SeekFrame(frameIndex);
+                provider.ResetWindow(cacheStartFrame, fps, pcm, tempoRate);
+                provider.SeekFrame(frameIndex, fps);
 
                 lock (_audioCacheLock)
                 {
                     if (token.IsCancellationRequested || generation != _audioCacheGeneration || !ReferenceEquals(waveOut, _waveOut))
                         return;
 
-                    _reverseAudioProvider = provider;
+                    _reverseAudioProvider = null;
                     _memoryAudioProvider = null;
-                    _slidingAudioProvider = null;
+                    _slidingAudioProvider = provider;
                     _reverseSegment = new ReversePlaybackSegment
                     {
                         StartFrame = cacheStartFrame,
                         EndFrame = cacheEndFrame,
-                        Rate = effectiveRate,
-                        AudioProvider = provider
+                        Rate = effectiveRate
                     };
                     waveOut.Init(provider);
                 }
@@ -719,28 +724,42 @@ namespace MxfPlayer.Services
 
             if (keepPlaying)
             {
-                Task.Run(() =>
-                {
-                    WaitForAudioBuffer(frameIndex, fps, effectiveRate, 2000);
-                    PlayWaveOutIfCurrent(waveOut, generation);
-                });
+                Task decodeTask = _audioCacheTask;
+                _ = decodeTask.ContinueWith(
+                    completedTask =>
+                    {
+                        if (completedTask.IsCanceled || completedTask.IsFaulted ||
+                            token.IsCancellationRequested || generation != _audioCacheGeneration)
+                        {
+                            return;
+                        }
+
+                        PlayWaveOutIfCurrent(waveOut, generation);
+                    },
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
             }
         }
 
         private void StartReverseSlidingPrepend(long frameIndex, double fps, float rate)
         {
             var provider = _slidingAudioProvider;
-            if (provider == null || string.IsNullOrEmpty(CurrentPath))
+            var currentSegment = _reverseSegment;
+            if (provider == null || currentSegment == null || string.IsNullOrEmpty(CurrentPath))
                 return;
 
             float effectiveRate = rate < 0 ? rate : -Math.Max(1.0f, Math.Abs(rate));
-            long reverseWindowFrames = FrameFromTimeMs((long)(ReverseAudioCacheWindowMs * Math.Abs(effectiveRate)), fps);
-            long cacheStartFrame = Math.Max(0, frameIndex - reverseWindowFrames);
+            long reverseWindowFrames = GetReverseAudioSegmentFrames(effectiveRate, fps);
+            long previousStartFrame = currentSegment.StartFrame;
+            long cacheStartFrame = Math.Max(0, previousStartFrame - reverseWindowFrames);
+            if (cacheStartFrame >= previousStartFrame)
+                return;
+
             var token = _audioCacheCts?.Token ?? CancellationToken.None;
             string path = CurrentPath;
             int generation = _audioCacheGeneration;
-            int refreshBehindMs = GetReverseAudioRefreshBehindMs(effectiveRate);
-            int maxDurationMs = (int)Math.Ceiling(ReverseAudioCacheWindowMs * Math.Abs(effectiveRate) + refreshBehindMs);
+            int maxDurationMs = (int)Math.Ceiling((previousStartFrame - cacheStartFrame) * 1000.0 / Math.Max(1.0, fps)) + 500;
 
             _audioCacheTask = Task.Factory.StartNew(() =>
             {
@@ -749,7 +768,24 @@ namespace MxfPlayer.Services
                 if (token.IsCancellationRequested || generation != _audioCacheGeneration)
                     return;
 
-                provider.PrependWindow(cacheStartFrame, fps, pcm, tempoRate);
+                if (!provider.PrependWindow(cacheStartFrame, fps, pcm, tempoRate))
+                    return;
+
+                lock (_audioCacheLock)
+                {
+                    if (token.IsCancellationRequested || generation != _audioCacheGeneration ||
+                        !ReferenceEquals(provider, _slidingAudioProvider))
+                    {
+                        return;
+                    }
+
+                    _reverseSegment = new ReversePlaybackSegment
+                    {
+                        StartFrame = cacheStartFrame,
+                        EndFrame = currentSegment.EndFrame,
+                        Rate = effectiveRate
+                    };
+                }
             }, token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
@@ -773,6 +809,19 @@ namespace MxfPlayer.Services
             return rate < 0 ? -1.0f : 1.0f;
         }
 
+        private long GetReverseAudioSegmentFrames(float rate, double fps)
+        {
+            double multiplier = Math.Max(1.0, Math.Abs(rate));
+            long requestedFrames = (long)Math.Ceiling(ReverseSegmentFrames * multiplier);
+            long maxFrames = FrameFromTimeMs(ReverseAudioCacheWindowMs, fps);
+            return Math.Max(30, Math.Min(requestedFrames, maxFrames));
+        }
+
+        private int GetReverseAudioPreloadFrames(float rate)
+        {
+            return (int)Math.Ceiling(ReverseSegmentPreloadFrames * Math.Max(1.0, Math.Abs(rate)));
+        }
+
         private int GetReverseAudioRefreshBehindMs(float rate)
         {
             double multiplier = Math.Max(1.0, Math.Abs(rate));
@@ -785,8 +834,6 @@ namespace MxfPlayer.Services
             public long StartFrame { get; init; }
             public long EndFrame { get; init; }
             public float Rate { get; init; }
-            public ReverseSegmentAudioProvider? AudioProvider { get; init; }
-
             public bool Contains(long frameIndex, float rate)
             {
                 return frameIndex >= StartFrame &&
@@ -1065,23 +1112,33 @@ namespace MxfPlayer.Services
 
         public Task<bool> WaitForVideoBufferAheadAsync(long frameIndex, int requiredAheadFrames, int timeoutMs = 3000)
         {
+            return WaitForVideoBufferForRateAsync(frameIndex, 1.0f, requiredAheadFrames, timeoutMs);
+        }
+
+        public Task<bool> WaitForVideoBufferForRateAsync(long frameIndex, float rate, int requiredFrames, int timeoutMs = 3000)
+        {
             return Task.Run(() =>
             {
-                if (requiredAheadFrames <= 0)
+                if (requiredFrames <= 0)
                     return true;
 
                 var sw = Stopwatch.StartNew();
                 long clampedFrame = DisplayIndexFromMediaFrame(Math.Max(0, frameIndex));
-                int requiredBufferedFrames = Math.Min(requiredAheadFrames * DisplayUnitsPerFrame, GetMaxCachedVideoFramesForRate(_videoRate));
-                long requiredAhead = Math.Max(0, requiredBufferedFrames - 1);
+                bool forward = rate >= 0;
+                int requiredBufferedFrames = Math.Min(requiredFrames * DisplayUnitsPerFrame, GetMaxCachedVideoFramesForRate(rate));
+                long requiredDistance = Math.Max(0, requiredBufferedFrames - 1);
+                if (!forward)
+                    requiredDistance = Math.Min(requiredDistance, clampedFrame);
 
                 while (sw.ElapsedMilliseconds < timeoutMs)
                 {
                     lock (_lock)
                     {
-                        long continuousFrame = GetContinuousCachedFrameLimit(clampedFrame, true);
-                        if (continuousFrame >= 0 &&
-                            continuousFrame - clampedFrame >= requiredAhead)
+                        long continuousFrame = GetContinuousCachedFrameLimit(clampedFrame, forward);
+                        long bufferedDistance = forward
+                            ? continuousFrame - clampedFrame
+                            : clampedFrame - continuousFrame;
+                        if (continuousFrame >= 0 && bufferedDistance >= requiredDistance)
                         {
                             return true;
                         }
@@ -1380,8 +1437,12 @@ namespace MxfPlayer.Services
 
                 if (frameIndex >= windowEndFrame)
                 {
+                    // The reverse window already includes extra following frames for
+                    // BWDIF. Finish this decode task here instead of scanning the rest
+                    // of the file while waiting for a filtered tail frame.
+                    cachedThroughFrame = Math.Max(cachedThroughFrame, windowEndFrame - 1);
                     ffmpeg.av_frame_unref(frame);
-                    continue;
+                    break;
                 }
 
                 long displayIndex = DisplayIndexFromMediaFrame(frameIndex);
@@ -2246,7 +2307,7 @@ namespace MxfPlayer.Services
             if (_isVideoPlaying)
             {
                 long currentMediaFrame = CurrentFrameIndex;
-                StartAudioCacheFromFrame(currentMediaFrame, _audioFps, effectiveRate, false);
+                StartAudioCacheFromFrame(currentMediaFrame, _audioFps, effectiveRate, keepPlaying: true);
                 WaitForAudioBuffer(currentMediaFrame, _audioFps, effectiveRate, 1000);
                 PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
             }
@@ -2272,10 +2333,16 @@ namespace MxfPlayer.Services
 
             if (effectiveRate < 0)
             {
+                if (_audioCacheTask != null && !_audioCacheTask.IsCompleted)
+                    return;
+
                 if (_reverseSegment == null ||
                     !_reverseSegment.Contains(CurrentFrameIndex, effectiveRate) ||
-                    _reverseAudioProvider == null ||
-                    !_reverseAudioProvider.HasFrameData(CurrentFrameIndex, GetInitialReverseAudioBehindMs(effectiveRate)))
+                    _slidingAudioProvider == null ||
+                    !_slidingAudioProvider.IsReverseFrameDataAvailable(
+                        CurrentFrameIndex,
+                        _audioFps,
+                        GetInitialReverseAudioBehindMs(effectiveRate)))
                 {
                     StartAudioCacheFromFrame(CurrentFrameIndex, _audioFps, effectiveRate, _isVideoPlaying);
                 }
@@ -2586,7 +2653,8 @@ namespace MxfPlayer.Services
                 int reverseWindowFrames = Math.Min(ReverseVideoDecodeWindowFrames * DisplayUnitsPerFrame, GetMaxCachedVideoFramesForRate(_videoRate));
                 long startDisplayIndex = Math.Max(0, _currentFrameIndex - reverseWindowFrames + 1);
                 startFrame = MediaFrameFromDisplayIndex(startDisplayIndex);
-                endFrameExclusive = Math.Min(_totalVideoFrames, MediaFrameFromDisplayIndex(_currentFrameIndex) + 1);
+                // BWDIF needs following frames at the window boundary to emit the last requested frame.
+                endFrameExclusive = Math.Min(_totalVideoFrames, MediaFrameFromDisplayIndex(_currentFrameIndex) + 3);
             }
             else
             {
@@ -2612,8 +2680,7 @@ namespace MxfPlayer.Services
 
         private int GetReverseVideoPreloadLowWaterFrames()
         {
-            int maxFrames = GetMaxCachedVideoFramesForRate(_videoRate);
-            return Math.Min(ReverseVideoPreloadLowWaterFrames, Math.Max(3, maxFrames * 3 / 4));
+            return GetReverseStartupVideoBufferFramesForRate(_videoRate);
         }
 
         public void Seek(long timeMs)
@@ -2634,8 +2701,10 @@ namespace MxfPlayer.Services
             bool hasData = _videoRate < 0
                 ? (_reverseSegment != null &&
                    _reverseSegment.Contains(frameIndex, _videoRate) &&
-                   _reverseAudioProvider != null &&
-                   _reverseAudioProvider.HasFrameData(frameIndex, 250))
+                   ((_slidingAudioProvider != null &&
+                     _slidingAudioProvider.IsReverseFrameDataAvailable(frameIndex, fps, 250)) ||
+                    (_reverseAudioProvider != null &&
+                     _reverseAudioProvider.HasFrameData(frameIndex, 250))))
                 : (_fileAudioProvider != null &&
                    Math.Abs(_forwardAudioCacheRate - _videoRate) <= 0.001f &&
                    _fileAudioProvider.IsFrameDataAvailable(frameIndex, fps));
@@ -2652,7 +2721,10 @@ namespace MxfPlayer.Services
             }
 
             if (_videoRate < 0)
+            {
+                _slidingAudioProvider?.SeekFrame(frameIndex, fps);
                 _reverseAudioProvider?.SeekFrame(frameIndex);
+            }
             else
                 _fileAudioProvider?.SeekFrame(frameIndex, fps);
             _memoryAudioProvider?.SeekFrame(frameIndex, fps);
@@ -2819,10 +2891,14 @@ namespace MxfPlayer.Services
 
             if (_reverseSegment == null ||
                 !_reverseSegment.Contains(CurrentFrameIndex, _videoRate) ||
-                CurrentFrameIndex - _reverseSegment.StartFrame < ReverseSegmentPreloadFrames)
+                _slidingAudioProvider == null)
             {
                 StartAudioCacheFromFrame(CurrentFrameIndex, _audioFps, _videoRate, _isVideoPlaying, waitForPreviousCache: false);
+                return;
             }
+
+            if (CurrentFrameIndex - _reverseSegment.StartFrame < GetReverseAudioPreloadFrames(_videoRate))
+                StartReverseSlidingPrepend(CurrentFrameIndex, _audioFps, _videoRate);
         }
         // frameIndex = round(timeMs * fps / 1000)
         public static long FrameFromTimeMs(long timeMs, double fps)
