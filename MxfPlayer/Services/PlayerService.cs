@@ -69,6 +69,9 @@ namespace MxfPlayer.Services
         private int _videoDecodeGeneration;
         private CancellationTokenSource? _audioCacheCts;
         private Task? _audioCacheTask;
+        private CancellationTokenSource? _reverseRateChangeCts;
+        private Task? _reverseRateChangeTask;
+        private int _reverseRateChangeGeneration;
         private string? _pcmCachePath;
         private int _audioCacheGeneration;
         private float _forwardAudioCacheRate = 1.0f;
@@ -584,6 +587,9 @@ namespace MxfPlayer.Services
             {
                 if (string.IsNullOrEmpty(CurrentPath)) return;
 
+                _reverseRateChangeCts?.Cancel();
+                _reverseRateChangeGeneration++;
+
                 _audioCacheCts?.Cancel();
 
                 if (waitForPreviousCache)
@@ -752,6 +758,8 @@ namespace MxfPlayer.Services
             float effectiveRate = rate < 0 ? rate : -Math.Max(1.0f, Math.Abs(rate));
             long reverseWindowFrames = GetReverseAudioSegmentFrames(effectiveRate, fps);
             long previousStartFrame = currentSegment.StartFrame;
+            if (Math.Abs(effectiveRate) >= 8.0f)
+                reverseWindowFrames = Math.Min(reverseWindowFrames, FrameFromTimeMs(12000, fps));
             long cacheStartFrame = Math.Max(0, previousStartFrame - reverseWindowFrames);
             if (cacheStartFrame >= previousStartFrame)
                 return;
@@ -2307,9 +2315,92 @@ namespace MxfPlayer.Services
             if (_isVideoPlaying)
             {
                 long currentMediaFrame = CurrentFrameIndex;
+                if (_videoRate < 0 && _slidingAudioProvider != null && _reverseSegment != null &&
+                    Math.Abs(_reverseSegment.Rate - effectiveRate) > 0.001f)
+                {
+                    StartReverseRateChange(currentMediaFrame, _audioFps, effectiveRate);
+                    return;
+                }
                 StartAudioCacheFromFrame(currentMediaFrame, _audioFps, effectiveRate, keepPlaying: true);
                 WaitForAudioBuffer(currentMediaFrame, _audioFps, effectiveRate, 1000);
                 PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
+            }
+        }
+
+        private void StartReverseRateChange(long frameIndex, double fps, float rate)
+        {
+            lock (_audioCacheLock)
+            {
+                if (string.IsNullOrEmpty(CurrentPath) || _slidingAudioProvider == null)
+                    return;
+
+                _reverseRateChangeCts?.Cancel();
+                _reverseRateChangeCts = new CancellationTokenSource();
+                // A previous prepend can hold the FFmpeg decoder lock for a long
+                // window. It is obsolete once the playback rate changes.
+                _audioCacheCts?.Cancel();
+                CancellationToken token = _reverseRateChangeCts.Token;
+                int changeGeneration = ++_reverseRateChangeGeneration;
+                int audioGeneration = _audioCacheGeneration;
+                string path = CurrentPath;
+                long initialFrames = FrameFromTimeMs(12000, fps);
+                long startFrame = Math.Max(0, frameIndex - Math.Min(GetReverseAudioSegmentFrames(rate, fps), initialFrames) + 1);
+                int maxDurationMs = (int)Math.Ceiling((frameIndex - startFrame + 1) * 1000.0 / Math.Max(1.0, fps)) + 500;
+                int channels = Math.Clamp(_pcmOutputChannels > 0 ? _pcmOutputChannels : CurrentAudioCount, 1, ChannelMask.Length);
+
+                // Keep the current output alive at the new transport speed while
+                // FFmpeg prepares pitch-preserved audio for the new rate.
+                _slidingAudioProvider.PlaybackRate = (float)(-Math.Abs(rate) / Math.Max(1.0, Math.Abs(_reverseSegment!.Rate)));
+                _slidingAudioProvider.SeekFrame(frameIndex, fps);
+
+                _reverseRateChangeTask = Task.Factory.StartNew(() =>
+                {
+                    double tempoRate = GetReverseAudioTempoRate(rate);
+                    byte[] pcm = DecodePcmCacheBytes(path, startFrame, fps, token, maxDurationMs,
+                        clearMeterSamples: false, audioTempoRate: (float)tempoRate);
+                    if (token.IsCancellationRequested || pcm.Length == 0)
+                        return;
+
+                    var provider = new SlidingPcmAudioProvider(channels, _audioSampleRate)
+                    {
+                        Mask = ChannelMask,
+                        PlaybackRate = GetReverseAudioProviderRate(rate)
+                    };
+                    provider.ResetWindow(startFrame, fps, pcm, tempoRate);
+
+                    lock (_audioCacheLock)
+                    {
+                        if (token.IsCancellationRequested || changeGeneration != _reverseRateChangeGeneration ||
+                            audioGeneration != _audioCacheGeneration || Math.Abs(_videoRate - rate) > 0.001f)
+                            return;
+
+                        long currentFrame = CurrentFrameIndex;
+                        provider.SeekFrame(currentFrame, fps);
+                        var replacement = new WaveOutEvent
+                        {
+                            DesiredLatency = AudioOutputLatencyMs,
+                            NumberOfBuffers = AudioOutputBufferCount
+                        };
+                        replacement.Init(provider);
+                        var previous = _waveOut;
+                        _waveOut = replacement;
+                        _slidingAudioProvider = provider;
+                        _reverseSegment = new ReversePlaybackSegment
+                        {
+                            StartFrame = startFrame,
+                            EndFrame = frameIndex,
+                            Rate = rate
+                        };
+                        _audioCacheCts?.Dispose();
+                        _audioCacheCts = new CancellationTokenSource();
+                        _audioCacheTask = null;
+                        _audioCacheGeneration++;
+                        if (_isVideoPlaying)
+                            PlayWaveOutIfCurrent(replacement, _audioCacheGeneration);
+                        try { previous?.Stop(); } catch { }
+                        try { previous?.Dispose(); } catch { }
+                    }
+                }, token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
             }
         }
 
@@ -2333,6 +2424,8 @@ namespace MxfPlayer.Services
 
             if (effectiveRate < 0)
             {
+                if (_reverseRateChangeTask != null && !_reverseRateChangeTask.IsCompleted)
+                    return;
                 if (_audioCacheTask != null && !_audioCacheTask.IsCompleted)
                     return;
 
@@ -2484,8 +2577,12 @@ namespace MxfPlayer.Services
             if (!HasVideoStallResumeBuffer())
                 return;
 
+            // The UI timer calls this method. Keep the transport stopped until
+            // audio is ready instead of blocking the UI thread for up to 1 s.
+            if (_videoRate >= 0 && !HasAudioPlaybackBuffer(CurrentFrameIndex, AudioStallResumeBufferMs))
+                return;
+
             SeekAudioByFrame(CurrentFrameIndex, _audioFps);
-            WaitForAudioBuffer(CurrentFrameIndex, _audioFps, _videoRate, 1000);
             if (!PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration))
                 ResetMediaClock(_currentFrameIndex);
             _isPlaybackStalledForVideo = false;
@@ -2877,6 +2974,9 @@ namespace MxfPlayer.Services
 
         private void EnsureAudioCacheForCurrentFrame()
         {
+            if (_reverseRateChangeTask != null && !_reverseRateChangeTask.IsCompleted)
+                return;
+
             if (_videoRate >= 0)
             {
                 if (_fileAudioProvider != null || _audioCacheTask != null && !_audioCacheTask.IsCompleted)
@@ -2967,6 +3067,8 @@ namespace MxfPlayer.Services
 
         public void StopAudioBridge()
         {
+            _reverseRateChangeCts?.Cancel();
+            _reverseRateChangeGeneration++;
             StopFrameAudioOutput();
             _isVideoPlaying = false;
             _isPlaybackStalledForVideo = false;
@@ -2979,6 +3081,7 @@ namespace MxfPlayer.Services
 
             WaitForTaskQuietly(_videoDecodeTask, 500);
             WaitForTaskQuietly(_audioCacheTask, 500);
+            WaitForTaskQuietly(_reverseRateChangeTask, 500);
 
             lock (_lock)
             {
