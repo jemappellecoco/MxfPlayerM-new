@@ -50,6 +50,8 @@ namespace MxfPlayer
         private Control _metersPanel = null!;
         private Form? _metersWindow;
         private bool _isStartingPlayback = false;
+        private int _transportVersion;
+        private bool _isClosing;
         private bool _isEditingNowTimecode = false;
         private bool _isBuffering = false;
         private MediaInfoResult? _currentMediaInfo;
@@ -61,6 +63,15 @@ namespace MxfPlayer
         private int _meterAreaHeight = 0;
         private int _meterUpdateElapsedMs = 0;
         private int _timelineUpdateElapsedMs = 0;
+        private readonly System.Diagnostics.Stopwatch _videoUiPerfClock = System.Diagnostics.Stopwatch.StartNew();
+        private long _lastVideoUiTickTimestamp;
+        private double _maxVideoUiTickGapMs;
+        private double _maxVideoUiTickWorkMs;
+        private double _maxVideoUiAdvanceMs;
+        private double _maxVideoUiFrameMs;
+        private double _maxVideoUiMeterMs;
+        private double _maxVideoUiTimelineMs;
+        private int _videoUiTickCount;
         private bool _isFrameStepping = false;
         private bool _isBoundarySeeking = false;
         private int _pendingFrameStepDelta = 0;
@@ -94,6 +105,9 @@ namespace MxfPlayer
             StartMeterLevelWorker();
             this.FormClosing += (s, e) =>
             {
+                _isClosing = true;
+                _transportVersion++;
+                _meterTimer.Stop();
                 _meterLevelsCts?.Cancel();
                 _player.Dispose();
             };
@@ -370,8 +384,6 @@ namespace MxfPlayer
         {
             _currentMediaInfo = info;
 
-            UpdateTimeLabels(info);
-
             BeginInvoke(new Action(() =>
             {
                 RefreshTimelineTicks(info);
@@ -554,7 +566,7 @@ namespace MxfPlayer
                     _player.ConfigureVideoScan(info.ScanType);
                 }
 
-                fps = GetSelectedFps();
+                fps = info != null ? GetRealFpsFromInfo(info) : 0;
                 if (fps <= 0)
                 {
                     MessageBox.Show("讀不到影片 FPS，無法播放。");
@@ -580,7 +592,7 @@ namespace MxfPlayer
                         {
                             ClearDisplayedVideoFrame();
                             await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
-                            if (!await WaitForPlaybackStartupBuffersAsync(fps, SmoothStartupBufferRate))
+                            if (_isClosing || !await WaitForPlaybackStartupBuffersAsync(fps, SmoothStartupBufferRate) || _isClosing)
                                 return false;
                             UpdateVideoFrame();
                         }
@@ -594,7 +606,7 @@ namespace MxfPlayer
                 {
                     ClearDisplayedVideoFrame();
                     await _player.StartAudioBridge(file.FullPath, audioCount, startTimeMs, 1.0f, fps, sampleRate);
-                    if (!await WaitForPlaybackStartupBuffersAsync(fps, SmoothStartupBufferRate))
+                    if (_isClosing || !await WaitForPlaybackStartupBuffersAsync(fps, SmoothStartupBufferRate) || _isClosing)
                         return false;
                     UpdateVideoFrame();
                 }
@@ -610,6 +622,7 @@ namespace MxfPlayer
 
         private async Task PlaySelectedFileAsync(MediaFile file, bool resetRateToNormal = false)
         {
+            int requestVersion = ++_transportVersion;
             ReleaseNowTimecodeInputFocus();
 
             bool isDifferentFile = !string.Equals(_player.CurrentPath, file.FullPath, StringComparison.OrdinalIgnoreCase);
@@ -624,7 +637,7 @@ namespace MxfPlayer
                 _playbackController.Pause();
                 ResetUiUpdateThrottle();
                 bool started = await StartPlaybackForFile(file, startTimeMs);
-                if (!started) return;
+                if (!started || _isClosing || requestVersion != _transportVersion) return;
             }
 
             ResetUiUpdateThrottle();
@@ -638,19 +651,29 @@ namespace MxfPlayer
                 await _playbackController.Play();
             }
 
+            if (_isClosing || requestVersion != _transportVersion ||
+                !string.Equals(_player.CurrentPath, file.FullPath, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            _lblCurrentFile.Text = file.FileName;
+            if (TryGetPlayingMediaInfo(out var playingInfo) && playingInfo != null)
+                UpdatePlaybackTimeLabels(playingInfo);
+
             _lblNow.ForeColor = Color.Orange;
             UpdateTimelineUI(-1);
         }
-        private double GetSelectedFps()
+        private bool TryGetPlayingMediaInfo(out MediaInfoResult? info)
         {
-            if (!TryGetSelectedMediaFile(out var file) ||
-                file == null ||
-                !_mediaCache.TryGetValue(file.FullPath, out var info))
-            {
-                return 0;
-            }
+            info = null;
+            return !string.IsNullOrWhiteSpace(_player.CurrentPath) &&
+                _mediaCache.TryGetValue(_player.CurrentPath, out info);
+        }
 
-            return GetRealFpsFromInfo(info);
+        private double GetPlayingFps()
+        {
+            return TryGetPlayingMediaInfo(out var info) && info != null
+                ? GetRealFpsFromInfo(info)
+                : 0;
         }
    
         private void UpdateTimelineUI()
@@ -673,17 +696,12 @@ namespace MxfPlayer
                         _timeline.Value = timelineValue;
 
 
-                    double fps = GetSelectedFps();
+                    if (!TryGetPlayingMediaInfo(out var info) || info == null) return;
+                    double fps = GetRealFpsFromInfo(info);
                     if (fps <= 0) return;
 
-                    bool dropFrame = IsSelectedDropFrame();
-                    long somFrame = 0;
-                    if (TryGetSelectedMediaFile(out var file) &&
-                        file != null &&
-                        _mediaCache.TryGetValue(file.FullPath, out var info))
-                    {
-                        somFrame = TimecodeToFrame(info.Som, fps, dropFrame);
-                    }
+                    bool dropFrame = IsDropFrame(info);
+                    long somFrame = TimecodeToFrame(info.Som, fps, dropFrame);
 
 
                     if (!_isEditingNowTimecode)
@@ -916,10 +934,9 @@ namespace MxfPlayer
             return files;
         }
 
-        private void UpdateTimeLabels(MediaInfoResult info)
+        private void UpdatePlaybackTimeLabels(MediaInfoResult info)
         {
             bool dropFrame = IsDropFrame(info);
-            _lblCurrentFile.Text = info.FileName;
             _lblStart.Text = $"START {info.Som}";
             SetNowTimecodeText(info.Som, dropFrame);
             _lblDur.Text = $"DUR {info.DurationTc}";
@@ -935,22 +952,63 @@ namespace MxfPlayer
                 if (_isBuffering)
                     return;
 
+                long tickStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (_lastVideoUiTickTimestamp != 0)
+                {
+                    double gapMs = System.Diagnostics.Stopwatch.GetElapsedTime(_lastVideoUiTickTimestamp, tickStart).TotalMilliseconds;
+                    if (gapMs < 1000)
+                        _maxVideoUiTickGapMs = Math.Max(_maxVideoUiTickGapMs, gapMs);
+                }
+                _lastVideoUiTickTimestamp = tickStart;
+
                 _player.AdvanceVideo(_meterTimer.Interval);
+                long advanceEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+                _maxVideoUiAdvanceMs = Math.Max(_maxVideoUiAdvanceMs,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(tickStart, advanceEnd).TotalMilliseconds);
 
                 UpdateVideoFrame();
+                long frameEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+                _maxVideoUiFrameMs = Math.Max(_maxVideoUiFrameMs,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(advanceEnd, frameEnd).TotalMilliseconds);
 
+                long meterStart = frameEnd;
                 _meterUpdateElapsedMs += _meterTimer.Interval;
                 if (_meterUpdateElapsedMs >= MeterUpdateIntervalMs)
                 {
                     _meterUpdateElapsedMs = 0;
                     ApplyLatestMeterLevels();
                 }
+                long meterEnd = System.Diagnostics.Stopwatch.GetTimestamp();
+                _maxVideoUiMeterMs = Math.Max(_maxVideoUiMeterMs,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(meterStart, meterEnd).TotalMilliseconds);
 
                 _timelineUpdateElapsedMs += _meterTimer.Interval;
                 if (_timelineUpdateElapsedMs >= TimelineUpdateIntervalMs)
                 {
                     _timelineUpdateElapsedMs = 0;
                     UpdateTimelineFromPlayer();
+                }
+                _maxVideoUiTimelineMs = Math.Max(_maxVideoUiTimelineMs,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(meterEnd).TotalMilliseconds);
+
+                _videoUiTickCount++;
+                _maxVideoUiTickWorkMs = Math.Max(_maxVideoUiTickWorkMs,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(tickStart).TotalMilliseconds);
+                if (_videoUiPerfClock.ElapsedMilliseconds >= 1000)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[VideoUiPerf] ticks={_videoUiTickCount} maxGapMs={_maxVideoUiTickGapMs:0.0} " +
+                        $"maxWorkMs={_maxVideoUiTickWorkMs:0.0} advanceMs={_maxVideoUiAdvanceMs:0.0} " +
+                        $"frameMs={_maxVideoUiFrameMs:0.0} meterMs={_maxVideoUiMeterMs:0.0} " +
+                        $"timelineMs={_maxVideoUiTimelineMs:0.0} rate={_playbackController.CurrentRate:0.###}");
+                    _videoUiTickCount = 0;
+                    _maxVideoUiTickGapMs = 0;
+                    _maxVideoUiTickWorkMs = 0;
+                    _maxVideoUiAdvanceMs = 0;
+                    _maxVideoUiFrameMs = 0;
+                    _maxVideoUiMeterMs = 0;
+                    _maxVideoUiTimelineMs = 0;
+                    _videoUiPerfClock.Restart();
                 }
             };
         }
@@ -963,16 +1021,11 @@ namespace MxfPlayer
 
         private void UpdateVideoFrame()
         {
-            long frameIndex = _player.GetDisplayFrameIndex();
-
-            if (frameIndex < 0)
-                return;
-
-            if (frameIndex == _displayedVideoFrameIndex)
-                return;
-
             var nextFrame = _player.GetDisplayVideoFrameReference(out var snapshotFrameIndex);
             if (nextFrame == null)
+                return;
+
+            if (snapshotFrameIndex == _displayedVideoFrameIndex)
                 return;
 
             _displayedVideoFrame = nextFrame;
@@ -1229,7 +1282,7 @@ namespace MxfPlayer
 
             _lblCurrentFile = new Label
             {
-                Text = "尚未選擇檔案",
+                Text = "尚未播放檔案",
                 Dock = DockStyle.Fill,
                 AutoSize = false,
                 TextAlign = ContentAlignment.MiddleLeft,
@@ -1920,10 +1973,22 @@ namespace MxfPlayer
                 MessageBox.Show($"播放失敗：{ex.Message}");
             }
         }
-        private void HandlePause()
+        private async void HandlePause()
         {
+            _transportVersion++;
             _playbackController.Pause();
             ResetUiUpdateThrottle();
+            if (_playbackController.CurrentRate >= 2.0f)
+            {
+                long pausedFrame = _player.CurrentFrameIndex;
+                await _player.WaitForFrameBufferAsync(pausedFrame, 3000);
+                if (!_meterTimer.Enabled && _player.CurrentFrameIndex == pausedFrame)
+                {
+                    _displayedVideoFrameIndex = -1;
+                    UpdateVideoFrame();
+                    UpdateTimelineUI(-1);
+                }
+            }
         }
 
         private async void HandleMoveFirst() 
@@ -1941,7 +2006,7 @@ namespace MxfPlayer
             if (_isBoundarySeeking)
                 return;
 
-            double fps = GetSelectedFps();
+            double fps = GetPlayingFps();
             if (fps <= 0)
                 return;
 
@@ -1969,6 +2034,8 @@ namespace MxfPlayer
         }
         private async Task ApplyPlaybackRateAsync(float rate)
         {
+            var rateChangeClock = System.Diagnostics.Stopwatch.StartNew();
+            int requestVersion = ++_transportVersion;
             _lblRate.Text = $"{rate:0}x";
             bool wasPlaying = _meterTimer.Enabled;
             bool needsForwardBuffer = rate > 1.0f;
@@ -1995,7 +2062,7 @@ namespace MxfPlayer
 
             if (needsRateBuffer)
             {
-                double fps = GetSelectedFps();
+                double fps = GetPlayingFps();
                 bool ready = fps <= 0 ||
                     await WaitForPlaybackStartupBuffersAsync(
                         fps,
@@ -2003,8 +2070,12 @@ namespace MxfPlayer
                         bufferTimeoutMs,
                         showWarning: false);
 
-                if (pausedForBuffer)
+                if (pausedForBuffer && !_isClosing && requestVersion == _transportVersion)
                     await _playbackController.Play(ready ? bufferTimeoutMs : 1);
+
+                System.Diagnostics.Debug.WriteLine(
+                    $"[RateChange] rate={rate:0.###} pausedForBuffer={pausedForBuffer} " +
+                    $"bufferReady={ready} elapsedMs={rateChangeClock.ElapsedMilliseconds}");
             }
         }
         private async void HandleMoveBackForward()
@@ -2044,7 +2115,7 @@ namespace MxfPlayer
                 return;
             }
 
-            double fps = GetSelectedFps();
+            double fps = GetPlayingFps();
             if (fps <= 0)
                 return;
 
@@ -2113,7 +2184,7 @@ namespace MxfPlayer
             if (ready[0] && ready[1])
                 return true;
 
-            if (showWarning)
+            if (showWarning && !_isClosing)
             {
                 string missing = !ready[0] && !ready[1]
                     ? "影片與音訊"
@@ -2170,6 +2241,7 @@ namespace MxfPlayer
         }
         private async Task SeekFromNowInputAsync()
         {
+            int requestVersion = _transportVersion;
             if (_isSeeking) return;
             string input = _lblNow.Text.Trim();
             if (string.IsNullOrEmpty(input))
@@ -2178,7 +2250,7 @@ namespace MxfPlayer
                 return;
             }
 
-            double fps = GetSelectedFps();
+            double fps = GetPlayingFps();
             if (fps <= 0)
             {
                 _isEditingNowTimecode = false;
@@ -2186,7 +2258,7 @@ namespace MxfPlayer
                 return;
             }
 
-            bool dropFrame = IsSelectedDropFrame();
+            bool dropFrame = IsPlayingDropFrame();
             if (!TryGetFrameFromTimecode(input, fps, dropFrame, out long inputFrame))
             {
                 _isEditingNowTimecode = false;
@@ -2196,9 +2268,7 @@ namespace MxfPlayer
 
             long somFrame = 0;
 
-            if (TryGetSelectedMediaFile(out var file) &&
-                file != null &&
-                _mediaCache.TryGetValue(file.FullPath, out var info))
+            if (TryGetPlayingMediaInfo(out var info) && info != null)
             {
                 somFrame = TimecodeToFrame(info.Som, fps, dropFrame);
             }
@@ -2220,7 +2290,7 @@ namespace MxfPlayer
                 UpdateTimelineUI(-1);
                 ReleaseNowTimecodeInputFocus();
 
-                if (wasPlaying)
+                if (wasPlaying && !_isClosing && requestVersion == _transportVersion)
                     await _playbackController.Play();
             }
             finally
@@ -2243,7 +2313,8 @@ namespace MxfPlayer
 
         private async Task HandleJump(int seconds)
         {
-            double fps = GetSelectedFps();
+            int requestVersion = _transportVersion;
+            double fps = GetPlayingFps();
             if (fps <= 0) return;
 
             bool wasPlaying = _meterTimer.Enabled;
@@ -2261,7 +2332,7 @@ namespace MxfPlayer
                 RefreshTimelineTicks(_currentMediaInfo);
             UpdateMetersFromAudioLevel();
 
-            if (wasPlaying)
+            if (wasPlaying && !_isClosing && requestVersion == _transportVersion)
                 await _playbackController.Play();
         }
         private Button CreateControlButton(string text, int width)
@@ -2760,21 +2831,15 @@ namespace MxfPlayer
                     if (_timeline.Value != timelineValue)
                         _timeline.Value = timelineValue;
 
-                    double fps = GetSelectedFps();
+                    if (!TryGetPlayingMediaInfo(out var info) || info == null) return;
+                    double fps = GetRealFpsFromInfo(info);
                     if (fps <= 0) return;
 
-                    bool dropFrame = IsSelectedDropFrame();
-                    long somFrame = 0;
+                    bool dropFrame = IsDropFrame(info);
+                    long somFrame = TimecodeToFrame(info.Som, fps, dropFrame);
                     long currentFrame = overrideTime != -1
                         ? PlayerService.FrameFromTimeMs(overrideTime, fps)
                         : _player.CurrentFrameIndex;
-
-                    if (TryGetSelectedMediaFile(out var file) &&
-                        file != null &&
-                        _mediaCache.TryGetValue(file.FullPath, out var info))
-                    {
-                        somFrame = TimecodeToFrame(info.Som, fps, dropFrame);
-                    }
 
                     if (!_isEditingNowTimecode)
                         SetNowTimecodeText(FrameToTimecode(somFrame + currentFrame, fps, dropFrame), dropFrame);
@@ -2837,7 +2902,7 @@ namespace MxfPlayer
             if (!IsNowTimecodeDigitPosition(position))
                 return;
 
-            char[] chars = NormalizeNowTimecodeText(_lblNow.Text, IsSelectedDropFrame()).ToCharArray();
+            char[] chars = NormalizeNowTimecodeText(_lblNow.Text, IsPlayingDropFrame()).ToCharArray();
             chars[position] = digit;
             _lblNow.Text = new string(chars);
         }
@@ -2861,7 +2926,7 @@ namespace MxfPlayer
 
         private void SetNowTimecodeText(string timecode)
         {
-            SetNowTimecodeText(timecode, IsSelectedDropFrame());
+            SetNowTimecodeText(timecode, IsPlayingDropFrame());
         }
 
         private void SetNowTimecodeText(string timecode, bool dropFrame)
@@ -2889,11 +2954,9 @@ namespace MxfPlayer
             return normalized;
         }
 
-        private bool IsSelectedDropFrame()
+        private bool IsPlayingDropFrame()
         {
-            if (TryGetSelectedMediaFile(out var file) &&
-                file != null &&
-                _mediaCache.TryGetValue(file.FullPath, out var info))
+            if (TryGetPlayingMediaInfo(out var info) && info != null)
             {
                 return IsDropFrame(info);
             }
@@ -3014,6 +3077,7 @@ namespace MxfPlayer
 
         private async Task SeekFromTimeline()
         {
+            int requestVersion = _transportVersion;
             if (_isSeeking) return;
             _isSeeking = true;
 
@@ -3027,7 +3091,7 @@ namespace MxfPlayer
                 _playbackController.SeekByTimelineValue(
                     _timeline.Value,
                     _timeline.Maximum,
-                    GetSelectedFps()
+                    GetPlayingFps()
                 );
 
                 _displayedVideoFrameIndex = -1;
@@ -3036,7 +3100,8 @@ namespace MxfPlayer
                 UpdateVideoFrame();
                 UpdateTimelineUI(-1);
                 UpdateMetersFromAudioLevel();
-                await _playbackController.Play(250);
+                if (!_isClosing && requestVersion == _transportVersion)
+                    await _playbackController.Play(250);
             }
             finally
             {
@@ -3095,6 +3160,9 @@ namespace MxfPlayer
         private class VideoFrameView : Control
         {
             private Image? _frame;
+            private readonly System.Diagnostics.Stopwatch _paintPerfClock = System.Diagnostics.Stopwatch.StartNew();
+            private double _maxPaintMs;
+            private int _paintCount;
 
             public VideoFrameView()
             {
@@ -3118,6 +3186,7 @@ namespace MxfPlayer
 
             protected override void OnPaint(PaintEventArgs e)
             {
+                long paintStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 base.OnPaint(e);
 
                 e.Graphics.Clear(BackColor);
@@ -3128,6 +3197,18 @@ namespace MxfPlayer
                 e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
                 e.Graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
                 e.Graphics.DrawImage(_frame, target);
+
+                _paintCount++;
+                _maxPaintMs = Math.Max(_maxPaintMs,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(paintStart).TotalMilliseconds);
+                if (_paintPerfClock.ElapsedMilliseconds >= 1000)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[VideoPaintPerf] paints={_paintCount} maxPaintMs={_maxPaintMs:0.0}");
+                    _paintCount = 0;
+                    _maxPaintMs = 0;
+                    _paintPerfClock.Restart();
+                }
             }
 
             private static Rectangle GetFitRectangle(int imageWidth, int imageHeight, int viewWidth, int viewHeight)
