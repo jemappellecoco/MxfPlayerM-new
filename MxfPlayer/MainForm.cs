@@ -996,11 +996,14 @@ namespace MxfPlayer
                     System.Diagnostics.Stopwatch.GetElapsedTime(tickStart).TotalMilliseconds);
                 if (_videoUiPerfClock.ElapsedMilliseconds >= 1000)
                 {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[VideoUiPerf] ticks={_videoUiTickCount} maxGapMs={_maxVideoUiTickGapMs:0.0} " +
-                        $"maxWorkMs={_maxVideoUiTickWorkMs:0.0} advanceMs={_maxVideoUiAdvanceMs:0.0} " +
-                        $"frameMs={_maxVideoUiFrameMs:0.0} meterMs={_maxVideoUiMeterMs:0.0} " +
-                        $"timelineMs={_maxVideoUiTimelineMs:0.0} rate={_playbackController.CurrentRate:0.###}");
+                    if (PlaybackDiagnostics.Enabled)
+                    {
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[VideoUiPerf] ticks={_videoUiTickCount} maxGapMs={_maxVideoUiTickGapMs:0.0} " +
+                            $"maxWorkMs={_maxVideoUiTickWorkMs:0.0} advanceMs={_maxVideoUiAdvanceMs:0.0} " +
+                            $"frameMs={_maxVideoUiFrameMs:0.0} meterMs={_maxVideoUiMeterMs:0.0} " +
+                            $"timelineMs={_maxVideoUiTimelineMs:0.0} rate={_playbackController.CurrentRate:0.###}");
+                    }
                     _videoUiTickCount = 0;
                     _maxVideoUiTickGapMs = 0;
                     _maxVideoUiTickWorkMs = 0;
@@ -1069,6 +1072,13 @@ namespace MxfPlayer
 
             var toolsMenu = CreateTopMenu("Tools");
             toolsMenu.DropDownItems.Add(CreateMenuItem("HotKey...", MenuIconKind.Keyboard, OnHotKeyMenuClicked));
+            var playbackLogItem = new ToolStripMenuItem("播放診斷 Log")
+            {
+                CheckOnClick = true,
+                Checked = PlaybackDiagnostics.Enabled
+            };
+            playbackLogItem.CheckedChanged += (_, _) => PlaybackDiagnostics.Enabled = playbackLogItem.Checked;
+            toolsMenu.DropDownItems.Add(playbackLogItem);
 
             menu.Items.Add(fileMenu);
             menu.Items.Add(playbackMenu);
@@ -2073,9 +2083,10 @@ namespace MxfPlayer
                 if (pausedForBuffer && !_isClosing && requestVersion == _transportVersion)
                     await _playbackController.Play(ready ? bufferTimeoutMs : 1);
 
-                System.Diagnostics.Debug.WriteLine(
-                    $"[RateChange] rate={rate:0.###} pausedForBuffer={pausedForBuffer} " +
-                    $"bufferReady={ready} elapsedMs={rateChangeClock.ElapsedMilliseconds}");
+                if (PlaybackDiagnostics.Enabled)
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[RateChange] rate={rate:0.###} pausedForBuffer={pausedForBuffer} " +
+                        $"bufferReady={ready} elapsedMs={rateChangeClock.ElapsedMilliseconds}");
             }
         }
         private async void HandleMoveBackForward()
@@ -3203,8 +3214,9 @@ namespace MxfPlayer
                     System.Diagnostics.Stopwatch.GetElapsedTime(paintStart).TotalMilliseconds);
                 if (_paintPerfClock.ElapsedMilliseconds >= 1000)
                 {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[VideoPaintPerf] paints={_paintCount} maxPaintMs={_maxPaintMs:0.0}");
+                    if (PlaybackDiagnostics.Enabled)
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[VideoPaintPerf] paints={_paintCount} maxPaintMs={_maxPaintMs:0.0}");
                     _paintCount = 0;
                     _maxPaintMs = 0;
                     _paintPerfClock.Restart();

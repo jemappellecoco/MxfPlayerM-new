@@ -249,8 +249,6 @@ namespace MxfPlayer.Services
         private int GetForwardPresentationGap()
         {
             if (_videoRate >= 8.0f) return 12;
-            if (_videoRate >= 4.0f) return 6;
-            if (_videoRate >= 2.0f) return 2;
             return 1;
         }
 
@@ -268,9 +266,9 @@ namespace MxfPlayer.Services
 
             // A skipped GOP can leave a larger gap between displayable frames.
             // Advance to the next decoded picture instead of freezing the media clock.
-            if (_videoRate >= 4.0f)
+            if (_videoRate >= 8.0f)
             {
-                int lookAhead = _videoRate >= 8.0f ? 24 : 12;
+                int lookAhead = 24;
                 for (int offset = 1; offset <= lookAhead; offset++)
                 {
                     long candidate = targetFrame + offset;
@@ -1376,11 +1374,11 @@ namespace MxfPlayer.Services
                 ffmpeg.avcodec_parameters_to_context(codecContext, codecParameters);
                 codecContext->thread_count = Math.Max(1, Environment.ProcessorCount - 2);
                 codecContext->thread_type = ffmpeg.FF_THREAD_FRAME | ffmpeg.FF_THREAD_SLICE;
-                bool sparseForward = _videoRate >= 4.0f && _isVideoPlaying && !_decodeExactForVideoRecovery;
+                // At 4x the full decoder is fast enough to keep the cache continuous.
+                // Sparse GOP decoding remains for 8x, where full decode cannot keep up.
+                bool sparseForward = _videoRate >= 8.0f && _isVideoPlaying && !_decodeExactForVideoRecovery;
                 if (sparseForward)
-                    codecContext->skip_frame = _videoRate >= 8.0f
-                        ? AVDiscard.AVDISCARD_NONKEY
-                        : AVDiscard.AVDISCARD_BIDIR;
+                    codecContext->skip_frame = AVDiscard.AVDISCARD_NONKEY;
                 if (ffmpeg.avcodec_open2(codecContext, codec, null) < 0) return;
 
                 int width = codecContext->width;
@@ -1662,7 +1660,8 @@ namespace MxfPlayer.Services
                     : 0;
                 double cacheMs = AverageMilliseconds(totalCacheTicks, totalFrames);
 
-                Debug.WriteLine(
+                if (PlaybackDiagnostics.Enabled)
+                    Debug.WriteLine(
                     $"[VideoDecodePerf] fps={totalFrames / elapsedSeconds:0.0} " +
                     $"activeFps={totalFrames / activeSeconds:0.0} " +
                     $"readMs={readMs:0.00} sendMs={sendMs:0.00} receiveMs={receiveMs:0.00} " +
@@ -1758,10 +1757,9 @@ namespace MxfPlayer.Services
 
         private bool ShouldCacheVideoFrameLocked(long frameIndex, int decodeGeneration)
         {
-            bool sampleForwardFrame = _videoRate < 2.0f || !_isVideoPlaying || _decodeExactForVideoRecovery ||
+            bool sampleForwardFrame = _videoRate < 8.0f || !_isVideoPlaying || _decodeExactForVideoRecovery ||
                 frameIndex == _currentFrameIndex ||
-                (_videoRate >= 8.0f ? frameIndex % 2 == 0 :
-                 _videoRate >= 4.0f || frameIndex % 2 == 0);
+                frameIndex % 2 == 0;
             return IsCurrentVideoDecodeGeneration(decodeGeneration) &&
                    !IsForwardFrameTooFarAheadLocked(frameIndex) &&
                    sampleForwardFrame &&
@@ -2607,7 +2605,7 @@ namespace MxfPlayer.Services
             LogVideoBufferStatus();
             long logEnd = Stopwatch.GetTimestamp();
 
-            if (Stopwatch.GetElapsedTime(advanceStart, logEnd).TotalMilliseconds >= 50)
+            if (PlaybackDiagnostics.Enabled && Stopwatch.GetElapsedTime(advanceStart, logEnd).TotalMilliseconds >= 50)
             {
                 Debug.WriteLine(
                     $"[VideoAdvanceSlow] totalMs={Stopwatch.GetElapsedTime(advanceStart, logEnd).TotalMilliseconds:0.0} " +
@@ -2729,7 +2727,7 @@ namespace MxfPlayer.Services
         private bool HasAudioUnderrun()
         {
             bool underrun = _videoRate >= 0 && _fileAudioProvider?.ConsumeUnderrun() == true;
-            if (underrun)
+            if (underrun && PlaybackDiagnostics.Enabled)
                 Debug.WriteLine($"[AudioUnderrun] frame={_currentFrameIndex} rate={_videoRate:0.###}");
             return underrun;
         }
@@ -2770,6 +2768,9 @@ namespace MxfPlayer.Services
 
         private void LogVideoBufferStatus()
         {
+            if (!PlaybackDiagnostics.Enabled)
+                return;
+
             if (_videoStatusLogClock.ElapsedMilliseconds < 1000)
                 return;
 
