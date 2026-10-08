@@ -2968,23 +2968,30 @@ namespace MxfPlayer.Services
                 _isVideoPlaying = false;
                 _playbackClock.Stop();
                 _videoRate = 1.0f;
-
-                if (_fileAudioProvider == null ||
-                    !_fileAudioProvider.IsFrameDataAvailable(frameIndex, fps, 0))
+                try
                 {
-                    StartAudioCacheFromFrame(frameIndex, fps, 1.0f, false);
+                    if (_fileAudioProvider == null ||
+                        Math.Abs(_forwardAudioCacheRate - 1.0f) > 0.001f ||
+                        !_fileAudioProvider.IsFrameDataAvailable(frameIndex, fps, 0))
+                    {
+                        StartAudioCacheFromFrame(frameIndex, fps, 1.0f, false);
+                    }
+
+                    if (WaitForFrameAudioBuffer(frameIndex, fps, 1000))
+                    {
+                        CaptureFrameAudioPeaks(frameIndex, fps);
+                        byte[]? framePcm = _fileAudioProvider?.ReadFrameStereoPcm(frameIndex, fps, ChannelMask);
+                        if (framePcm is { Length: > 0 })
+                            PlayOneShotFrameAudio(framePcm);
+                    }
+
+                    _fileAudioProvider?.SeekFrame(frameIndex, fps);
                 }
-
-                WaitForFrameAudioBuffer(frameIndex, fps, 1000);
-                CaptureFrameAudioPeaks(frameIndex, fps);
-
-                byte[]? framePcm = _fileAudioProvider?.ReadFrameStereoPcm(frameIndex, fps, ChannelMask);
-                if (framePcm is { Length: > 0 })
-                    PlayOneShotFrameAudio(framePcm);
-
-                _fileAudioProvider?.SeekFrame(frameIndex, fps);
-                _videoRate = previousRate;
-                _isVideoPlaying = wasPlaying;
+                finally
+                {
+                    _videoRate = previousRate;
+                    _isVideoPlaying = wasPlaying;
+                }
             });
         }
 

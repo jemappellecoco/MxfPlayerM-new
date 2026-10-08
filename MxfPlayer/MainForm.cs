@@ -2130,6 +2130,7 @@ namespace MxfPlayer
             if (fps <= 0)
                 return;
 
+            _playbackController.Pause();
             _isFrameStepping = true;
             int currentDirection = Math.Sign(direction);
             try

@@ -57,9 +57,6 @@ namespace MxfPlayer.Controllers
             if (fps <= 0) return;
             long targetFrame = Math.Max(0, _player.CurrentFrameIndex - 1);
             _player.SeekVideoByFrame(targetFrame);
-            _player.SeekAudioByFrame(targetFrame, fps);
-            // 逐幀後退通常建議暫停音訊
-            _player.Pause();
         }
         public async Task Play(int audioBufferTimeoutMs = 3000)
         {
@@ -150,8 +147,6 @@ namespace MxfPlayer.Controllers
             if (fps <= 0) fps = _player.CurrentFps;
             long targetFrame = Math.Min(_player.LastFrameIndex, _player.CurrentFrameIndex + 1);
             _player.SeekVideoByFrame(targetFrame);
-            _player.SeekAudioByFrame(targetFrame, fps);
-            _player.Pause();
             await Task.CompletedTask;
         }
 
