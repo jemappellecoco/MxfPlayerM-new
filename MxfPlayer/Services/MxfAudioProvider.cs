@@ -59,7 +59,7 @@ namespace MxfPlayer.Services
 
         public MxfAudioProvider(string pcmPath, int channels, long baseTimeMs, int sampleRate)
         {
-            _fileStream = new FileStream(pcmPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            _fileStream = new FileStream(pcmPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             _channels = channels;
             _sampleRate = sampleRate > 0 ? sampleRate : 48000;
             _baseTimeMs = baseTimeMs;

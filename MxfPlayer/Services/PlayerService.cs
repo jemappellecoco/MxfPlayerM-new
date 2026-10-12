@@ -508,6 +508,7 @@ namespace MxfPlayer.Services
 
         public PlayerService()
         {
+            _ = Task.Run(PcmCacheCleanup.CleanOldCaches);
             LoadFFmpegFromConfig();
 
             _waveProvider = CreateWaveProvider(_audioSampleRate);
@@ -651,7 +652,7 @@ namespace MxfPlayer.Services
 
                 if (!string.IsNullOrEmpty(_pcmCachePath))
                 {
-                    try { File.Delete(_pcmCachePath); } catch { }
+                    PcmCacheCleanup.DeleteAfterWriter(_pcmCachePath, _audioCacheTask);
                     _pcmCachePath = null;
                 }
 
@@ -923,12 +924,18 @@ namespace MxfPlayer.Services
                 if (_disposed || !_isVideoPlaying ||
                     (!allowStalled && (_isPlaybackStalledForVideo || _isPlaybackStalledForAudio)) ||
                     generation != _audioCacheGeneration || !ReferenceEquals(waveOut, _waveOut))
+                {
+                    if (PlaybackDiagnostics.Enabled)
+                        Debug.WriteLine($"[AudioPlayBlocked] playing={_isVideoPlaying} videoStalled={_isPlaybackStalledForVideo} audioStalled={_isPlaybackStalledForAudio} generation={generation} currentGeneration={_audioCacheGeneration} sameOutput={ReferenceEquals(waveOut, _waveOut)}");
                     return false;
+                }
 
                 try
                 {
                     bool wasPlaying = waveOut.PlaybackState == PlaybackState.Playing;
                     waveOut.Play();
+                    if (PlaybackDiagnostics.Enabled && !wasPlaying)
+                        Debug.WriteLine($"[AudioPlayStarted] rate={_videoRate} frame={CurrentFrameIndex} generation={generation}");
                     if (!wasPlaying)
                         ResetMediaClock(_currentFrameIndex, waveOut);
                     return true;
@@ -1059,7 +1066,8 @@ namespace MxfPlayer.Services
                         }
                     }
 
-                    using (var output = new FileStream(pcmPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite))
+                    using (var output = new FileStream(pcmPath, FileMode.OpenOrCreate, FileAccess.Write,
+                        FileShare.ReadWrite | FileShare.Delete, 4096, FileOptions.DeleteOnClose))
                     {
                         DecodeToFile(output, token, maxDurationMs, TimeMsFromFrame(startFrame, fps));
                     }
@@ -2318,8 +2326,14 @@ namespace MxfPlayer.Services
 
             if (audioBufferTimeoutMs > 0)
             {
-                WaitForAudioBuffer(currentMediaFrame, _audioFps, _videoRate, audioBufferTimeoutMs);
-                if (!PlayWaveOutIfCurrent(waveOut, generation))
+                bool audioReady = WaitForAudioBuffer(currentMediaFrame, _audioFps, _videoRate, audioBufferTimeoutMs);
+                if (PlaybackDiagnostics.Enabled)
+                    Debug.WriteLine($"[AudioResume] rate={_videoRate} frame={currentMediaFrame} ready={audioReady} generation={generation} cacheTask={_audioCacheTask?.Status} videoStalled={_isPlaybackStalledForVideo} audioStalled={_isPlaybackStalledForAudio}");
+                // Explicit resume replaces the previous stall once both streams
+                // are ready. Otherwise that stale flag blocks audio before it
+                // is cleared below, leaving only the video clock running.
+                bool resumeStalledPlayback = audioReady && IsVideoFrameCached(_currentFrameIndex);
+                if (!PlayWaveOutIfCurrent(waveOut, generation, allowStalled: resumeStalledPlayback))
                     ResetMediaClock(_currentFrameIndex);
             }
             else
@@ -2358,7 +2372,9 @@ namespace MxfPlayer.Services
                 {
                     long currentMediaFrame = CurrentFrameIndex;
                     StartAudioCacheFromFrame(currentMediaFrame, _audioFps, effectiveRate, false);
-                    WaitForAudioBuffer(currentMediaFrame, _audioFps, effectiveRate, 1000);
+                    bool audioReady = WaitForAudioBuffer(currentMediaFrame, _audioFps, effectiveRate, 1000);
+                    if (PlaybackDiagnostics.Enabled)
+                        Debug.WriteLine($"[AudioRateReady] rate={effectiveRate} frame={currentMediaFrame} ready={audioReady} generation={_audioCacheGeneration} cacheTask={_audioCacheTask?.Status}");
                     PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration);
                 }
 
@@ -2465,6 +2481,8 @@ namespace MxfPlayer.Services
         public void SetVideoRate(float rate)
         {
             float previousRate = _videoRate;
+            if (PlaybackDiagnostics.Enabled)
+                Debug.WriteLine($"[RateSwitch] from={previousRate} to={rate} frame={CurrentFrameIndex} videoStalled={_isPlaybackStalledForVideo} audioStalled={_isPlaybackStalledForAudio}");
             AdvanceVideo(0);
             _videoRate = rate == 0 ? 1.0f : rate;
             SetAudioRate(_videoRate);
@@ -3180,6 +3198,7 @@ namespace MxfPlayer.Services
 
         public void StopAudioBridge()
         {
+            Task? cacheWriter = _audioCacheTask;
             _reverseRateChangeCts?.Cancel();
             _reverseRateChangeGeneration++;
             StopFrameAudioOutput();
@@ -3239,7 +3258,7 @@ namespace MxfPlayer.Services
 
             if (!string.IsNullOrEmpty(_pcmCachePath))
             {
-                try { File.Delete(_pcmCachePath); } catch { }
+                PcmCacheCleanup.DeleteAfterWriter(_pcmCachePath, cacheWriter);
                 _pcmCachePath = null;
             }
         }
