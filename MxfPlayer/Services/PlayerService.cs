@@ -80,7 +80,6 @@ namespace MxfPlayer.Services
         private bool _isVideoPlaying;
         private volatile bool _disposed;
         private bool _isPlaybackStalledForVideo;
-        private bool _decodeExactForVideoRecovery;
         private bool _isPlaybackStalledForAudio;
         private string? _ffmpegRuntimeError;
         private float _videoRate = 1.0f;
@@ -248,7 +247,6 @@ namespace MxfPlayer.Services
 
         private int GetForwardPresentationGap()
         {
-            if (_videoRate >= 8.0f) return 12;
             return 1;
         }
 
@@ -261,22 +259,6 @@ namespace MxfPlayer.Services
                 {
                     cachedFrame = candidate;
                     return true;
-                }
-            }
-
-            // A skipped GOP can leave a larger gap between displayable frames.
-            // Advance to the next decoded picture instead of freezing the media clock.
-            if (_videoRate >= 8.0f)
-            {
-                int lookAhead = 24;
-                for (int offset = 1; offset <= lookAhead; offset++)
-                {
-                    long candidate = targetFrame + offset;
-                    if (_videoFrameCache.TryGetValue(candidate, out bitmap))
-                    {
-                        cachedFrame = candidate;
-                        return true;
-                    }
                 }
             }
 
@@ -1374,11 +1356,7 @@ namespace MxfPlayer.Services
                 ffmpeg.avcodec_parameters_to_context(codecContext, codecParameters);
                 codecContext->thread_count = Math.Max(1, Environment.ProcessorCount - 2);
                 codecContext->thread_type = ffmpeg.FF_THREAD_FRAME | ffmpeg.FF_THREAD_SLICE;
-                // At 4x the full decoder is fast enough to keep the cache continuous.
-                // Sparse GOP decoding remains for 8x, where full decode cannot keep up.
-                bool sparseForward = _videoRate >= 8.0f && _isVideoPlaying && !_decodeExactForVideoRecovery;
-                if (sparseForward)
-                    codecContext->skip_frame = AVDiscard.AVDISCARD_NONKEY;
+                // All forward rates use full decoding and a continuous frame cache.
                 if (ffmpeg.avcodec_open2(codecContext, codec, null) < 0) return;
 
                 int width = codecContext->width;
@@ -1422,7 +1400,6 @@ namespace MxfPlayer.Services
                 long fallbackFrameIndex = seekFrame;
                 long cachedThroughFrame = startFrame - 1;
                 long filterOutputDisplayIndex = -1;
-                var filteredFrameIndexes = new Queue<long>();
 
                 while (!token.IsCancellationRequested &&
                        IsCurrentVideoDecodeGeneration(decodeGeneration) &&
@@ -1456,8 +1433,6 @@ namespace MxfPlayer.Services
                                 ref fallbackFrameIndex,
                                 ref cachedThroughFrame,
                                 ref filterOutputDisplayIndex,
-                                filteredFrameIndexes,
-                                sparseForward,
                                 decodeGeneration,
                                 token);
 
@@ -1499,8 +1474,6 @@ namespace MxfPlayer.Services
             ref long fallbackFrameIndex,
             ref long cachedThroughFrame,
             ref long filterOutputDisplayIndex,
-            Queue<long> filteredFrameIndexes,
-            bool sparseForward,
             int decodeGeneration,
             CancellationToken token)
         {
@@ -1543,13 +1516,9 @@ namespace MxfPlayer.Services
 
                     if (videoFilter.AddFrame(frame))
                     {
-                        if (sparseForward)
-                            filteredFrameIndexes.Enqueue(displayIndex);
                         while (videoFilter.TryReceiveFrame(filteredFrame))
                         {
                             long filteredDisplayIndex = filterOutputDisplayIndex;
-                            if (sparseForward && filteredFrameIndexes.Count > 0)
-                                filteredDisplayIndex = filteredFrameIndexes.Dequeue();
                             filterOutputDisplayIndex++;
                             long filteredMediaFrameIndex = MediaFrameFromDisplayIndex(filteredDisplayIndex);
 
@@ -1757,12 +1726,8 @@ namespace MxfPlayer.Services
 
         private bool ShouldCacheVideoFrameLocked(long frameIndex, int decodeGeneration)
         {
-            bool sampleForwardFrame = _videoRate < 8.0f || !_isVideoPlaying || _decodeExactForVideoRecovery ||
-                frameIndex == _currentFrameIndex ||
-                frameIndex % 2 == 0;
             return IsCurrentVideoDecodeGeneration(decodeGeneration) &&
                    !IsForwardFrameTooFarAheadLocked(frameIndex) &&
-                   sampleForwardFrame &&
                    !_videoFrameCache.ContainsKey(frameIndex);
         }
 
@@ -2323,7 +2288,6 @@ namespace MxfPlayer.Services
             bool needsExactFrame = _isVideoPlaying && _videoRate >= 2.0f;
             _isVideoPlaying = false;
             _isPlaybackStalledForVideo = false;
-            _decodeExactForVideoRecovery = false;
             _isPlaybackStalledForAudio = false;
             _playbackClock.Stop();
             lock (_audioCacheLock)
@@ -2384,6 +2348,9 @@ namespace MxfPlayer.Services
 
             if (effectiveRate >= 0)
             {
+                if (CanReuseForwardAudioCache(CurrentFrameIndex, effectiveRate))
+                    return;
+
                 if (_fileAudioProvider != null)
                     _fileAudioProvider.PlaybackRate = GetForwardAudioProviderRate(effectiveRate);
 
@@ -2507,6 +2474,21 @@ namespace MxfPlayer.Services
                 EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
         }
 
+        private bool CanReuseForwardAudioCache(long frameIndex, float rate)
+        {
+            if (_fileAudioProvider == null ||
+                Math.Abs(_forwardAudioCacheRate - rate) > 0.001f)
+                return false;
+
+            // A small reserve is not a reason to discard already decoded PCM.
+            if (_fileAudioProvider.IsFrameDataAvailable(frameIndex, _audioFps, 0))
+                return true;
+
+            // Keep the writer when playback has just reached its current tail.
+            // A seek outside this nearby range still creates a cache at the new position.
+            return _audioCacheTask != null && !_audioCacheTask.IsCompleted &&
+                   _fileAudioProvider.IsNearGrowingCacheTail(frameIndex, _audioFps, AudioStallResumeBufferMs);
+        }
         public void PrepareAudioForRate(float rate)
         {
             if (string.IsNullOrEmpty(CurrentPath))
@@ -2535,9 +2517,7 @@ namespace MxfPlayer.Services
                 return;
             }
 
-            if (_fileAudioProvider == null ||
-                Math.Abs(_forwardAudioCacheRate - effectiveRate) > 0.001f ||
-                !_fileAudioProvider.IsFrameDataAvailable(CurrentFrameIndex, _audioFps, AudioStallResumeBufferMs))
+            if (!CanReuseForwardAudioCache(CurrentFrameIndex, effectiveRate))
             {
                 StartAudioCacheFromFrame(CurrentFrameIndex, _audioFps, effectiveRate, _isVideoPlaying);
             }
@@ -2670,7 +2650,6 @@ namespace MxfPlayer.Services
                 return;
 
             _isPlaybackStalledForVideo = true;
-            _decodeExactForVideoRecovery = true;
             _isPlaybackStalledForAudio = false;
             _playbackStartFrame = _currentFrameIndex;
             _playbackClock.Stop();
@@ -2706,7 +2685,6 @@ namespace MxfPlayer.Services
             if (!PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration, allowStalled: true))
                 ResetMediaClock(_currentFrameIndex);
             _isPlaybackStalledForVideo = false;
-            _decodeExactForVideoRecovery = false;
             if (_videoRate >= 4.0f)
                 EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
         }
@@ -3207,7 +3185,6 @@ namespace MxfPlayer.Services
             StopFrameAudioOutput();
             _isVideoPlaying = false;
             _isPlaybackStalledForVideo = false;
-            _decodeExactForVideoRecovery = false;
             _isPlaybackStalledForAudio = false;
             _playbackClock.Stop();
             _videoCts?.Cancel();

@@ -94,6 +94,19 @@ namespace MxfPlayer.Services
             return _fileStream.Length >= targetOffsetBytes + requiredBytes;
         }
 
+        public bool IsNearGrowingCacheTail(long frameIndex, double fps, int maxAheadMs)
+        {
+            if (fps <= 0) fps = 29.97;
+            long timeMs = (long)Math.Round(frameIndex * 1000.0 / fps);
+            if (timeMs < _baseTimeMs) return false;
+
+            lock (_streamLock)
+            {
+                if (_disposed) return false;
+                long targetBytes = MediaMsToSourceBytes(timeMs - _baseTimeMs);
+                return targetBytes <= _fileStream.Length + MediaMsToSourceBytes(maxAheadMs);
+            }
+        }
         public bool IsReverseFrameDataAvailable(long frameIndex, double fps, int requiredBehindMs)
         {
             if (fps <= 0) fps = 29.97;
