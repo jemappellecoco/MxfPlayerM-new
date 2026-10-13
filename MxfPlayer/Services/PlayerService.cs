@@ -92,6 +92,7 @@ namespace MxfPlayer.Services
         private long _videoDecodePerfSendPackets;
         private long _videoDecodePerfSendTicks;
         private long _videoDecodePerfReceiveFrames;
+        private long _videoDecodePerfDecodedFrames;
         private long _videoDecodePerfReceiveTicks;
         private long _videoDecodePerfFrames;
         private long _videoDecodePerfBitmapTicks;
@@ -247,7 +248,9 @@ namespace MxfPlayer.Services
 
         private int GetForwardPresentationGap()
         {
-            return 1;
+            // At 16x, eight source frames occupy about one UI update (30 fps media).
+            // Decode and deinterlace every frame, but convert only selected pictures.
+            return _videoRate >= 16.0f ? 8 : 1;
         }
 
         private bool TryGetPlaybackVideoFrameLocked(long targetFrame, out long cachedFrame, out Bitmap? bitmap)
@@ -1493,6 +1496,7 @@ namespace MxfPlayer.Services
                 TrackVideoReceivePerf(Stopwatch.GetTimestamp() - receiveStartTicks);
                 if (receiveResult != 0)
                     break;
+                Interlocked.Increment(ref _videoDecodePerfDecodedFrames);
 
                 long frameIndex = GetFrameIndexFromTimestamp(frame, streamTimeBase, streamStartTime, fallbackFrameIndex);
                 fallbackFrameIndex++;
@@ -1562,6 +1566,7 @@ namespace MxfPlayer.Services
 
                     if (!ShouldCacheVideoFrame(displayIndex, decodeGeneration))
                     {
+                        cachedThroughFrame = Math.Max(cachedThroughFrame, frameIndex);
                         ffmpeg.av_frame_unref(frame);
                         continue;
                     }
@@ -1622,6 +1627,7 @@ namespace MxfPlayer.Services
                 long totalSendPackets = Interlocked.Exchange(ref _videoDecodePerfSendPackets, 0);
                 long totalSendTicks = Interlocked.Exchange(ref _videoDecodePerfSendTicks, 0);
                 long totalReceiveFrames = Interlocked.Exchange(ref _videoDecodePerfReceiveFrames, 0);
+                long totalDecodedFrames = Interlocked.Exchange(ref _videoDecodePerfDecodedFrames, 0);
                 long totalReceiveTicks = Interlocked.Exchange(ref _videoDecodePerfReceiveTicks, 0);
                 long totalFrames = Interlocked.Exchange(ref _videoDecodePerfFrames, 0);
                 long totalBitmapTicks = Interlocked.Exchange(ref _videoDecodePerfBitmapTicks, 0);
@@ -1641,6 +1647,7 @@ namespace MxfPlayer.Services
                     Debug.WriteLine(
                     $"[VideoDecodePerf] fps={totalFrames / elapsedSeconds:0.0} " +
                     $"activeFps={totalFrames / activeSeconds:0.0} " +
+                    $"decodedFps={totalDecodedFrames / elapsedSeconds:0.0} decodedActiveFps={totalDecodedFrames / activeSeconds:0.0} presentationGap={GetForwardPresentationGap()} " +
                     $"readMs={readMs:0.00} sendMs={sendMs:0.00} receiveMs={receiveMs:0.00} " +
                     $"bitmapMs={bitmapMs:0.00} cacheMs={cacheMs:0.00} " +
                     $"throttleMs={throttleSeconds * 1000.0:0} frames={totalFrames} packets={totalPackets}");
@@ -1736,6 +1743,7 @@ namespace MxfPlayer.Services
         {
             return IsCurrentVideoDecodeGeneration(decodeGeneration) &&
                    !IsForwardFrameTooFarAheadLocked(frameIndex) &&
+                    (_videoRate < 16.0f || frameIndex <= _currentFrameIndex + 16 || frameIndex % 8 == 0) &&
                    !_videoFrameCache.ContainsKey(frameIndex);
         }
 
@@ -2488,6 +2496,7 @@ namespace MxfPlayer.Services
             SetAudioRate(_videoRate);
             ResetMediaClock(_currentFrameIndex);
             if (Math.Sign(previousRate) != Math.Sign(_videoRate) ||
+                (previousRate >= 16.0f) != (_videoRate >= 16.0f) ||
                 (previousRate >= 4.0f) != (_videoRate >= 4.0f))
                 EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
         }
@@ -2672,9 +2681,9 @@ namespace MxfPlayer.Services
             _playbackStartFrame = _currentFrameIndex;
             _playbackClock.Stop();
             StopWaveOutForReposition();
-            // A sparse cache can have a hole near the playhead even while the
-            // decoder is throttled far ahead. Restart at the stalled position.
-            EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
+            // At 16x a cache-tail wait should let the current full decoder catch
+            // up instead of seeking and decoding the same GOP again.
+            EnsureVideoDecoderNearCurrentFrame(forceRestart: _videoRate < 16.0f);
         }
 
         private void StallPlaybackForAudioBuffer()
@@ -2703,7 +2712,7 @@ namespace MxfPlayer.Services
             if (!PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration, allowStalled: true))
                 ResetMediaClock(_currentFrameIndex);
             _isPlaybackStalledForVideo = false;
-            if (_videoRate >= 4.0f)
+            if (_videoRate >= 4.0f && _videoRate < 16.0f)
                 EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
         }
 
