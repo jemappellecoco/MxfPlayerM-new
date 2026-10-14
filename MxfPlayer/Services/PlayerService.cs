@@ -81,6 +81,7 @@ namespace MxfPlayer.Services
         private volatile bool _disposed;
         private bool _isPlaybackStalledForVideo;
         private bool _isPlaybackStalledForAudio;
+        private bool _waitingForReverseStartup;
         private string? _ffmpegRuntimeError;
         private float _videoRate = 1.0f;
         private readonly Stopwatch _playbackClock = new();
@@ -2493,6 +2494,17 @@ namespace MxfPlayer.Services
                 Debug.WriteLine($"[RateSwitch] from={previousRate} to={rate} frame={CurrentFrameIndex} videoStalled={_isPlaybackStalledForVideo} audioStalled={_isPlaybackStalledForAudio}");
             AdvanceVideo(0);
             _videoRate = rate == 0 ? 1.0f : rate;
+            if (_videoRate >= 0)
+                _waitingForReverseStartup = false;
+            else if (previousRate >= 0 && _isVideoPlaying)
+                _waitingForReverseStartup = true;
+            if (_waitingForReverseStartup)
+            {
+                _isPlaybackStalledForVideo = true;
+                _isPlaybackStalledForAudio = false;
+                _playbackClock.Stop();
+                StopWaveOutForReposition();
+            }
             SetAudioRate(_videoRate);
             ResetMediaClock(_currentFrameIndex);
             if (Math.Sign(previousRate) != Math.Sign(_videoRate) ||
@@ -2683,7 +2695,7 @@ namespace MxfPlayer.Services
             StopWaveOutForReposition();
             // At 16x a cache-tail wait should let the current full decoder catch
             // up instead of seeking and decoding the same GOP again.
-            EnsureVideoDecoderNearCurrentFrame(forceRestart: _videoRate < 16.0f);
+            EnsureVideoDecoderNearCurrentFrame(forceRestart: _videoRate > -8.0f && _videoRate < 16.0f);
         }
 
         private void StallPlaybackForAudioBuffer()
@@ -2705,13 +2717,14 @@ namespace MxfPlayer.Services
 
             // The UI timer calls this method. Keep the transport stopped until
             // audio is ready instead of blocking the UI thread for up to 1 s.
-            if (_videoRate >= 0 && !HasAudioPlaybackBuffer(CurrentFrameIndex, AudioStallResumeBufferMs))
+            if (!HasAudioPlaybackBuffer(CurrentFrameIndex, AudioStallResumeBufferMs))
                 return;
 
             SeekAudioByFrame(CurrentFrameIndex, _audioFps);
             if (!PlayWaveOutIfCurrent(_waveOut, _audioCacheGeneration, allowStalled: true))
                 ResetMediaClock(_currentFrameIndex);
             _isPlaybackStalledForVideo = false;
+            _waitingForReverseStartup = false;
             if (_videoRate >= 4.0f && _videoRate < 16.0f)
                 EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
         }
@@ -2740,7 +2753,9 @@ namespace MxfPlayer.Services
         private bool HasAudioPlaybackBuffer(long frameIndex, int requiredAheadMs)
         {
             if (_videoRate < 0)
-                return true;
+                return CurrentAudioCount <= 0 ||
+                    (_slidingAudioProvider != null && _slidingAudioProvider.IsReverseFrameDataAvailable(frameIndex, _audioFps, 250)) ||
+                    (_reverseAudioProvider != null && _reverseAudioProvider.HasFrameData(frameIndex, 250));
             if (CurrentAudioCount <= 0)
                 return true;
 
@@ -2757,6 +2772,9 @@ namespace MxfPlayer.Services
                     return false;
 
                 int requiredFrames = GetVideoStallResumeBufferFrames();
+                if (_waitingForReverseStartup)
+                    requiredFrames = (int)Math.Min(_currentFrameIndex,
+                        GetReverseStartupVideoBufferFramesForRate(_videoRate) * DisplayUnitsPerFrame - 1);
                 if (_videoRate >= 0)
                     return continuousFrame - _currentFrameIndex >= requiredFrames;
 
@@ -2881,10 +2899,22 @@ namespace MxfPlayer.Services
             if (_videoRate < 0)
             {
                 int reverseWindowFrames = Math.Min(ReverseVideoDecodeWindowFrames * DisplayUnitsPerFrame, GetMaxCachedVideoFramesForRate(_videoRate));
-                long startDisplayIndex = Math.Max(0, _currentFrameIndex - reverseWindowFrames + 1);
+                long windowEndDisplayIndex = _currentFrameIndex;
+                if (_videoRate <= -8.0f && !forceRestart && continuousCachedFrame >= 0)
+                {
+                    // Extend immediately before the connected cache, rather than
+                    // decoding a mostly overlapping window around the playhead.
+                    windowEndDisplayIndex = Math.Max(0, continuousCachedFrame - 1);
+                    long bufferedFrames = _currentFrameIndex - continuousCachedFrame + 1;
+                    int room = (int)Math.Max(32, GetMaxCachedVideoFramesForRate(_videoRate) - bufferedFrames - 16);
+                    reverseWindowFrames = Math.Min(reverseWindowFrames, room);
+                }
+                long startDisplayIndex = Math.Max(0, windowEndDisplayIndex - reverseWindowFrames + 1);
                 startFrame = MediaFrameFromDisplayIndex(startDisplayIndex);
                 // BWDIF needs following frames at the window boundary to emit the last requested frame.
-                endFrameExclusive = Math.Min(_totalVideoFrames, MediaFrameFromDisplayIndex(_currentFrameIndex) + 3);
+                endFrameExclusive = Math.Min(_totalVideoFrames, MediaFrameFromDisplayIndex(windowEndDisplayIndex) + 3);
+                if (PlaybackDiagnostics.Enabled && _videoRate <= -8.0f)
+                    Debug.WriteLine($"[ReverseVideoWindow] current={_currentFrameIndex} continuousEnd={continuousCachedFrame} start={startFrame} endExclusive={endFrameExclusive} frames={reverseWindowFrames} forced={forceRestart}");
             }
             else
             {
@@ -2910,6 +2940,8 @@ namespace MxfPlayer.Services
 
         private int GetReverseVideoPreloadLowWaterFrames()
         {
+            if (_videoRate <= -8.0f)
+                return DisplayFramesToMediaFrames(GetMaxCachedVideoFramesForRate(_videoRate) * 2 / 3);
             return GetReverseStartupVideoBufferFramesForRate(_videoRate);
         }
 
