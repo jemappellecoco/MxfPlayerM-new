@@ -23,8 +23,19 @@ namespace MxfPlayer.Services
                     return _cachedConfig;
 
                 _cachedConfig = LoadFromDisk();
+                string bundledFfmpeg = Path.Combine(AppContext.BaseDirectory, "FFmpeg");
+                string bundledMediaInfo = Path.Combine(AppContext.BaseDirectory, "MediaInfo", "MediaInfo.dll");
+                _cachedConfig.FFmpegPath = File.Exists(Path.Combine(bundledFfmpeg, "avcodec-62.dll"))
+                    ? bundledFfmpeg : ResolvePath(_cachedConfig.FFmpegPath);
+                _cachedConfig.MediaInfoPath = File.Exists(bundledMediaInfo)
+                    ? bundledMediaInfo : ResolvePath(_cachedConfig.MediaInfoPath);
                 return _cachedConfig;
             }
+        }
+
+        private static string ResolvePath(string path)
+        {
+            return string.IsNullOrWhiteSpace(path) ? "" : Path.GetFullPath(path, AppContext.BaseDirectory);
         }
 
         private static AppConfig LoadFromDisk()

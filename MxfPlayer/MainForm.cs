@@ -2023,6 +2023,7 @@ namespace MxfPlayer
             _isBoundarySeeking = true;
             try
             {
+                _playbackController.Pause();
                 if (moveLast)
                     await _playbackController.MoveLast(fps);
                 else
@@ -2032,7 +2033,7 @@ namespace MxfPlayer
                 _displayedVideoFrameIndex = -1;
                 UpdateTimelineUI(-1);
 
-                await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 1000);
+                await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 3000);
                 UpdateVideoFrame();
                 UpdateTimelineUI(-1);
                 UpdateMetersFromAudioLevel();

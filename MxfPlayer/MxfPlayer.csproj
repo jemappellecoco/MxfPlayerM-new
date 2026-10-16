@@ -7,6 +7,9 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+    <DefaultItemExcludes>$(DefaultItemExcludes);publish\**</DefaultItemExcludes>
+    <FFmpegBundleSource Condition="'$(FFmpegBundleSource)' == ''">C:\Tools\ffmpeg-8.1-full_build-shared\bin</FFmpegBundleSource>
+    <MediaInfoBundleSource Condition="'$(MediaInfoBundleSource)' == ''">C:\Program Files\MediaInfo</MediaInfoBundleSource>
   </PropertyGroup>
 
   <ItemGroup>
@@ -14,6 +17,33 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="$(FFmpegBundleSource)\*.dll;$(FFmpegBundleSource)\ffmpeg.exe;$(FFmpegBundleSource)\ffprobe.exe">
+      <Link>FFmpeg\%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="$(FFmpegBundleSource)\..\LICENSE">
+      <Link>FFmpeg\LICENSE</Link>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="$(MediaInfoBundleSource)\*.dll;$(MediaInfoBundleSource)\License.html">
+      <Link>MediaInfo\%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
+  <Target Name="ValidateBundledTools" BeforeTargets="PrepareForPublish">
+    <Error Condition="!Exists('$(FFmpegBundleSource)\avcodec-62.dll') Or !Exists('$(FFmpegBundleSource)\ffmpeg.exe')" Text="找不到 FFmpeg 8.x shared 工具，請設定 FFmpegBundleSource。" />
+    <Error Condition="!Exists('$(MediaInfoBundleSource)\MediaInfo.dll')" Text="找不到 MediaInfo.dll，請設定 MediaInfoBundleSource。" />
+    <Error Condition="'$(RuntimeIdentifier)' != 'win-x64'" Text="隨附工具為 x64，請使用 -r win-x64 發佈。" />
+  </Target>
+
+  <Target Name="WritePortableConfig" AfterTargets="Publish">
+    <WriteLinesToFile File="$(PublishDir)config.json" Lines="{ &quot;FFmpegPath&quot;: &quot;FFmpeg&quot;, &quot;MediaInfoPath&quot;: &quot;MediaInfo/MediaInfo.dll&quot; }" Overwrite="true" Encoding="UTF-8" />
+  </Target>
 
  
 

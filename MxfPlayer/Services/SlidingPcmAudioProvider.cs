@@ -199,7 +199,11 @@ namespace MxfPlayer.Services
 
                 int bytesWritten = framesWritten * 4;
                 if (bytesWritten < count)
+                {
+                    if (PlaybackDiagnostics.Enabled)
+                        System.Diagnostics.Debug.WriteLine($"[ReverseAudioUnderrun] startSample={startSample} requested={framesRequested} written={framesWritten} bufferedSamples={BufferedSourceFrames} providerRate={_playbackRate} tempoRate={_tempoRate}");
                     Array.Clear(buffer, offset + bytesWritten, count - bytesWritten);
+                }
 
                 return count;
             }
