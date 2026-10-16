@@ -14,8 +14,7 @@ using static Vortice.DXGI.DXGI;
 
 namespace MxfPlayer.Services;
 
-// All calls are made on the WinForms UI thread. The decoder only creates CPU
-// frame buffers; no immediate-context calls are made by its background task.
+// Device, immediate context and swap chain are owned by one presentation thread.
 internal sealed class Direct3D11FrameRenderer : IDisposable
 {
     private readonly ID3D11Device _device;
@@ -150,9 +149,9 @@ internal sealed class Direct3D11FrameRenderer : IDisposable
         _views[plane] = _device.CreateShaderResourceView(_textures[plane]!);
     }
 
-    public void Draw(bool hasFrame, Color background)
+    public bool Draw(bool hasFrame, Color background)
     {
-        if (_target == null) return;
+        if (_target == null) return false;
         _context.OMSetRenderTargets(_target);
         _context.ClearRenderTargetView(_target, new Color4(background.R / 255f, background.G / 255f, background.B / 255f, 1));
         if (hasFrame && _sourceWidth > 0)
@@ -169,9 +168,21 @@ internal sealed class Direct3D11FrameRenderer : IDisposable
             _context.Draw(3, 0);
             for (uint i = 0; i < 3; i++) _context.PSSetShaderResource(i, null!);
         }
-        // The UI already selects the frame from the media clock. Do not block it
-        // on vblank, which also drives transport and audio-buffer checks.
-        _swapChain.Present(0, PresentFlags.None).CheckError();
+        // Submit each picture in sequence without waiting for monitor refresh.
+        // The compositor may show only a subset; the application never skips
+        // a source picture to catch the media clock.
+        var result = _swapChain.Present(0, PresentFlags.None);
+        if (result.Code == 0x087A0001) return false; // DXGI_STATUS_OCCLUDED
+        result.CheckError();
+        return true;
+    }
+
+    public bool IsVisible()
+    {
+        var result = _swapChain.Present(0, PresentFlags.Test);
+        if (result.Code == 0x087A0001) return false;
+        result.CheckError();
+        return true;
     }
 
     private void ReleaseTextures()

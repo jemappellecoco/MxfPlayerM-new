@@ -13,7 +13,7 @@ using MxfPlayer.Models;
 
 namespace MxfPlayer.Services
 {
-    public unsafe class PlayerService : IDisposable
+    public unsafe partial class PlayerService : IDisposable
     {
         private bool _filterReady = false; 
 
@@ -72,13 +72,13 @@ namespace MxfPlayer.Services
         private float _forwardAudioCacheRate = 1.0f;
         private long _displayedVideoFrameIndex = -1;
         private ReversePlaybackSegment? _reverseSegment;
-        private bool _isVideoPlaying;
+        private volatile bool _isVideoPlaying;
         private volatile bool _disposed;
         private bool _isPlaybackStalledForVideo;
         private bool _isPlaybackStalledForAudio;
         private bool _waitingForReverseStartup;
         private string? _ffmpegRuntimeError;
-        private float _videoRate = 1.0f;
+        private volatile float _videoRate = 1.0f;
         private readonly Stopwatch _playbackClock = new();
         private readonly Stopwatch _videoStatusLogClock = Stopwatch.StartNew();
         private readonly Stopwatch _videoDecodeRestartClock = Stopwatch.StartNew();
@@ -122,7 +122,7 @@ namespace MxfPlayer.Services
         public int CurrentAudioCount { get; private set; }
         public bool IsAudioReady => _waveOut != null && (_fileAudioProvider != null || _slidingAudioProvider != null || _reverseAudioProvider != null);
         public bool IsPlaying => _isVideoPlaying;
-        public long CurrentFrameIndex => MediaFrameFromDisplayIndex(_currentFrameIndex);
+        public long CurrentFrameIndex => MediaFrameFromDisplayIndex(Interlocked.Read(ref _currentFrameIndex));
 
         public int GetRequiredVideoBufferFramesForRate(float rate)
         {
@@ -244,9 +244,8 @@ namespace MxfPlayer.Services
 
         private int GetForwardPresentationGap()
         {
-            // At 16x, eight source frames occupy about one UI update (30 fps media).
-            // Decode and deinterlace every frame, but convert only selected pictures.
-            return _videoRate >= 16.0f ? 8 : 1;
+            // Strict presentation keeps every decoded display frame at every rate.
+            return 1;
         }
 
         private bool TryGetPlaybackVideoFrameLocked(long targetFrame, out long cachedFrame, out VideoFrameData? frameData)
@@ -564,7 +563,7 @@ namespace MxfPlayer.Services
             }
         }
 
-        public Task StartAudioBridge(string path, int audioCount, long startTimeMs = 0, float rate = 1.0f, double fps = 0, int sampleRate = 48000)
+        private Task StartAudioBridgeCore(string path, int audioCount, long startTimeMs = 0, float rate = 1.0f, double fps = 0, int sampleRate = 48000)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(PlayerService));
             if (!string.IsNullOrWhiteSpace(_ffmpegRuntimeError))
@@ -975,10 +974,14 @@ namespace MxfPlayer.Services
 
         private void ResetMediaClock(long displayIndex, WaveOutEvent? waveOut)
         {
-            _playbackStartFrame = ClampDisplayIndex(displayIndex);
-            _audioClockStartFrame = _playbackStartFrame;
-            _audioClockStartBytes = GetWaveOutPositionBytes(waveOut);
-            _playbackClock.Restart();
+            lock (_mediaClockGate)
+            {
+                _playbackStartFrame = ClampDisplayIndex(displayIndex);
+                _audioClockStartFrame = _playbackStartFrame;
+                _audioClockStartBytes = GetWaveOutPositionBytes(waveOut);
+                _playbackClock.Restart();
+                Interlocked.Increment(ref _presentationEpoch);
+            }
         }
 
         private long GetWaveOutPositionBytes(WaveOutEvent? waveOut)
@@ -1049,7 +1052,7 @@ namespace MxfPlayer.Services
 
         public Task<bool> WaitForAudioBufferAsync(long frameIndex, double fps, float rate, int timeoutMs)
         {
-            return Task.Run(() => WaitForAudioBuffer(frameIndex, fps, rate, timeoutMs));
+            return Task.Run(() => WaitForAudioBuffer(frameIndex, fps, NormalizePlaybackRate(rate), timeoutMs));
         }
 
         private void CreatePcmCacheFile(string path, string pcmPath, long startFrame, double fps, CancellationToken token, int? maxDurationMs = null, float audioTempoRate = 1.0f)
@@ -1788,7 +1791,6 @@ namespace MxfPlayer.Services
         {
             return IsCurrentVideoDecodeGeneration(decodeGeneration) &&
                    !IsForwardFrameTooFarAheadLocked(frameIndex) &&
-                    (_videoRate < 16.0f || frameIndex <= _currentFrameIndex + 16 || frameIndex % 8 == 0) &&
                    !_videoFrameCache.ContainsKey(frameIndex);
         }
 
@@ -2337,8 +2339,9 @@ namespace MxfPlayer.Services
         }
 
 
-        public void Pause()
+        private void PauseCore()
         {
+            Interlocked.Increment(ref _presentationEpoch);
             bool needsExactFrame = _isVideoPlaying && _videoRate >= 2.0f;
             _isVideoPlaying = false;
             _isPlaybackStalledForVideo = false;
@@ -2359,7 +2362,7 @@ namespace MxfPlayer.Services
             try { _waveOut?.Stop(); } catch { }
         }
 
-        public void ResumeAudio(int audioBufferTimeoutMs = 3000)
+        private void ResumeAudioCore(int audioBufferTimeoutMs = 3000)
         {
             if (_disposed) return;
             StopFrameAudioOutput();
@@ -2402,7 +2405,7 @@ namespace MxfPlayer.Services
                 EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
         }
 
-        public void SetAudioRate(float rate)
+        private void SetAudioRateCore(float rate)
         {
             float effectiveRate = Math.Abs(rate) > 0 ? rate : 1.0f;
 
@@ -2527,13 +2530,13 @@ namespace MxfPlayer.Services
             }
         }
 
-        public void SetVideoRate(float rate)
+        private void SetVideoRateCore(float rate)
         {
             float previousRate = _videoRate;
             if (PlaybackDiagnostics.Enabled)
                 Debug.WriteLine($"[RateSwitch] from={previousRate} to={rate} frame={CurrentFrameIndex} videoStalled={_isPlaybackStalledForVideo} audioStalled={_isPlaybackStalledForAudio}");
-            AdvanceVideo(0);
-            _videoRate = rate == 0 ? 1.0f : rate;
+            _requestedVideoRate = rate == 0 ? 1.0f : rate;
+            _videoRate = NormalizePlaybackRate(_requestedVideoRate);
             if (_videoRate >= 0)
                 _waitingForReverseStartup = false;
             else if (previousRate >= 0 && _isVideoPlaying)
@@ -2568,7 +2571,7 @@ namespace MxfPlayer.Services
             return _audioCacheTask != null && !_audioCacheTask.IsCompleted &&
                    _fileAudioProvider.IsNearGrowingCacheTail(frameIndex, _audioFps, AudioStallResumeBufferMs);
         }
-        public void PrepareAudioForRate(float rate)
+        private void PrepareAudioForRateCore(float rate)
         {
             if (string.IsNullOrEmpty(CurrentPath))
                 return;
@@ -2602,7 +2605,7 @@ namespace MxfPlayer.Services
             }
         }
 
-        public void AdvanceVideo(int elapsedMs)
+        private void AdvanceVideoCore(int elapsedMs)
         {
             if (!_isVideoPlaying || _totalVideoFrames <= 0) return;
 
@@ -2625,13 +2628,29 @@ namespace MxfPlayer.Services
                 return;
             }
 
-            double clockElapsedMs = GetMasterClockElapsedMs();
-            long framesToMove = (long)Math.Floor(clockElapsedMs * DisplayFps * Math.Abs(_videoRate) / 1000.0);
+            if (_presentedEpoch != Interlocked.Read(ref _presentationEpoch) || _presentedFrame != _currentFrameIndex)
+                return;
+
             long targetFrame;
-            if (_videoRate >= 0)
-                targetFrame = Math.Min(TotalDisplayUnits - 1, _audioClockStartFrame + framesToMove);
-            else
-                targetFrame = Math.Max(0, _playbackStartFrame - framesToMove);
+            lock (_mediaClockGate)
+            {
+                double elapsed = GetMasterClockElapsedMs();
+                long distance = (long)Math.Floor(elapsed * DisplayFps * Math.Abs(_videoRate) / 1000.0);
+                targetFrame = _videoRate >= 0
+                    ? Math.Min(TotalDisplayUnits - 1, _audioClockStartFrame + distance)
+                    : Math.Max(0, _playbackStartFrame - distance);
+            }
+            long clockDistance = (_videoRate >= 0 ? 1 : -1) * (targetFrame - _currentFrameIndex);
+            if (clockDistance <= 0)
+                return;
+            if (clockDistance > 2)
+            {
+                // Never jump over undisplayed pictures to catch the audio clock.
+                // Stop/reposition both streams through the existing buffer-resume path.
+                StallPlaybackForVideoBuffer();
+                return;
+            }
+            targetFrame = Math.Clamp(_currentFrameIndex + (_videoRate >= 0 ? 1 : -1), 0, TotalDisplayUnits - 1);
             long clockEnd = Stopwatch.GetTimestamp();
 
             if (HasAudioUnderrun())
@@ -2874,7 +2893,7 @@ namespace MxfPlayer.Services
                 $"decodeTask={taskStatus} completed={taskCompleted} rate={_videoRate:0.###}");
         }
 
-        public void SeekVideoByFrame(long frameIndex)
+        private void SeekVideoByFrameCore(long frameIndex)
         {
             if (_totalVideoFrames <= 0) return;
             _currentFrameIndex = DisplayIndexFromMediaFrame(ClampFrameIndex(frameIndex));
@@ -2882,7 +2901,7 @@ namespace MxfPlayer.Services
             EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
         }
 
-        private void EnsureVideoDecoderNearCurrentFrame(bool forceRestart = false)
+        private void EnsureVideoDecoderNearCurrentFrameCore(bool forceRestart = false)
         {
             if (_disposed || string.IsNullOrEmpty(CurrentPath)) return;
 
@@ -2997,7 +3016,7 @@ namespace MxfPlayer.Services
             SeekAudioByFrame(FrameFromTimeMs(timeMs, _audioFps), _audioFps);
         }
 
-        public void SeekAudioByFrame(long frameIndex, double fps, bool waitForPreviousCache = true)
+        private void SeekAudioByFrameCore(long frameIndex, double fps, bool waitForPreviousCache = true)
         {
             frameIndex = ClampFrameIndex(frameIndex);
             bool hasData = _videoRate < 0
@@ -3277,8 +3296,9 @@ namespace MxfPlayer.Services
             return magnitude / 32768f;
         }
 
-        public void StopAudioBridge()
+        private void StopAudioBridgeCore()
         {
+            Interlocked.Increment(ref _presentationEpoch);
             Task? cacheWriter = _audioCacheTask;
             _reverseRateChangeCts?.Cancel();
             _reverseRateChangeGeneration++;

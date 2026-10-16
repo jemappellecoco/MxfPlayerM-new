@@ -42,7 +42,6 @@ namespace MxfPlayer
         private Label _lblTotalSize = null!;
         private TrackBar _timeline = null!;
         private System.Windows.Forms.Timer _meterTimer = null!;
-        private long _displayedVideoFrameIndex = -1;
         private readonly List<Panel> _meterBars = new();
         private readonly List<CheckBox> _channelChecks = new();
         private TableLayoutPanel _videoAndMetersLayout = null!;
@@ -51,6 +50,7 @@ namespace MxfPlayer
         private bool _isStartingPlayback = false;
         private int _transportVersion;
         private bool _isClosing;
+        private bool _renderShutdownComplete;
         private bool _isEditingNowTimecode = false;
         private bool _isBuffering = false;
         private MediaInfoResult? _currentMediaInfo;
@@ -102,13 +102,20 @@ namespace MxfPlayer
             InitTimer();
             _playbackController = new PlaybackController(_player, _meterTimer, ResetMeters);
             StartMeterLevelWorker();
-            this.FormClosing += (s, e) =>
+            SizeChanged += (_, _) => _videoView.SetWindowVisible(WindowState != FormWindowState.Minimized);
+            this.FormClosing += async (s, e) =>
             {
+                if (_renderShutdownComplete) return;
+                e.Cancel = true;
+                if (_isClosing) return;
                 _isClosing = true;
                 _transportVersion++;
                 _meterTimer.Stop();
                 _meterLevelsCts?.Cancel();
+                await _videoView.StopRenderingAsync();
                 _player.Dispose();
+                _renderShutdownComplete = true;
+                Close();
             };
         }
 
@@ -960,7 +967,7 @@ namespace MxfPlayer
                 }
                 _lastVideoUiTickTimestamp = tickStart;
 
-                _player.AdvanceVideo(_meterTimer.Interval);
+                UpdatePlaybackRateLabel();
                 long advanceEnd = System.Diagnostics.Stopwatch.GetTimestamp();
                 _maxVideoUiAdvanceMs = Math.Max(_maxVideoUiAdvanceMs,
                     System.Diagnostics.Stopwatch.GetElapsedTime(tickStart, advanceEnd).TotalMilliseconds);
@@ -1021,26 +1028,20 @@ namespace MxfPlayer
             _timelineUpdateElapsedMs = 0;
         }
 
-        private void UpdateVideoFrame()
+        private void UpdatePlaybackRateLabel()
         {
-            var nextFrame = _player.GetDisplayVideoFrameReference(out var snapshotFrameIndex);
-            if (nextFrame == null)
-                return;
-
-            if (snapshotFrameIndex == _displayedVideoFrameIndex)
-            {
-                nextFrame.Dispose();
-                return;
-            }
-
-            _displayedVideoFrameIndex = snapshotFrameIndex;
-            _videoView.SetFrame(nextFrame);
+            float requested = _player.RequestedVideoRate;
+            float effective = _player.EffectiveVideoRate;
+            SetTextIfChanged(_lblRate, Math.Abs(requested - effective) < .001f
+                ? $"{requested:0.##}x"
+                : $"{requested:0.##}x → {effective:0.##}x");
         }
+
+        private void UpdateVideoFrame() => _videoView.RequestFrame();
 
         private void ClearDisplayedVideoFrame()
         {
-            _videoView.SetFrame(null);
-            _displayedVideoFrameIndex = -1;
+            _videoView.ClearFrame();
             _player.ClearDisplayedVideoFrameReference();
         }
 
@@ -1243,7 +1244,7 @@ namespace MxfPlayer
             _videoAndMetersLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, MainMetersWidth));
             videoWrap.Controls.Add(_videoAndMetersLayout);
 
-            _videoView = new Direct3DVideoView
+            _videoView = new Direct3DVideoView(_player)
             {
                 Dock = DockStyle.Fill,
                 BackColor = Color.Black,
@@ -1697,6 +1698,9 @@ namespace MxfPlayer
             _lblRate = new Label
             {
                 Text = "1x",
+                AutoSize = true,
+                MinimumSize = new Size(42, 30),
+                Padding = new Padding(4, 0, 4, 0),
                 Width = 42,
                 Height = 30,
                 ForeColor = Color.Orange,
@@ -1994,7 +1998,6 @@ namespace MxfPlayer
                 await _player.WaitForFrameBufferAsync(pausedFrame, 3000);
                 if (!_meterTimer.Enabled && _player.CurrentFrameIndex == pausedFrame)
                 {
-                    _displayedVideoFrameIndex = -1;
                     UpdateVideoFrame();
                     UpdateTimelineUI(-1);
                 }
@@ -2030,7 +2033,7 @@ namespace MxfPlayer
                     await _playbackController.MoveFirst(fps);
 
                 ResetUiUpdateThrottle();
-                _displayedVideoFrameIndex = -1;
+
                 UpdateTimelineUI(-1);
 
                 await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 3000);
@@ -2067,6 +2070,7 @@ namespace MxfPlayer
 
             _player.SetVideoRate(rate);
             _player.PrepareAudioForRate(rate);
+            UpdatePlaybackRateLabel();
 
             if (Math.Abs(rate - 1.0f) > 0.001f)
                 _player.PrepareVideoBuffer();
@@ -2161,7 +2165,6 @@ namespace MxfPlayer
 
         private async Task RefreshAfterFrameStepAsync(double fps)
         {
-            _displayedVideoFrameIndex = -1;
             await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 1000);
             UpdateVideoFrame();
             UpdateTimelineUI(-1);
@@ -2296,7 +2299,7 @@ namespace MxfPlayer
                 _playbackController.Pause();
                 _player.SeekVideoByFrame(targetFrame);
                 _player.SeekAudioByFrame(targetFrame, fps);
-                _displayedVideoFrameIndex = -1;
+
                 await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 3000);
                 UpdateVideoFrame();
                 _isEditingNowTimecode = false;
@@ -2336,7 +2339,6 @@ namespace MxfPlayer
 
             await _playbackController.Jump(seconds, fps);
 
-            _displayedVideoFrameIndex = -1;
             await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 1000);
 
             UpdateVideoFrame();
@@ -3106,8 +3108,6 @@ namespace MxfPlayer
                     _timeline.Maximum,
                     GetPlayingFps()
                 );
-
-                _displayedVideoFrameIndex = -1;
 
                 await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 250);
                 UpdateVideoFrame();
