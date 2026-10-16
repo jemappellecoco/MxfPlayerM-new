@@ -9,8 +9,7 @@ using System.Globalization;
 using NAudio.Wave;
 using FFmpeg.AutoGen;
 using System.Linq;
-using System.Drawing;
-using System.Drawing.Imaging;
+using MxfPlayer.Models;
 
 namespace MxfPlayer.Services
 {
@@ -45,15 +44,11 @@ namespace MxfPlayer.Services
         private int _audioSampleRate = 48000;
         private int _pcmOutputChannels;
         public double CurrentFps => _audioFps > 0 ? _audioFps : 29.97;
-        private readonly Dictionary<long, Bitmap> _videoFrameCache = new();
+        private readonly Dictionary<long, VideoFrameData> _videoFrameCache = new();
         private const long VideoFrameCacheBudgetBytes = 3072L * 1024L * 1024L;
         private const int MinCachedVideoFrames = 96;
-        private const int MaxCachedVideoFrames = 600; // Hard cap for decoded bitmaps kept in memory.
-        private const int MaxPooledVideoBitmaps = 48;
+        private const int MaxCachedVideoFrames = 600; // Hard cap for decoded frames kept in memory.
         private int _maxCachedVideoFrames = 360;
-        private int _pooledBitmapWidth;
-        private int _pooledBitmapHeight;
-        private readonly Stack<Bitmap> _videoBitmapPool = new();
         private const int VideoPreloadLowWaterFrames = 300; // Refill early enough to absorb short decode/CPU dips.
         private const int VideoPreloadHighWaterFrames = 420; // Keep a deeper forward cushion before throttling decode.
         private const int ForwardVideoCacheTailFrames = 12; // Keep only a short already-played tail so cache favors upcoming frames.
@@ -96,7 +91,7 @@ namespace MxfPlayer.Services
         private long _videoDecodePerfDecodedFrames;
         private long _videoDecodePerfReceiveTicks;
         private long _videoDecodePerfFrames;
-        private long _videoDecodePerfBitmapTicks;
+        private long _videoDecodePerfPrepareTicks;
         private long _videoDecodePerfCacheTicks;
         private long _videoDecodePerfThrottleTicks;
         private long _playbackStartFrame;
@@ -254,12 +249,12 @@ namespace MxfPlayer.Services
             return _videoRate >= 16.0f ? 8 : 1;
         }
 
-        private bool TryGetPlaybackVideoFrameLocked(long targetFrame, out long cachedFrame, out Bitmap? bitmap)
+        private bool TryGetPlaybackVideoFrameLocked(long targetFrame, out long cachedFrame, out VideoFrameData? frameData)
         {
             for (int offset = 0; offset < GetForwardPresentationGap(); offset++)
             {
                 long candidate = targetFrame - offset;
-                if (candidate >= 0 && _videoFrameCache.TryGetValue(candidate, out bitmap))
+                if (candidate >= 0 && _videoFrameCache.TryGetValue(candidate, out frameData))
                 {
                     cachedFrame = candidate;
                     return true;
@@ -267,7 +262,7 @@ namespace MxfPlayer.Services
             }
 
             cachedFrame = -1;
-            bitmap = null;
+            frameData = null;
             return false;
         }
 
@@ -291,7 +286,7 @@ namespace MxfPlayer.Services
                     return _videoFrameCache.ContainsKey(_currentFrameIndex);
             }
         }
-        public Image? CurrentVideoFrame
+        public VideoFrameData? CurrentVideoFrame
         {
             get
             {
@@ -299,14 +294,14 @@ namespace MxfPlayer.Services
                     return _videoFrameCache.TryGetValue(_currentFrameIndex, out var frame) ? frame : null;
             }
         }
-        public Image? CreateCurrentVideoFrameSnapshot() => CreateCurrentVideoFrameSnapshot(out _);
-        public Image? CreateCurrentVideoFrameSnapshot(out long frameIndex)
+        public VideoFrameData? CreateCurrentVideoFrameSnapshot() => CreateCurrentVideoFrameSnapshot(out _);
+        public VideoFrameData? CreateCurrentVideoFrameSnapshot(out long frameIndex)
         {
             lock (_videoCacheLock)
             {
                 frameIndex = _currentFrameIndex;
                 return _videoFrameCache.TryGetValue(_currentFrameIndex, out var frame)
-                    ? (Image)frame.Clone()
+                    ? frame.Clone()
                     : null;
             }
         }
@@ -319,34 +314,34 @@ namespace MxfPlayer.Services
                     : -1;
             }
         }
-        public Image? CreateDisplayVideoFrameSnapshot(out long frameIndex)
+        public VideoFrameData? CreateDisplayVideoFrameSnapshot(out long frameIndex)
         {
             lock (_videoCacheLock)
             {
                 frameIndex = _currentFrameIndex;
                 return _videoFrameCache.TryGetValue(_currentFrameIndex, out var exactFrame)
-                    ? (Image)exactFrame.Clone()
+                    ? exactFrame.Clone()
                     : null;
             }
         }
-        public Image? GetDisplayVideoFrameReference(out long frameIndex)
+        public VideoFrameData? GetDisplayVideoFrameReference(out long frameIndex)
         {
             lock (_videoCacheLock)
             {
                 frameIndex = _currentFrameIndex;
                 if (!_isVideoPlaying)
                 {
-                    if (!_videoFrameCache.TryGetValue(_currentFrameIndex, out Bitmap? pausedFrame))
+                    if (!_videoFrameCache.TryGetValue(_currentFrameIndex, out VideoFrameData? pausedFrame))
                         return null;
                     _displayedVideoFrameIndex = _currentFrameIndex;
-                    return pausedFrame;
+                    return pausedFrame.Retain();
                 }
-                if (!TryGetPlaybackVideoFrameLocked(_currentFrameIndex, out long cachedFrame, out Bitmap? exactFrame))
+                if (!TryGetPlaybackVideoFrameLocked(_currentFrameIndex, out long cachedFrame, out VideoFrameData? exactFrame))
                     return null;
 
                 frameIndex = cachedFrame;
                 _displayedVideoFrameIndex = cachedFrame;
-                return exactFrame;
+                return exactFrame!.Retain();
             }
         }
 
@@ -1279,77 +1274,74 @@ namespace MxfPlayer.Services
             return 0;
         }
 
-        private Bitmap CreateBitmapFromFrame(AVFrame* sourceFrame, SwsContext* swsContext, int width, int height)
+        private VideoFrameData CreateVideoFrameDataFromFrame(AVFrame* sourceFrame, SwsContext* swsContext, int width, int height)
         {
-            var bitmap = RentVideoBitmap(width, height);
-            var data = bitmap.LockBits(
-                new Rectangle(0, 0, width, height),
-                ImageLockMode.WriteOnly,
-                System.Drawing.Imaging.PixelFormat.Format32bppRgb);
-
+            var format = (AVPixelFormat)sourceFrame->format;
+            bool planar = true;
+            int chromaWidth = width;
+            int chromaHeight = height;
+            switch (format)
+            {
+                case AVPixelFormat.AV_PIX_FMT_YUV420P:
+                case AVPixelFormat.AV_PIX_FMT_YUVJ420P:
+                    chromaWidth = (width + 1) / 2;
+                    chromaHeight = (height + 1) / 2;
+                    break;
+                case AVPixelFormat.AV_PIX_FMT_YUV422P:
+                case AVPixelFormat.AV_PIX_FMT_YUVJ422P:
+                    chromaWidth = (width + 1) / 2;
+                    break;
+                case AVPixelFormat.AV_PIX_FMT_YUV444P:
+                case AVPixelFormat.AV_PIX_FMT_YUVJ444P:
+                    break;
+                default:
+                    planar = false;
+                    break;
+            }
+            bool fullRange = sourceFrame->color_range == AVColorRange.AVCOL_RANGE_JPEG ||
+                format == AVPixelFormat.AV_PIX_FMT_YUVJ420P ||
+                format == AVPixelFormat.AV_PIX_FMT_YUVJ422P ||
+                format == AVPixelFormat.AV_PIX_FMT_YUVJ444P;
+            var result = new VideoFrameData(width, height, chromaWidth, chromaHeight,
+                planar, fullRange, sourceFrame->colorspace, sourceFrame->chroma_location);
             try
             {
-                int targetStride = data.Stride;
-                AVFrame bitmapFrame = default;
-                bitmapFrame.data[0] = (byte*)data.Scan0;
-                bitmapFrame.linesize[0] = targetStride;
-
-                ffmpeg.sws_scale(
-                    swsContext,
-                    sourceFrame->data,
-                    sourceFrame->linesize,
-                    0,
-                    height,
-                    bitmapFrame.data,
-                    bitmapFrame.linesize);
-
-            }
-            finally
-            {
-                bitmap.UnlockBits(data);
-            }
-
-            return bitmap;
-        }
-
-        private Bitmap RentVideoBitmap(int width, int height)
-        {
-            lock (_videoCacheLock)
-            {
-                if (_pooledBitmapWidth == width &&
-                    _pooledBitmapHeight == height &&
-                    _videoBitmapPool.Count > 0)
+                fixed (byte* destination = result.Pixels)
                 {
-                    return _videoBitmapPool.Pop();
+                    if (planar)
+                    {
+                        CopyVideoPlane(sourceFrame->data[0], sourceFrame->linesize[0], destination, width, height);
+                        CopyVideoPlane(sourceFrame->data[1], sourceFrame->linesize[1], destination + result.YSize, chromaWidth, chromaHeight);
+                        CopyVideoPlane(sourceFrame->data[2], sourceFrame->linesize[2], destination + result.YSize + result.ChromaSize, chromaWidth, chromaHeight);
+                    }
+                    else
+                    {
+                        // Less common/greater-than-8-bit formats retain the existing
+                        // swscale conversion; their scaling and presentation still use D3D11.
+                        AVFrame target = default;
+                        target.data[0] = destination;
+                        target.linesize[0] = width * 4;
+                        if (ffmpeg.sws_scale(swsContext, sourceFrame->data, sourceFrame->linesize,
+                            0, height, target.data, target.linesize) != height)
+                            throw new InvalidOperationException("Video pixel conversion failed.");
+                    }
                 }
+                return result;
             }
-
-            return new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
-        }
-
-        private void ReleaseVideoBitmap(Bitmap bitmap)
-        {
-            lock (_videoCacheLock)
+            catch
             {
-                if (bitmap.Width == _pooledBitmapWidth &&
-                    bitmap.Height == _pooledBitmapHeight &&
-                    _videoBitmapPool.Count < MaxPooledVideoBitmaps)
-                {
-                    _videoBitmapPool.Push(bitmap);
-                    return;
-                }
+                result.Dispose();
+                throw;
             }
-
-            bitmap.Dispose();
         }
 
-        private void ClearVideoBitmapPoolLocked()
+        private static void CopyVideoPlane(byte* source, int sourceStride, byte* destination, int width, int height)
         {
-            foreach (var bitmap in _videoBitmapPool)
-                bitmap.Dispose();
-
-            _videoBitmapPool.Clear();
+            for (int row = 0; row < height; row++)
+                Buffer.MemoryCopy(source + row * sourceStride, destination + row * width, width, width);
         }
+
+        private void ReleaseVideoFrame(VideoFrameData frame) => frame.Dispose();
 
         private void DecodeVideoFrameWindow(string path, long startFrame, int decodeGeneration, CancellationToken token, long? endFrameExclusive = null)
         {
@@ -1465,7 +1457,7 @@ namespace MxfPlayer.Services
                                         mediaIndex >= startFrame && mediaIndex < windowEndFrame &&
                                         ShouldCacheVideoFrame(index, decodeGeneration))
                                     {
-                                        Bitmap tail = CreateBitmapFromFrame(filteredFrame, swsContext, width, height);
+                                        VideoFrameData tail = CreateVideoFrameDataFromFrame(filteredFrame, swsContext, width, height);
                                         AddVideoFrameToCache(index, tail, decodeGeneration);
                                     }
                                     ffmpeg.av_frame_unref(filteredFrame);
@@ -1592,14 +1584,14 @@ namespace MxfPlayer.Services
                                 filteredMediaFrameIndex < windowEndFrame &&
                                 ShouldCacheVideoFrame(filteredDisplayIndex, decodeGeneration))
                             {
-                                long bitmapStartTicks = Stopwatch.GetTimestamp();
-                                Bitmap filteredBitmap = CreateBitmapFromFrame(filteredFrame, swsContext, width, height);
-                                long bitmapTicks = Stopwatch.GetTimestamp() - bitmapStartTicks;
+                                long prepareStartTicks = Stopwatch.GetTimestamp();
+                                VideoFrameData filteredData = CreateVideoFrameDataFromFrame(filteredFrame, swsContext, width, height);
+                                long prepareTicks = Stopwatch.GetTimestamp() - prepareStartTicks;
                                 long cacheStartTicks = Stopwatch.GetTimestamp();
-                                bool addedToCache = AddVideoFrameToCache(filteredDisplayIndex, filteredBitmap, decodeGeneration);
+                                bool addedToCache = AddVideoFrameToCache(filteredDisplayIndex, filteredData, decodeGeneration);
                                 long cacheTicks = Stopwatch.GetTimestamp() - cacheStartTicks;
                                 if (addedToCache)
-                                    TrackVideoDecodePerf(bitmapTicks, cacheTicks);
+                                    TrackVideoDecodePerf(prepareTicks, cacheTicks);
                             }
 
                             if (filteredMediaFrameIndex >= windowStartFrame && filteredMediaFrameIndex < windowEndFrame)
@@ -1624,17 +1616,17 @@ namespace MxfPlayer.Services
                         continue;
                     }
 
-                    long bitmapStartTicks = Stopwatch.GetTimestamp();
-                    Bitmap bitmap = CreateBitmapFromFrame(frame, swsContext, width, height);
-                    long bitmapTicks = Stopwatch.GetTimestamp() - bitmapStartTicks;
+                    long prepareStartTicks = Stopwatch.GetTimestamp();
+                    VideoFrameData frameData = CreateVideoFrameDataFromFrame(frame, swsContext, width, height);
+                    long prepareTicks = Stopwatch.GetTimestamp() - prepareStartTicks;
                     long cacheStartTicks = Stopwatch.GetTimestamp();
-                    bool addedToCache = AddVideoFrameToCache(displayIndex, bitmap, decodeGeneration);
+                    bool addedToCache = AddVideoFrameToCache(displayIndex, frameData, decodeGeneration);
                     long cacheTicks = Stopwatch.GetTimestamp() - cacheStartTicks;
 
                     if (addedToCache)
                     {
                         cachedThroughFrame = Math.Max(cachedThroughFrame, frameIndex);
-                        TrackVideoDecodePerf(bitmapTicks, cacheTicks);
+                        TrackVideoDecodePerf(prepareTicks, cacheTicks);
                     }
                 }
 
@@ -1660,10 +1652,10 @@ namespace MxfPlayer.Services
             Interlocked.Add(ref _videoDecodePerfReceiveTicks, receiveTicks);
         }
 
-        private void TrackVideoDecodePerf(long bitmapTicks, long cacheTicks)
+        private void TrackVideoDecodePerf(long prepareTicks, long cacheTicks)
         {
             long frames = Interlocked.Increment(ref _videoDecodePerfFrames);
-            Interlocked.Add(ref _videoDecodePerfBitmapTicks, bitmapTicks);
+            Interlocked.Add(ref _videoDecodePerfPrepareTicks, prepareTicks);
             Interlocked.Add(ref _videoDecodePerfCacheTicks, cacheTicks);
 
             if (_videoDecodePerfClock.ElapsedMilliseconds < 1000)
@@ -1683,7 +1675,7 @@ namespace MxfPlayer.Services
                 long totalDecodedFrames = Interlocked.Exchange(ref _videoDecodePerfDecodedFrames, 0);
                 long totalReceiveTicks = Interlocked.Exchange(ref _videoDecodePerfReceiveTicks, 0);
                 long totalFrames = Interlocked.Exchange(ref _videoDecodePerfFrames, 0);
-                long totalBitmapTicks = Interlocked.Exchange(ref _videoDecodePerfBitmapTicks, 0);
+                long totalPrepareTicks = Interlocked.Exchange(ref _videoDecodePerfPrepareTicks, 0);
                 long totalCacheTicks = Interlocked.Exchange(ref _videoDecodePerfCacheTicks, 0);
                 long totalThrottleTicks = Interlocked.Exchange(ref _videoDecodePerfThrottleTicks, 0);
                 double throttleSeconds = totalThrottleTicks / (double)Stopwatch.Frequency;
@@ -1691,8 +1683,8 @@ namespace MxfPlayer.Services
                 double readMs = AverageMilliseconds(totalReadTicks, totalPackets);
                 double sendMs = AverageMilliseconds(totalSendTicks, totalSendPackets);
                 double receiveMs = AverageMilliseconds(totalReceiveTicks, totalReceiveFrames);
-                double bitmapMs = totalFrames > 0
-                    ? totalBitmapTicks * 1000.0 / Stopwatch.Frequency / totalFrames
+                double prepareMs = totalFrames > 0
+                    ? totalPrepareTicks * 1000.0 / Stopwatch.Frequency / totalFrames
                     : 0;
                 double cacheMs = AverageMilliseconds(totalCacheTicks, totalFrames);
 
@@ -1702,7 +1694,7 @@ namespace MxfPlayer.Services
                     $"activeFps={totalFrames / activeSeconds:0.0} " +
                     $"decodedFps={totalDecodedFrames / elapsedSeconds:0.0} decodedActiveFps={totalDecodedFrames / activeSeconds:0.0} presentationGap={GetForwardPresentationGap()} " +
                     $"readMs={readMs:0.00} sendMs={sendMs:0.00} receiveMs={receiveMs:0.00} " +
-                    $"bitmapMs={bitmapMs:0.00} cacheMs={cacheMs:0.00} " +
+                    $"prepareMs={prepareMs:0.00} cacheMs={cacheMs:0.00} " +
                     $"throttleMs={throttleSeconds * 1000.0:0} frames={totalFrames} packets={totalPackets}");
 
                 _videoDecodePerfClock.Restart();
@@ -1756,33 +1748,33 @@ namespace MxfPlayer.Services
             return Volatile.Read(ref _videoDecodeGeneration) == decodeGeneration;
         }
 
-        private bool AddVideoFrameToCache(long frameIndex, Bitmap bitmap, int decodeGeneration)
+        private bool AddVideoFrameToCache(long frameIndex, VideoFrameData frameData, int decodeGeneration)
         {
-            List<Bitmap>? framesToRelease = null;
+            List<VideoFrameData>? framesToRelease = null;
             bool addedToCache = false;
 
             lock (_videoCacheLock)
             {
                 if (!ShouldCacheVideoFrameLocked(frameIndex, decodeGeneration))
                 {
-                    framesToRelease = new List<Bitmap>(capacity: 1) { bitmap };
+                    framesToRelease = new List<VideoFrameData>(capacity: 1) { frameData };
                 }
                 else
                 {
-                    _videoFrameCache[frameIndex] = bitmap;
+                    _videoFrameCache[frameIndex] = frameData;
                     addedToCache = true;
 
                     int maxCachedFrames = GetMaxCachedVideoFramesForRate(_videoRate);
                     int trimTriggerFrames = maxCachedFrames + Math.Max(12, maxCachedFrames / 10);
                     if (_videoFrameCache.Count > trimTriggerFrames)
                     {
-                        framesToRelease = new List<Bitmap>();
+                        framesToRelease = new List<VideoFrameData>();
                         TrimVideoFrameCacheLocked(maxCachedFrames, framesToRelease);
                     }
                 }
             }
 
-            ReleaseVideoBitmaps(framesToRelease);
+            ReleaseVideoFrames(framesToRelease);
             return addedToCache;
         }
 
@@ -1816,29 +1808,22 @@ namespace MxfPlayer.Services
                 VideoFrameCacheBudgetBytes / frameBytes,
                 MinCachedVideoFrames,
                 MaxCachedVideoFrames);
-            List<Bitmap>? framesToRelease = null;
+            List<VideoFrameData>? framesToRelease = null;
 
             lock (_videoCacheLock)
             {
-                if (_pooledBitmapWidth != width || _pooledBitmapHeight != height)
-                {
-                    ClearVideoBitmapPoolLocked();
-                    _pooledBitmapWidth = width;
-                    _pooledBitmapHeight = height;
-                }
-
                 _maxCachedVideoFrames = targetFrames;
                 if (_videoFrameCache.Count > targetFrames)
                 {
-                    framesToRelease = new List<Bitmap>();
+                    framesToRelease = new List<VideoFrameData>();
                     TrimVideoFrameCacheLocked(targetFrames, framesToRelease);
                 }
             }
 
-            ReleaseVideoBitmaps(framesToRelease);
+            ReleaseVideoFrames(framesToRelease);
         }
 
-        private void TrimVideoFrameCacheLocked(int maxCachedFrames, List<Bitmap> framesToRelease)
+        private void TrimVideoFrameCacheLocked(int maxCachedFrames, List<VideoFrameData> framesToRelease)
         {
             while (_videoFrameCache.Count > maxCachedFrames)
             {
@@ -1900,19 +1885,19 @@ namespace MxfPlayer.Services
             return victimIndex;
         }
 
-        private void ReleaseVideoBitmaps(List<Bitmap>? frames)
+        private void ReleaseVideoFrames(List<VideoFrameData>? frames)
         {
             if (frames == null)
                 return;
 
             foreach (var frame in frames)
-                ReleaseVideoBitmap(frame);
+                ReleaseVideoFrame(frame);
         }
 
         private void ClearVideoFrameCacheLocked()
         {
             foreach (var frame in _videoFrameCache.Values)
-                ReleaseVideoBitmap(frame);
+                ReleaseVideoFrame(frame);
 
             _videoFrameCache.Clear();
         }
@@ -2710,7 +2695,7 @@ namespace MxfPlayer.Services
                 return;
 
             List<long>? staleFrameIndexes = null;
-            List<Bitmap>? framesToRelease = null;
+            List<VideoFrameData>? framesToRelease = null;
 
             lock (_videoCacheLock)
             {
@@ -2726,7 +2711,7 @@ namespace MxfPlayer.Services
 
                 if (staleFrameIndexes != null)
                 {
-                    framesToRelease = new List<Bitmap>(staleFrameIndexes.Count);
+                    framesToRelease = new List<VideoFrameData>(staleFrameIndexes.Count);
                     foreach (long frameIndex in staleFrameIndexes)
                     {
                         if (_videoFrameCache.Remove(frameIndex, out var oldFrame))
@@ -2735,7 +2720,7 @@ namespace MxfPlayer.Services
                 }
             }
 
-            ReleaseVideoBitmaps(framesToRelease);
+            ReleaseVideoFrames(framesToRelease);
         }
 
         private void StallPlaybackForVideoBuffer()
@@ -3404,8 +3389,6 @@ namespace MxfPlayer.Services
         {
             _disposed = true;
             StopAudioBridge();
-            lock (_videoCacheLock)
-                ClearVideoBitmapPoolLocked();
         }
     }
 }

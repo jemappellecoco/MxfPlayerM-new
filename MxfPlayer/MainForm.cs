@@ -28,7 +28,7 @@ namespace MxfPlayer
         private readonly MainHotKeyMessageFilter _hotKeyMessageFilter;
         private Panel _timelineLabelsPanel = null!;
         private readonly Random _rnd = new();
-        private VideoFrameView _videoView = null!;
+        private Direct3DVideoView _videoView = null!;
         private TextBox _txtPath = null!;
         private DataGridView _gridFiles = null!;
         private RichTextBox _txtInfo = null!;
@@ -42,7 +42,6 @@ namespace MxfPlayer
         private Label _lblTotalSize = null!;
         private TrackBar _timeline = null!;
         private System.Windows.Forms.Timer _meterTimer = null!;
-        private Image? _displayedVideoFrame;
         private long _displayedVideoFrameIndex = -1;
         private readonly List<Panel> _meterBars = new();
         private readonly List<CheckBox> _channelChecks = new();
@@ -1029,9 +1028,11 @@ namespace MxfPlayer
                 return;
 
             if (snapshotFrameIndex == _displayedVideoFrameIndex)
+            {
+                nextFrame.Dispose();
                 return;
+            }
 
-            _displayedVideoFrame = nextFrame;
             _displayedVideoFrameIndex = snapshotFrameIndex;
             _videoView.SetFrame(nextFrame);
         }
@@ -1039,7 +1040,6 @@ namespace MxfPlayer
         private void ClearDisplayedVideoFrame()
         {
             _videoView.SetFrame(null);
-            _displayedVideoFrame = null;
             _displayedVideoFrameIndex = -1;
             _player.ClearDisplayedVideoFrameReference();
         }
@@ -1243,7 +1243,7 @@ namespace MxfPlayer
             _videoAndMetersLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, MainMetersWidth));
             videoWrap.Controls.Add(_videoAndMetersLayout);
 
-            _videoView = new VideoFrameView
+            _videoView = new Direct3DVideoView
             {
                 Dock = DockStyle.Fill,
                 BackColor = Color.Black,
@@ -3170,73 +3170,5 @@ namespace MxfPlayer
             }
         }
 
-        private class VideoFrameView : Control
-        {
-            private Image? _frame;
-            private readonly System.Diagnostics.Stopwatch _paintPerfClock = System.Diagnostics.Stopwatch.StartNew();
-            private double _maxPaintMs;
-            private int _paintCount;
-
-            public VideoFrameView()
-            {
-                DoubleBuffered = true;
-                SetStyle(
-                    ControlStyles.AllPaintingInWmPaint |
-                    ControlStyles.OptimizedDoubleBuffer |
-                    ControlStyles.UserPaint |
-                    ControlStyles.ResizeRedraw,
-                    true);
-            }
-
-            public void SetFrame(Image? frame)
-            {
-                if (ReferenceEquals(_frame, frame))
-                    return;
-
-                _frame = frame;
-                Invalidate();
-            }
-
-            protected override void OnPaint(PaintEventArgs e)
-            {
-                long paintStart = System.Diagnostics.Stopwatch.GetTimestamp();
-                base.OnPaint(e);
-
-                e.Graphics.Clear(BackColor);
-                if (_frame == null || ClientSize.Width <= 0 || ClientSize.Height <= 0)
-                    return;
-
-                Rectangle target = GetFitRectangle(_frame.Width, _frame.Height, ClientSize.Width, ClientSize.Height);
-                e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
-                e.Graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
-                e.Graphics.DrawImage(_frame, target);
-
-                _paintCount++;
-                _maxPaintMs = Math.Max(_maxPaintMs,
-                    System.Diagnostics.Stopwatch.GetElapsedTime(paintStart).TotalMilliseconds);
-                if (_paintPerfClock.ElapsedMilliseconds >= 1000)
-                {
-                    if (PlaybackDiagnostics.Enabled)
-                        System.Diagnostics.Debug.WriteLine(
-                            $"[VideoPaintPerf] paints={_paintCount} maxPaintMs={_maxPaintMs:0.0}");
-                    _paintCount = 0;
-                    _maxPaintMs = 0;
-                    _paintPerfClock.Restart();
-                }
-            }
-
-            private static Rectangle GetFitRectangle(int imageWidth, int imageHeight, int viewWidth, int viewHeight)
-            {
-                if (imageWidth <= 0 || imageHeight <= 0 || viewWidth <= 0 || viewHeight <= 0)
-                    return Rectangle.Empty;
-
-                double scale = Math.Min(viewWidth / (double)imageWidth, viewHeight / (double)imageHeight);
-                int width = Math.Max(1, (int)Math.Round(imageWidth * scale));
-                int height = Math.Max(1, (int)Math.Round(imageHeight * scale));
-                int x = (viewWidth - width) / 2;
-                int y = (viewHeight - height) / 2;
-                return new Rectangle(x, y, width, height);
-            }
-        }
     }
 }
