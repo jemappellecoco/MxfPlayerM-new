@@ -2300,8 +2300,11 @@ namespace MxfPlayer
                 _player.SeekVideoByFrame(targetFrame);
                 _player.SeekAudioByFrame(targetFrame, fps);
 
+                ResetMeters();
+                await _player.WaitForAudioBufferAsync(targetFrame, fps, _playbackController.CurrentRate, 3000);
                 await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 3000);
                 UpdateVideoFrame();
+                UpdateMetersFromAudioLevel();
                 _isEditingNowTimecode = false;
                 UpdateTimelineUI(-1);
                 ReleaseNowTimecodeInputFocus();
@@ -3109,12 +3112,21 @@ namespace MxfPlayer
                     GetPlayingFps()
                 );
 
-                await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 250);
+                long targetFrame = _player.CurrentFrameIndex;
+                float rate = _playbackController.CurrentRate;
+                ResetMeters();
+                if (PlaybackDiagnostics.Enabled)
+                    System.Diagnostics.Debug.WriteLine($"[TimelineSeek] phase=buffering frame={targetFrame} rate={rate:0.###}");
+                bool ready = await WaitForPlaybackStartupBuffersAsync(GetPlayingFps(), rate);
                 UpdateVideoFrame();
                 UpdateTimelineUI(-1);
                 UpdateMetersFromAudioLevel();
-                if (!_isClosing && requestVersion == _transportVersion)
+                if (ready && !_isClosing && requestVersion == _transportVersion)
+                {
+                    if (PlaybackDiagnostics.Enabled)
+                        System.Diagnostics.Debug.WriteLine($"[TimelineSeek] phase=play frame={_player.CurrentFrameIndex} target={targetFrame} rate={rate:0.###}");
                     await _playbackController.Play(250);
+                }
             }
             finally
             {

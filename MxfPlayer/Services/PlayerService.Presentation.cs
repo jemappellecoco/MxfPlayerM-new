@@ -9,6 +9,8 @@ public unsafe partial class PlayerService
     private long _presentationEpoch;
     private long _presentedEpoch = -1;
     private long _presentedFrame = -1;
+    private long _presentationLagStarted;
+    private long _presentationLagEpoch = -1;
     private volatile float _requestedVideoRate = 1;
 
     public float RequestedVideoRate => _requestedVideoRate;

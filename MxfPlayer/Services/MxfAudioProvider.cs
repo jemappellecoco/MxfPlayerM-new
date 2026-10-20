@@ -146,6 +146,29 @@ namespace MxfPlayer.Services
             _fileStream.Position = pos;
         }
 
+        private long GetFrameStartSample(long frameIndex, double fps, long baseSampleIndex)
+        {
+            long start = MediaSampleToSourceSample((long)Math.Round(frameIndex * _sampleRate / fps)) - baseSampleIndex;
+            // The cache origin is rounded to milliseconds. Its first frame can
+            // consequently begin a few samples before that rounded origin.
+            if (start < 0 && (long)Math.Round(frameIndex * 1000.0 / fps) == _baseTimeMs)
+                return 0;
+            return start;
+        }
+
+        public bool IsCompleteFrameDataAvailable(long frameIndex, double fps)
+        {
+            if (fps <= 0) fps = 29.97;
+            lock (_streamLock)
+            {
+                if (_disposed) return false;
+                long baseSample = MediaSampleToSourceSample((long)Math.Round(_baseTimeMs * _sampleRate / 1000.0));
+                long start = GetFrameStartSample(frameIndex, fps, baseSample);
+                long end = MediaSampleToSourceSample((long)Math.Round((frameIndex + 1) * _sampleRate / fps)) - baseSample;
+                return start >= 0 && end > start && _fileStream.Length >= end * _channels * 2L;
+            }
+        }
+
         public float GetChannelPeakAtFrame(long frameIndex, double fps, int channel)
         {
             if (frameIndex < 0) frameIndex = 0;
@@ -164,7 +187,7 @@ namespace MxfPlayer.Services
                     long startSample = MediaSampleToSourceSample((long)Math.Round(frameIndex * _sampleRate / fps));
                     long endSample = MediaSampleToSourceSample((long)Math.Round((frameIndex + 1) * _sampleRate / fps));
                     long baseSampleIndex = MediaSampleToSourceSample((long)Math.Round(_baseTimeMs * _sampleRate / 1000.0));
-                    startSample -= baseSampleIndex;
+                    startSample = GetFrameStartSample(frameIndex, fps, baseSampleIndex);
                     endSample -= baseSampleIndex;
 
                     if (startSample < 0)
@@ -220,7 +243,7 @@ namespace MxfPlayer.Services
                     long startSample = MediaSampleToSourceSample((long)Math.Round(frameIndex * _sampleRate / fps));
                     long endSample = MediaSampleToSourceSample((long)Math.Round((frameIndex + 1) * _sampleRate / fps));
                     long baseSampleIndex = MediaSampleToSourceSample((long)Math.Round(_baseTimeMs * _sampleRate / 1000.0));
-                    startSample -= baseSampleIndex;
+                    startSample = GetFrameStartSample(frameIndex, fps, baseSampleIndex);
                     endSample -= baseSampleIndex;
 
                     if (startSample < 0)

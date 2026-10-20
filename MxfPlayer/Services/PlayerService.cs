@@ -1209,7 +1209,9 @@ namespace MxfPlayer.Services
                 bool forward = rate >= 0;
                 int requiredBufferedFrames = Math.Min(requiredFrames * DisplayUnitsPerFrame, GetMaxCachedVideoFramesForRate(rate));
                 long requiredDistance = Math.Max(0, requiredBufferedFrames - 1);
-                if (!forward)
+                if (forward)
+                    requiredDistance = Math.Min(requiredDistance, Math.Max(0, TotalDisplayUnits - 1 - clampedFrame));
+                else
                     requiredDistance = Math.Min(requiredDistance, clampedFrame);
 
                 while (sw.ElapsedMilliseconds < timeoutMs)
@@ -2152,13 +2154,17 @@ namespace MxfPlayer.Services
             if (_isVideoPlaying)
                 return meterPeak;
 
+            // Paused inspection uses the interval ending at the displayed frame.
+            if (frameIndex == 0)
+                return 0f;
+            long inspectedAudioFrame = frameIndex - 1;
             if (_videoRate < 0 && _slidingAudioProvider != null)
-                return _slidingAudioProvider.GetChannelPeakAtFrame(frameIndex, _audioFps, channel);
+                return _slidingAudioProvider.GetChannelPeakAtFrame(inspectedAudioFrame, _audioFps, channel);
 
             if (_fileAudioProvider != null)
-                return _fileAudioProvider.GetChannelPeakAtFrame(frameIndex, _audioFps, channel);
+                return _fileAudioProvider.GetChannelPeakAtFrame(inspectedAudioFrame, _audioFps, channel);
 
-            return meterPeak;
+            return 0f;
         }
 
         private float GetMeterSamplePeak(int channel, long currentTimeMs)
@@ -2401,8 +2407,9 @@ namespace MxfPlayer.Services
 
             _isPlaybackStalledForVideo = false;
             _isPlaybackStalledForAudio = false;
-            if (_videoRate >= 4.0f)
-                EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
+            // Seek/rate preparation already positioned the decoder. Keep its
+            // buffered run instead of seeking the same GOP again on resume.
+            EnsureVideoDecoderNearCurrentFrame();
         }
 
         private void SetAudioRateCore(float rate)
@@ -2641,15 +2648,38 @@ namespace MxfPlayer.Services
                     : Math.Max(0, _playbackStartFrame - distance);
             }
             long clockDistance = (_videoRate >= 0 ? 1 : -1) * (targetFrame - _currentFrameIndex);
-            if (clockDistance <= 0)
-                return;
-            if (clockDistance > 2)
+            long clockEpoch = Interlocked.Read(ref _presentationEpoch);
+            if (_presentationLagEpoch != clockEpoch)
             {
-                // Never jump over undisplayed pictures to catch the audio clock.
-                // Stop/reposition both streams through the existing buffer-resume path.
-                StallPlaybackForVideoBuffer();
+                _presentationLagEpoch = clockEpoch;
+                _presentationLagStarted = 0;
+            }
+            if (clockDistance <= 0)
+            {
+                _presentationLagStarted = 0;
                 return;
             }
+            // Allow a short presentation delay to catch up one picture at a time.
+            // A fixed two-picture limit is only about 8 ms at 8x and needlessly
+            // stops/reseeks otherwise-ready audio after an ordinary GPU hiccup.
+            double presentationLagMs = clockDistance * 1000.0 / (DisplayFps * Math.Abs(_videoRate));
+            if (presentationLagMs > 100)
+            {
+                // A single scheduler/GPU stall is recoverable without stopping
+                // audio. Require sustained lag while sequential frames catch up.
+                if (_presentationLagStarted == 0)
+                    _presentationLagStarted = Stopwatch.GetTimestamp();
+                if (Stopwatch.GetElapsedTime(_presentationLagStarted).TotalMilliseconds >= 500)
+                {
+                    if (PlaybackDiagnostics.Enabled)
+                        Debug.WriteLine($"[VideoClockLag] frame={_currentFrameIndex} behindFrames={clockDistance} lagMs={presentationLagMs:0.0} sustainedMs={Stopwatch.GetElapsedTime(_presentationLagStarted).TotalMilliseconds:0.0} rate={_videoRate:0.###}");
+                    _presentationLagStarted = 0;
+                    StallPlaybackForVideoBuffer();
+                    return;
+                }
+            }
+            else
+                _presentationLagStarted = 0;
             targetFrame = Math.Clamp(_currentFrameIndex + (_videoRate >= 0 ? 1 : -1), 0, TotalDisplayUnits - 1);
             long clockEnd = Stopwatch.GetTimestamp();
 
@@ -2896,6 +2926,7 @@ namespace MxfPlayer.Services
         private void SeekVideoByFrameCore(long frameIndex)
         {
             if (_totalVideoFrames <= 0) return;
+            ClearFrameAudioPeaks();
             _currentFrameIndex = DisplayIndexFromMediaFrame(ClampFrameIndex(frameIndex));
             ResetMediaClock(_currentFrameIndex);
             EnsureVideoDecoderNearCurrentFrame(forceRestart: true);
@@ -3028,16 +3059,21 @@ namespace MxfPlayer.Services
                      _reverseAudioProvider.HasFrameData(frameIndex, 250))))
                 : (_fileAudioProvider != null &&
                    Math.Abs(_forwardAudioCacheRate - _videoRate) <= 0.001f &&
+                   (_isVideoPlaying || _fileAudioProvider.IsCompleteFrameDataAvailable(Math.Max(0, frameIndex - 1), fps)) &&
                    _fileAudioProvider.IsFrameDataAvailable(frameIndex, fps));
 
             if (!hasData)
             {
                 StartAudioCacheFromFrame(
-                    frameIndex,
+                    _videoRate >= 0 && !_isVideoPlaying ? Math.Max(0, frameIndex - 1) : frameIndex,
                     fps,
                     Math.Abs(_videoRate) > 0 ? _videoRate : 1.0f,
                     _isVideoPlaying,
                     waitForPreviousCache);
+                // Keep the preceding frame for the paused meter, while actual
+                // playback still starts at the requested seek position.
+                if (_videoRate >= 0)
+                    _fileAudioProvider?.SeekFrame(frameIndex, fps);
                 return;
             }
 
@@ -3057,6 +3093,20 @@ namespace MxfPlayer.Services
             {
                 if (fps <= 0) fps = CurrentFps;
                 frameIndex = ClampFrameIndex(frameIndex);
+                long displayFrameIndex = frameIndex;
+                // The displayed timecode is the end of the inspected audio
+                // interval: display N plays [N-1, N), in either step direction.
+                if (displayFrameIndex == 0)
+                {
+                    StopFrameAudioOutput();
+                    lock (_lastFrameAudioPeaksLock)
+                    {
+                        Array.Clear(_lastFrameAudioPeaks, 0, _lastFrameAudioPeaks.Length);
+                        _lastFrameAudioPeakFrame = displayFrameIndex;
+                    }
+                    return;
+                }
+                frameIndex = displayFrameIndex - 1;
 
                 float previousRate = _videoRate;
                 bool wasPlaying = _isVideoPlaying;
@@ -3068,18 +3118,22 @@ namespace MxfPlayer.Services
                 {
                     if (_fileAudioProvider == null ||
                         Math.Abs(_forwardAudioCacheRate - 1.0f) > 0.001f ||
-                        !_fileAudioProvider.IsFrameDataAvailable(frameIndex, fps, 0))
+                        !_fileAudioProvider.IsCompleteFrameDataAvailable(frameIndex, fps))
                     {
                         StartAudioCacheFromFrame(frameIndex, fps, 1.0f, false);
                     }
 
-                    if (WaitForFrameAudioBuffer(frameIndex, fps, 1000))
+                    if (WaitForFrameAudioBuffer(frameIndex, fps, 3000))
                     {
-                        CaptureFrameAudioPeaks(frameIndex, fps);
                         byte[]? framePcm = _fileAudioProvider?.ReadFrameStereoPcm(frameIndex, fps, ChannelMask);
                         if (framePcm is { Length: > 0 })
+                        {
+                            CaptureFrameAudioPeaks(frameIndex, fps, displayFrameIndex);
                             PlayOneShotFrameAudio(framePcm);
+                        }
                     }
+                    else if (PlaybackDiagnostics.Enabled)
+                        Debug.WriteLine($"[FrameAudioNotReady] frame={frameIndex} fps={fps:0.###} generation={_audioCacheGeneration} cacheTask={_audioCacheTask?.Status}");
 
                     _fileAudioProvider?.SeekFrame(frameIndex, fps);
                 }
@@ -3143,7 +3197,7 @@ namespace MxfPlayer.Services
             _frameAudioSampleRate = 0;
         }
 
-        private void CaptureFrameAudioPeaks(long frameIndex, double fps)
+        private void CaptureFrameAudioPeaks(long frameIndex, double fps, long displayFrameIndex)
         {
             lock (_lastFrameAudioPeaksLock)
             {
@@ -3155,7 +3209,7 @@ namespace MxfPlayer.Services
                         _lastFrameAudioPeaks[channel] = _fileAudioProvider.GetChannelPeakAtFrame(frameIndex, fps, channel);
                 }
 
-                _lastFrameAudioPeakFrame = frameIndex;
+                _lastFrameAudioPeakFrame = displayFrameIndex;
             }
         }
 
@@ -3178,7 +3232,7 @@ namespace MxfPlayer.Services
                 if (_fileAudioProvider == null)
                     return false;
 
-                if (_fileAudioProvider.IsFrameDataAvailable(frameIndex, fps, 0))
+                if (_fileAudioProvider.IsCompleteFrameDataAvailable(frameIndex, fps))
                     return true;
 
                 Thread.Sleep(20);
