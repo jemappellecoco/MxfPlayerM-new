@@ -175,6 +175,12 @@ namespace MxfPlayer
             };
         }
 
+        protected override void OnDeactivate(EventArgs e)
+        {
+            _pendingFrameStepDelta = 0;
+            base.OnDeactivate(e);
+        }
+
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
             if (_lblNow != null && _lblNow.Focused)
@@ -206,10 +212,17 @@ namespace MxfPlayer
 
             public bool PreFilterMessage(ref Message m)
             {
-                if (Form.ActiveForm != _owner || m.Msg is not (0x0100 or 0x0104))
+                if (Form.ActiveForm != _owner)
                     return false;
 
                 Keys keyData = (Keys)(int)m.WParam | Control.ModifierKeys;
+                // Child controls may consume KeyUp before ProcessKeyPreview.
+                // Clear held-key repeats at the same message-filter boundary
+                // where KeyDown is intercepted.
+                if (m.Msg is 0x0101 or 0x0105)
+                    return _owner.TryClearPendingFrameStepHotKey(keyData);
+                if (m.Msg is not (0x0100 or 0x0104))
+                    return false;
                 if (_owner._lblNow != null && _owner._lblNow.Focused &&
                     (keyData & Keys.KeyCode) == Keys.Return)
                     return false;
@@ -268,10 +281,10 @@ namespace MxfPlayer
 
         private bool TryClearPendingFrameStepHotKey(Keys keyData)
         {
-            if (!TryGetHotKeyAction(keyData, out HotKeyAction action))
-                return false;
-
-            if (action is not HotKeyAction.StepBackward and not HotKeyAction.StepForward)
+            Keys releasedKey = keyData & Keys.KeyCode;
+            if (!_hotKeyBindings.Any(binding =>
+                (binding.Key is HotKeyAction.StepBackward or HotKeyAction.StepForward) &&
+                (binding.Value & Keys.KeyCode) == releasedKey))
                 return false;
 
             _pendingFrameStepDelta = 0;
@@ -420,8 +433,8 @@ namespace MxfPlayer
             AppendMediaInfoLine("EOM", info.Eom, false);
             AppendMediaInfoLine("長度", info.DurationTc, false);
             AppendMediaInfoLine("影片位元率", info.VideoBitRate, HasSpecError(analysis, "影片比特率錯誤"));
-            AppendMediaInfoLine("音訊單軌位元率", info.AudioBitRate, false);
-            AppendMediaInfoLine("整體位元率", info.OverallBitRate, false);
+            AppendMediaInfoLine("AudioBitRate", info.AudioBitRate, false);
+            AppendMediaInfoLine("OverallBitRate", info.OverallBitRate, false);
             AppendMediaInfoLine("顯示比例", info.DisplayAspect, HasSpecError(analysis, "長寬比錯誤"));
             AppendMediaInfoLine("格式檢查", specStatus, IsDisplaySpecError(analysis));
             AppendMediaInfoLine("錯誤原因", errorText, displayErrors.Count > 0);
@@ -2127,7 +2140,9 @@ namespace MxfPlayer
 
             if (_isFrameStepping)
             {
-                _pendingFrameStepDelta += Math.Sign(direction);
+                // Coalesce OS key repeats: never build a backlog of frame/audio
+                // checks that continues playing after the key is released.
+                _pendingFrameStepDelta = Math.Sign(direction);
                 return;
             }
 
@@ -2300,11 +2315,12 @@ namespace MxfPlayer
                 _player.SeekVideoByFrame(targetFrame);
                 _player.SeekAudioByFrame(targetFrame, fps);
 
-                ResetMeters();
-                await _player.WaitForAudioBufferAsync(targetFrame, fps, _playbackController.CurrentRate, 3000);
+                // Keep the displayed meter until the new audio is ready.
+                bool audioReady = await _player.WaitForAudioBufferAsync(targetFrame, fps, _playbackController.CurrentRate, 3000);
                 await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 3000);
                 UpdateVideoFrame();
-                UpdateMetersFromAudioLevel();
+                if (audioReady)
+                    UpdateMetersFromAudioLevel();
                 _isEditingNowTimecode = false;
                 UpdateTimelineUI(-1);
                 ReleaseNowTimecodeInputFocus();
@@ -2332,26 +2348,44 @@ namespace MxfPlayer
 
         private async Task HandleJump(int seconds)
         {
+            if (_isSeeking || _isFrameStepping) return;
             int requestVersion = _transportVersion;
             double fps = GetPlayingFps();
             if (fps <= 0) return;
 
             bool wasPlaying = _meterTimer.Enabled;
+            _isSeeking = true;
+            try
+            {
+                _playbackController.Pause();
+                await _playbackController.Jump(seconds, fps);
+                long targetFrame = _player.CurrentFrameIndex;
+                float rate = _playbackController.CurrentRate;
+                bool ready;
+                if (wasPlaying)
+                    ready = await WaitForPlaybackStartupBuffersAsync(fps, rate);
+                else
+                {
+                    Task<bool> audioReady = _player.WaitForAudioBufferAsync(targetFrame, fps, rate, 3000);
+                    await Task.WhenAll(audioReady, _player.WaitForFrameBufferAsync(targetFrame, 3000));
+                    ready = await audioReady;
+                }
 
-            _playbackController.Pause();
+                if (_isClosing || requestVersion != _transportVersion) return;
+                UpdateVideoFrame();
+                UpdateTimelineUI(-1);
+                if (_currentMediaInfo != null)
+                    RefreshTimelineTicks(_currentMediaInfo);
+                if (ready)
+                    UpdateMetersFromAudioLevel();
 
-            await _playbackController.Jump(seconds, fps);
-
-            await _player.WaitForFrameBufferAsync(_player.CurrentFrameIndex, 1000);
-
-            UpdateVideoFrame();
-            UpdateTimelineUI(-1);
-            if (_currentMediaInfo != null)
-                RefreshTimelineTicks(_currentMediaInfo);
-            UpdateMetersFromAudioLevel();
-
-            if (wasPlaying && !_isClosing && requestVersion == _transportVersion)
-                await _playbackController.Play();
+                if (wasPlaying && ready)
+                    await _playbackController.Play();
+            }
+            finally
+            {
+                _isSeeking = false;
+            }
         }
         private Button CreateControlButton(string text, int width)
         {
@@ -3114,13 +3148,13 @@ namespace MxfPlayer
 
                 long targetFrame = _player.CurrentFrameIndex;
                 float rate = _playbackController.CurrentRate;
-                ResetMeters();
                 if (PlaybackDiagnostics.Enabled)
                     System.Diagnostics.Debug.WriteLine($"[TimelineSeek] phase=buffering frame={targetFrame} rate={rate:0.###}");
                 bool ready = await WaitForPlaybackStartupBuffersAsync(GetPlayingFps(), rate);
                 UpdateVideoFrame();
                 UpdateTimelineUI(-1);
-                UpdateMetersFromAudioLevel();
+                if (ready)
+                    UpdateMetersFromAudioLevel();
                 if (ready && !_isClosing && requestVersion == _transportVersion)
                 {
                     if (PlaybackDiagnostics.Enabled)
