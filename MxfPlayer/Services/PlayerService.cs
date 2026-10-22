@@ -1396,19 +1396,17 @@ namespace MxfPlayer.Services
                     width, height, AVPixelFormat.AV_PIX_FMT_BGR0,
                     SwsFastBilinear, null, null, null);
 
+                // Keep one output frame per input frame. Deinterlace marked
+                // interlaced pictures before the GPU performs bicubic scaling.
                 if (_isInterlaced)
                 {
                     AVRational sourceFrameRate = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0
                         ? stream->avg_frame_rate
                         : stream->r_frame_rate;
                     videoFilter = new VideoFilterGraph(
-                        width,
-                        height,
-                        codecContext->pix_fmt,
-                        stream->time_base,
-                        sourceFrameRate,
-                        codecContext->sample_aspect_ratio,
-                        "bwdif=mode=send_frame:parity=auto:deint=interlaced");
+                        width, height, codecContext->pix_fmt,
+                        stream->time_base, sourceFrameRate, codecContext->sample_aspect_ratio,
+                        "yadif=mode=send_frame:parity=auto:deint=interlaced");
                 }
 
                 frame = ffmpeg.av_frame_alloc();
@@ -1442,7 +1440,7 @@ namespace MxfPlayer.Services
                         if (readResult == ffmpeg.AVERROR_EOF && !token.IsCancellationRequested &&
                             IsCurrentVideoDecodeGeneration(decodeGeneration))
                         {
-                            // Delayed codec pictures and BWDIF's final picture remain
+                            // Delayed codec pictures and the deinterlacer's final picture remain
                             // buffered at EOF. They include the frame requested by Move Last.
                             ffmpeg.avcodec_send_packet(codecContext, null);
                             DecodeWindowFrames(codecContext, frame, filteredFrame, videoFilter,
@@ -1554,7 +1552,7 @@ namespace MxfPlayer.Services
                 if (frameIndex >= windowEndFrame)
                 {
                     // The reverse window already includes extra following frames for
-                    // BWDIF. Finish this decode task here instead of scanning the rest
+                    // deinterlacing. Finish this decode task here instead of scanning the rest
                     // of the file while waiting for a filtered tail frame.
                     cachedThroughFrame = Math.Max(cachedThroughFrame, windowEndFrame - 1);
                     ffmpeg.av_frame_unref(frame);
@@ -2174,15 +2172,19 @@ namespace MxfPlayer.Services
 
             lock (_meterSamplesLock)
             {
-                for (int i = _meterSamples.Count - 1; i >= 0; i--)
+                // Timestamp buckets also handle interleaved channels whose
+                // samples are not globally ordered by presentation time.
+                long firstBucket = (currentTimeMs - windowMs) / MeterSampleBucketMs;
+                long lastBucket = currentTimeMs / MeterSampleBucketMs;
+                for (long bucket = firstBucket; bucket <= lastBucket; bucket++)
                 {
-                    var s = _meterSamples[i];
-
-                    if (s.Channel == channel &&
-                        s.TimeMs <= currentTimeMs &&
-                        s.TimeMs >= currentTimeMs - windowMs)
+                    if (!_meterSamples.TryGetValue(bucket, out var samples))
+                        continue;
+                    foreach (var s in samples)
                     {
-                        peak = Math.Max(peak, s.Peak);
+                        if (s.Channel == channel && s.TimeMs <= currentTimeMs &&
+                            s.TimeMs >= currentTimeMs - windowMs)
+                            peak = Math.Max(peak, s.Peak);
                     }
                 }
             }
@@ -2272,7 +2274,10 @@ namespace MxfPlayer.Services
 
                             lock (_meterSamplesLock)
                             {
-                                _meterSamples.Add(new MeterSample
+                                long bucket = ptsMs / MeterSampleBucketMs;
+                                if (!_meterSamples.TryGetValue(bucket, out var samples))
+                                    _meterSamples[bucket] = samples = new List<MeterSample>();
+                                samples.Add(new MeterSample
                                 {
                                     TimeMs = ptsMs,
                                     Channel = idx,
@@ -2328,7 +2333,8 @@ namespace MxfPlayer.Services
             public float Peak;
         }
 
-        private readonly List<MeterSample> _meterSamples = new();
+        private const long MeterSampleBucketMs = 120;
+        private readonly Dictionary<long, List<MeterSample>> _meterSamples = new();
         private readonly object _meterSamplesLock = new();
         private readonly float[] _lastFrameAudioPeaks = new float[8];
         private readonly object _lastFrameAudioPeaksLock = new();
@@ -3001,7 +3007,7 @@ namespace MxfPlayer.Services
                 }
                 long startDisplayIndex = Math.Max(0, windowEndDisplayIndex - reverseWindowFrames + 1);
                 startFrame = MediaFrameFromDisplayIndex(startDisplayIndex);
-                // BWDIF needs following frames at the window boundary to emit the last requested frame.
+                // Deinterlacing needs following frames at the window boundary to emit the last requested frame.
                 endFrameExclusive = Math.Min(_totalVideoFrames, MediaFrameFromDisplayIndex(windowEndDisplayIndex) + 3);
                 if (PlaybackDiagnostics.Enabled && _videoRate <= -8.0f)
                     Debug.WriteLine($"[ReverseVideoWindow] current={_currentFrameIndex} continuousEnd={continuousCachedFrame} start={startFrame} endExclusive={endFrameExclusive} frames={reverseWindowFrames} forced={forceRestart}");

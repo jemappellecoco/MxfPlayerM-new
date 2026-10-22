@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Windows.Forms;
@@ -16,6 +16,8 @@ namespace MxfPlayer
     {
         private bool _isDraggingTimeline = false;
         private bool _isUpdatingTimeline = false;
+        private int? _pendingTimelineSeekValue;
+        private bool _isTimelineSeeking;
         private readonly PlayerService _player = new();
         private readonly FolderService _folder = new();
         private readonly MediaInfoService _mediaInfo = new();
@@ -60,7 +62,7 @@ namespace MxfPlayer
         private CancellationTokenSource? _meterLevelsCts;
         private Task? _meterLevelsTask;
         private int _meterAreaHeight = 0;
-        private int _meterUpdateElapsedMs = 0;
+        private long _lastMeterUpdateTimestamp;
         private int _timelineUpdateElapsedMs = 0;
         private readonly System.Diagnostics.Stopwatch _videoUiPerfClock = System.Diagnostics.Stopwatch.StartNew();
         private long _lastVideoUiTickTimestamp;
@@ -75,7 +77,7 @@ namespace MxfPlayer
         private bool _isBoundarySeeking = false;
         private int _pendingFrameStepDelta = 0;
         private bool _areInlineMetersVisible = true;
-        private const int MeterUpdateIntervalMs = 100;
+        private const int MeterUpdateIntervalMs = 33;
         private const int TimelineUpdateIntervalMs = 100;
         private const int MainMetersWidth = 170;
         private const float SmoothStartupBufferRate = 2.0f;
@@ -991,10 +993,13 @@ namespace MxfPlayer
                     System.Diagnostics.Stopwatch.GetElapsedTime(advanceEnd, frameEnd).TotalMilliseconds);
 
                 long meterStart = frameEnd;
-                _meterUpdateElapsedMs += _meterTimer.Interval;
-                if (_meterUpdateElapsedMs >= MeterUpdateIntervalMs)
+                if (_lastMeterUpdateTimestamp == 0 ||
+                    System.Diagnostics.Stopwatch.GetElapsedTime(_lastMeterUpdateTimestamp, meterStart).TotalMilliseconds >= MeterUpdateIntervalMs)
                 {
-                    _meterUpdateElapsedMs = 0;
+                    long intervalTicks = System.Diagnostics.Stopwatch.Frequency * MeterUpdateIntervalMs / 1000;
+                    _lastMeterUpdateTimestamp = _lastMeterUpdateTimestamp == 0
+                        ? meterStart
+                        : meterStart - (meterStart - _lastMeterUpdateTimestamp) % intervalTicks;
                     ApplyLatestMeterLevels();
                 }
                 long meterEnd = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -1037,7 +1042,7 @@ namespace MxfPlayer
 
         private void ResetUiUpdateThrottle()
         {
-            _meterUpdateElapsedMs = 0;
+            _lastMeterUpdateTimestamp = 0;
             _timelineUpdateElapsedMs = 0;
         }
 
@@ -1753,8 +1758,9 @@ namespace MxfPlayer
                     SetTimelineValueFromMouse(e.X);
             };
 
-            _timeline.MouseUp += async (_, _) =>
+            _timeline.MouseUp += async (_, e) =>
             {
+                SetTimelineValueFromMouse(e.X);
                 _isDraggingTimeline = false;
                 await SeekFromTimeline();  
             };
@@ -3130,40 +3136,79 @@ namespace MxfPlayer
         private async Task SeekFromTimeline()
         {
             int requestVersion = _transportVersion;
-            if (_isSeeking) return;
+            if (_isSeeking)
+            {
+                if (_isTimelineSeeking)
+                    _pendingTimelineSeekValue = _timeline.Value;
+                return;
+            }
+            int requestedValue = _timeline.Value;
+            bool wasPlaying = _player.IsPlaying;
             _isSeeking = true;
+            _isTimelineSeeking = true;
 
             try
             {
-                _meterTimer.Stop();
-
-                // 先暫停，避免 Timer / 播放時鐘 / audio cache 同時跑
-                _playbackController.Pause();
-
-                _playbackController.SeekByTimelineValue(
-                    _timeline.Value,
-                    _timeline.Maximum,
-                    GetPlayingFps()
-                );
-
-                long targetFrame = _player.CurrentFrameIndex;
-                float rate = _playbackController.CurrentRate;
-                if (PlaybackDiagnostics.Enabled)
-                    System.Diagnostics.Debug.WriteLine($"[TimelineSeek] phase=buffering frame={targetFrame} rate={rate:0.###}");
-                bool ready = await WaitForPlaybackStartupBuffersAsync(GetPlayingFps(), rate);
-                UpdateVideoFrame();
-                UpdateTimelineUI(-1);
-                if (ready)
-                    UpdateMetersFromAudioLevel();
-                if (ready && !_isClosing && requestVersion == _transportVersion)
+                while (!_isClosing && requestVersion == _transportVersion)
                 {
+                    _pendingTimelineSeekValue = null;
+                    _meterTimer.Stop();
+
+                    // 先暫停，避免 Timer / 播放時鐘 / audio cache 同時跑
+                    _playbackController.Pause();
+
+                    _playbackController.SeekByTimelineValue(
+                        requestedValue,
+                        _timeline.Maximum,
+                        GetPlayingFps()
+                    );
+
+                    long targetFrame = _player.CurrentFrameIndex;
+                    float rate = _playbackController.CurrentRate;
+                    UpdateVideoFrame();
+                    UpdateTimelineUI(-1);
                     if (PlaybackDiagnostics.Enabled)
-                        System.Diagnostics.Debug.WriteLine($"[TimelineSeek] phase=play frame={_player.CurrentFrameIndex} target={targetFrame} rate={rate:0.###}");
-                    await _playbackController.Play(250);
+                        System.Diagnostics.Debug.WriteLine($"[TimelineSeek] phase=buffering frame={targetFrame} rate={rate:0.###}");
+                    bool ready = false;
+                    do
+                    {
+                        if (wasPlaying)
+                            ready = await WaitForPlaybackStartupBuffersAsync(GetPlayingFps(), rate, 250, showWarning: false);
+                        else
+                        {
+                            // A paused seek only needs the target picture and its
+                            // audio meter data, rather than a playback preload.
+                            bool[] buffers = await Task.WhenAll(
+                                _player.WaitForVideoBufferForRateAsync(targetFrame, rate, 1, 250),
+                                _player.WaitForAudioBufferAsync(targetFrame, GetPlayingFps(), rate, 250));
+                            ready = buffers[0] && buffers[1];
+                        }
+                    }
+                    while (!ready && !_pendingTimelineSeekValue.HasValue && !_isClosing &&
+                        requestVersion == _transportVersion);
+                    if (_isClosing || requestVersion != _transportVersion) return;
+                    if (_pendingTimelineSeekValue is int latestValue)
+                    {
+                        requestedValue = latestValue;
+                        continue;
+                    }
+                    UpdateVideoFrame();
+                    UpdateTimelineUI(-1);
+                    if (ready)
+                        UpdateMetersFromAudioLevel();
+                    if (wasPlaying && ready && !_isClosing && requestVersion == _transportVersion)
+                    {
+                        if (PlaybackDiagnostics.Enabled)
+                            System.Diagnostics.Debug.WriteLine($"[TimelineSeek] phase=play frame={_player.CurrentFrameIndex} target={targetFrame} rate={rate:0.###}");
+                        await _playbackController.Play(250);
+                    }
+                    break;
                 }
             }
             finally
             {
+                _pendingTimelineSeekValue = null;
+                _isTimelineSeeking = false;
                 _isSeeking = false;
             }
         }

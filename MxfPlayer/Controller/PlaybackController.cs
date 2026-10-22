@@ -102,7 +102,7 @@ namespace MxfPlayer.Controllers
             if (targetFrame > totalFrames) targetFrame = totalFrames;
 
             _player.SeekVideoByFrame(targetFrame);
-            _player.SeekAudioByFrame(targetFrame, fps);
+            _player.SeekAudioByFrame(targetFrame, fps, waitForPreviousCache: false);
         }
 
         public async Task Jump(int seconds, double fps)

@@ -23,8 +23,18 @@ internal sealed class Direct3D11FrameRenderer : IDisposable
     private readonly IDXGISwapChain1 _swapChain;
     private readonly ID3D11VertexShader _vertexShader;
     private readonly ID3D11PixelShader _pixelShader;
+    private readonly ID3D11PixelShader _verticalShader;
     private readonly ID3D11SamplerState _sampler;
     private readonly ID3D11Buffer _constants;
+    private readonly ID3D11Buffer _scaleConstants;
+    private ID3D11Texture2D? _horizontalTexture;
+    private ID3D11RenderTargetView? _horizontalTarget;
+    private ID3D11ShaderResourceView? _horizontalView;
+    private int _horizontalWidth, _horizontalHeight;
+    private ID3D11Texture2D? _horizontalWeights, _verticalWeights;
+    private ID3D11ShaderResourceView? _horizontalWeightView, _verticalWeightView;
+    private int _weightSourceWidth, _weightSourceHeight, _weightWidth, _weightHeight;
+    private int _horizontalTaps, _verticalTaps;
     private ID3D11RenderTargetView? _target;
     private readonly ID3D11Texture2D?[] _textures = new ID3D11Texture2D?[3];
     private readonly ID3D11ShaderResourceView?[] _views = new ID3D11ShaderResourceView?[3];
@@ -51,7 +61,8 @@ internal sealed class Direct3D11FrameRenderer : IDisposable
             });
             _factory.MakeWindowAssociation(window, WindowAssociationFlags.IgnoreAltEnter);
             _vertexShader = _device.CreateVertexShader(CompileShader("VS", "vs_4_0"));
-            _pixelShader = _device.CreatePixelShader(CompileShader("PS", "ps_4_0"));
+            _pixelShader = _device.CreatePixelShader(CompileShader("PSHorizontal", "ps_4_0"));
+            _verticalShader = _device.CreatePixelShader(CompileShader("PSVertical", "ps_4_0"));
             _sampler = _device.CreateSamplerState(new SamplerDescription
             {
                 Filter = Filter.MinMagMipLinear,
@@ -59,6 +70,7 @@ internal sealed class Direct3D11FrameRenderer : IDisposable
                 AddressW = TextureAddressMode.Clamp, MaxLOD = float.MaxValue
             });
             _constants = _device.CreateBuffer(48, BindFlags.ConstantBuffer);
+            _scaleConstants = _device.CreateBuffer(32, BindFlags.ConstantBuffer);
             Resize(width, height);
         }
         catch
@@ -157,16 +169,34 @@ internal sealed class Direct3D11FrameRenderer : IDisposable
         if (hasFrame && _sourceWidth > 0)
         {
             float scale = Math.Min(_width / (float)_sourceWidth, _height / (float)_sourceHeight);
-            float w = _sourceWidth * scale, h = _sourceHeight * scale;
-            _context.RSSetViewport(new Viewport((_width - w) / 2, (_height - h) / 2, w, h));
+            int w = Math.Clamp((int)Math.Round(_sourceWidth * scale), 1, _width);
+            int h = Math.Clamp((int)Math.Round(_sourceHeight * scale), 1, _height);
+            EnsureHorizontalTarget(w, _sourceHeight);
+            EnsureWeights(w, h);
+            _context.OMSetRenderTargets(_horizontalTarget!);
+            _context.RSSetViewport(new Viewport(0, 0, w, _sourceHeight));
             _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
             _context.VSSetShader(_vertexShader);
             _context.PSSetShader(_pixelShader);
             _context.PSSetConstantBuffer(0, _constants);
+            _context.PSSetConstantBuffer(1, _scaleConstants);
+            _context.UpdateSubresource(new[] { new Vector4(_sourceWidth, _sourceHeight, w, h),
+                new Vector4(_horizontalTaps, _verticalTaps, 0, 0) }, _scaleConstants);
             _context.PSSetSampler(0, _sampler);
             for (uint i = 0; i < 3; i++) _context.PSSetShaderResource(i, _views[i]!);
+            _context.PSSetShaderResource(3, _horizontalWeightView!);
+            _context.PSSetShaderResource(4, _verticalWeightView!);
             _context.Draw(3, 0);
             for (uint i = 0; i < 3; i++) _context.PSSetShaderResource(i, null!);
+
+            _context.OMSetRenderTargets(_target);
+            _context.RSSetViewport(new Viewport((_width - w) / 2, (_height - h) / 2, w, h));
+            _context.PSSetShader(_verticalShader);
+            _context.PSSetShaderResource(0, _horizontalView!);
+            _context.Draw(3, 0);
+            _context.PSSetShaderResource(0, null!);
+            _context.PSSetShaderResource(3, null!);
+            _context.PSSetShaderResource(4, null!);
         }
         // Submit each picture in sequence without waiting for monitor refresh.
         // The compositor may show only a subset; the application never skips
@@ -185,6 +215,23 @@ internal sealed class Direct3D11FrameRenderer : IDisposable
         return true;
     }
 
+    private void EnsureHorizontalTarget(int width, int height)
+    {
+        if (_horizontalTexture != null && _horizontalWidth == width && _horizontalHeight == height) return;
+        _horizontalView?.Dispose();
+        _horizontalTarget?.Dispose();
+        _horizontalTexture?.Dispose();
+        _horizontalTexture = _device.CreateTexture2D(new Texture2DDescription
+        {
+            Width = (uint)width, Height = (uint)height, MipLevels = 1, ArraySize = 1,
+            Format = Format.R16G16B16A16_Float, SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default, BindFlags = BindFlags.ShaderResource | BindFlags.RenderTarget
+        });
+        _horizontalTarget = _device.CreateRenderTargetView(_horizontalTexture);
+        _horizontalView = _device.CreateShaderResourceView(_horizontalTexture);
+        _horizontalWidth = width; _horizontalHeight = height;
+    }
+
     private void ReleaseTextures()
     {
         for (int i = 0; i < 3; i++)
@@ -194,11 +241,82 @@ internal sealed class Direct3D11FrameRenderer : IDisposable
         }
     }
 
+    private void EnsureWeights(int width, int height)
+    {
+        if (_weightSourceWidth == _sourceWidth && _weightSourceHeight == _sourceHeight &&
+            _weightWidth == width && _weightHeight == height) return;
+        _horizontalWeightView?.Dispose(); _horizontalWeights?.Dispose();
+        _verticalWeightView?.Dispose(); _verticalWeights?.Dispose();
+        (_horizontalWeights, _horizontalWeightView, _horizontalTaps) = CreateWeights(_sourceWidth, width);
+        (_verticalWeights, _verticalWeightView, _verticalTaps) = CreateWeights(_sourceHeight, height);
+        _weightSourceWidth = _sourceWidth; _weightSourceHeight = _sourceHeight;
+        _weightWidth = width; _weightHeight = height;
+    }
+
+    private unsafe (ID3D11Texture2D, ID3D11ShaderResourceView, int) CreateWeights(int source, int destination)
+    {
+        // Coefficients depend only on geometry. Compute them once per resize,
+        // and combine adjacent same-sign taps using the GPU's linear sampler.
+        double reduction = Math.Max(1.0, source / (double)destination);
+        var rows = new List<Vector4>[destination];
+        int taps = 1;
+        for (int pixel = 0; pixel < destination; pixel++)
+        {
+            double center = (pixel + 0.5) * source / destination - 0.5;
+            int first = (int)Math.Ceiling(center - 2 * reduction);
+            int last = (int)Math.Floor(center + 2 * reduction);
+            double[] weights = new double[last - first + 1];
+            double total = 0;
+            for (int t = 0; t < weights.Length; t++)
+            {
+                double x = Math.Abs((center - (first + t)) / reduction);
+                // Bicubic B=0, C=0.6 (FFmpeg's default bicubic parameters).
+                // Widen the four-tap kernel during reduction for antialiasing.
+                const double a = -0.6;
+                weights[t] = x < 1
+                    ? ((a + 2) * x - (a + 3)) * x * x + 1
+                    : x < 2 ? ((a * x - 5 * a) * x + 8 * a) * x - 4 * a : 0;
+                total += weights[t];
+            }
+            var row = rows[pixel] = new List<Vector4>();
+            for (int t = 0; t < weights.Length; t++)
+            {
+                double weight = weights[t];
+                if (Math.Abs(weight) < 1e-10) continue;
+                double coordinate = first + t;
+                if (t + 1 < weights.Length && weight * weights[t + 1] > 0)
+                {
+                    double next = weights[++t];
+                    coordinate += next / (weight + next);
+                    weight += next;
+                }
+                row.Add(new Vector4((float)((coordinate + 0.5) / source), (float)(weight / total), 0, 0));
+            }
+            taps = Math.Max(taps, row.Count);
+        }
+        var data = new Vector4[taps * destination];
+        for (int pixel = 0; pixel < destination; pixel++)
+            rows[pixel].CopyTo(data, pixel * taps);
+        ID3D11Texture2D texture;
+        fixed (Vector4* pixels = data)
+            texture = _device.CreateTexture2D(new Texture2DDescription
+            {
+                Width = (uint)taps, Height = (uint)destination, MipLevels = 1, ArraySize = 1,
+                Format = Format.R32G32B32A32_Float, SampleDescription = new SampleDescription(1, 0),
+                Usage = ResourceUsage.Immutable, BindFlags = BindFlags.ShaderResource
+            }, new[] { new SubresourceData((IntPtr)pixels, (uint)(taps * 16)) });
+        return (texture, _device.CreateShaderResourceView(texture), taps);
+    }
+
     public void Dispose()
     {
         _context?.ClearState();
         ReleaseTextures();
         _target?.Dispose();
+        _horizontalView?.Dispose(); _horizontalTarget?.Dispose(); _horizontalTexture?.Dispose();
+        _horizontalWeightView?.Dispose(); _horizontalWeights?.Dispose();
+        _verticalWeightView?.Dispose(); _verticalWeights?.Dispose();
+        _scaleConstants?.Dispose(); _verticalShader?.Dispose();
         _constants?.Dispose(); _sampler?.Dispose();
         _pixelShader?.Dispose(); _vertexShader?.Dispose();
         _swapChain?.Dispose(); _factory?.Dispose();
@@ -242,8 +360,11 @@ internal sealed class Direct3D11FrameRenderer : IDisposable
         Texture2D plane0 : register(t0);
         Texture2D plane1 : register(t1);
         Texture2D plane2 : register(t2);
+        Texture2D horizontalWeights : register(t3);
+        Texture2D verticalWeights : register(t4);
         SamplerState linearClamp : register(s0);
         cbuffer Conversion : register(b0) { float4 range; float4 coefficients; float4 mode; };
+        cbuffer Scaling : register(b1) { float4 dimensions; float4 tapCounts; };
         struct Vertex { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
         Vertex VS(uint id : SV_VertexID) {
             Vertex o;
@@ -251,13 +372,34 @@ internal sealed class Direct3D11FrameRenderer : IDisposable
             o.position = float4(o.uv.x * 2 - 1, 1 - o.uv.y * 2, 0, 1);
             return o;
         }
-        float4 PS(Vertex i) : SV_TARGET {
-            if (mode.x < 0.5) return float4(plane0.Sample(linearClamp, i.uv).rgb, 1);
-            float y = (plane0.Sample(linearClamp, i.uv).r - range.x) * range.y;
-            float u = (plane1.Sample(linearClamp, i.uv + mode.yz).r - range.z) * range.w;
-            float v = (plane2.Sample(linearClamp, i.uv + mode.yz).r - range.z) * range.w;
-            return float4(saturate(float3(y + coefficients.x * v,
-                y + coefficients.z * u + coefficients.w * v, y + coefficients.y * u)), 1);
+        float3 ReadRgb(float2 uv) {
+            if (mode.x < 0.5) return plane0.SampleLevel(linearClamp, uv, 0).rgb;
+            float y = (plane0.SampleLevel(linearClamp, uv, 0).r - range.x) * range.y;
+            float u = (plane1.SampleLevel(linearClamp, uv + mode.yz, 0).r - range.z) * range.w;
+            float v = (plane2.SampleLevel(linearClamp, uv + mode.yz, 0).r - range.z) * range.w;
+            return float3(y + coefficients.x * v,
+                y + coefficients.z * u + coefficients.w * v, y + coefficients.y * u);
+        }
+        // Separable bicubic. Widen the kernel when reducing size, so the
+        // full-frame downsample filters thin lines instead of aliasing them.
+        float4 PSHorizontal(Vertex i) : SV_TARGET {
+            int pixel = min((int)(i.uv.x * dimensions.z), (int)dimensions.z - 1);
+            float3 sum = 0;
+            [loop] for (int tap = 0; tap < (int)tapCounts.x; tap++) {
+                float2 coefficient = horizontalWeights.Load(int3(tap, pixel, 0)).xy;
+                sum += coefficient.y * ReadRgb(float2(coefficient.x, i.uv.y));
+            }
+            return float4(sum, 1);
+        }
+        float4 PSVertical(Vertex i) : SV_TARGET {
+            int pixel = min((int)(i.uv.y * dimensions.w), (int)dimensions.w - 1);
+            float3 sum = 0;
+            [loop] for (int tap = 0; tap < (int)tapCounts.y; tap++) {
+                float2 coefficient = verticalWeights.Load(int3(tap, pixel, 0)).xy;
+                sum += coefficient.y * plane0.SampleLevel(linearClamp,
+                    float2(i.uv.x, coefficient.x), 0).rgb;
+            }
+            return float4(saturate(sum), 1);
         }
         """;
 }
